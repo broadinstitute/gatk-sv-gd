@@ -1,0 +1,68 @@
+"""
+CLI entry point for gatk-sv-gd.
+
+Dispatches to subcommands: preprocess, infer, call, plot, eval, extract, synthesize.
+"""
+
+import sys
+
+
+SUBCOMMANDS = {
+    "preprocess": "gatk_sv_gd.preprocess",
+    "infer": "gatk_sv_gd.infer",
+    "call": "gatk_sv_gd.call",
+    "plot": "gatk_sv_gd.plot",
+    "eval": "gatk_sv_gd.eval",
+    "extract": "gatk_sv_gd.extract",
+    "synthesize": "gatk_sv_gd.synthesize",
+}
+
+DESCRIPTIONS = {
+    "preprocess": "Preprocess read-depth data for GD CNV inference",
+    "infer": "Run Bayesian CNV inference at GD loci (Pyro model)",
+    "call": "Call GD CNVs from model posterior probabilities",
+    "plot": "Generate visualisation plots for GD CNV calls",
+    "eval": "Evaluate GD CNV calls against a truth table",
+    "extract": "Extract putative GD events from VCF(s)",
+    "synthesize": "Spike synthetic GD CNVs into read-depth matrices",
+}
+
+
+def _print_usage(file=None):
+    """Print top-level usage information."""
+    if file is None:
+        file = sys.stdout
+    prog = "gatk-sv-gd"
+    print(f"Usage: {prog} <subcommand> [options]\n", file=file)
+    print("Genomic Disorder CNV detection from binned read counts.\n", file=file)
+    print("Subcommands:", file=file)
+    for name, desc in DESCRIPTIONS.items():
+        print(f"  {name:8s}  {desc}", file=file)
+    print(f"\nRun '{prog} <subcommand> --help' for subcommand-specific options.", file=file)
+
+
+def main():
+    """Main CLI dispatcher."""
+    if len(sys.argv) < 2 or sys.argv[1] in ("-h", "--help"):
+        _print_usage()
+        sys.exit(0 if len(sys.argv) >= 2 else 1)
+
+    subcommand = sys.argv[1]
+
+    if subcommand not in SUBCOMMANDS:
+        print(f"Error: unknown subcommand '{subcommand}'\n", file=sys.stderr)
+        _print_usage(file=sys.stderr)
+        sys.exit(1)
+
+    # Rewrite sys.argv so the submodule's argparse sees the correct prog name
+    sys.argv = [f"gatk-sv-gd {subcommand}"] + sys.argv[2:]
+
+    # Lazy import to avoid loading heavy dependencies (torch, pyro, matplotlib)
+    # for subcommands that don't need them.
+    import importlib
+    module = importlib.import_module(SUBCOMMANDS[subcommand])
+    module.main()
+
+
+if __name__ == "__main__":
+    main()
