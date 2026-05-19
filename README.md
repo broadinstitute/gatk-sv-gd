@@ -14,6 +14,20 @@ The package provides a staged workflow:
 preprocess -> infer -> call -> plot -> eval
 ```
 
+## Installation
+
+Install the package from the repository root with:
+
+```bash
+python -m pip install .
+```
+
+For editable installs during development, use:
+
+```bash
+python -m pip install -e .[dev]
+```
+
 It also includes utilities to extract putative GD events from VCFs and to spike
 synthetic GD events into read-depth and BAF matrices for benchmarking.
 
@@ -96,6 +110,30 @@ preprocessor filters BAF records to retained GD regions and summarizes them by
 bin and sample.
 
 ### End-to-End Pipeline
+
+For a one-command local run, the repository includes `run_gd.sh`, which wraps
+the current CLI stages and writes `preprocess`, `infer`, `call`, and `plot`
+subdirectories under a work directory. The truth-set evaluation step, and its
+`eval` subdirectory, are only run when `--truth-table` is supplied:
+
+```bash
+./run_gd.sh \
+  --work-dir gd_work \
+  --input-depth counts.tsv.gz \
+  --gd-table gd_table.tsv \
+  --segdup-bed segdups.bed.gz \
+  --centromere-bed centromeres.bed.gz \
+  --par-bed par.hg38.bed \
+  --baf-table all_samples.baf.txt.gz \
+  --high-res-counts highres.rd.txt.gz \
+  --gtf genes.gtf.gz \
+  --gaps-bed gaps.bed.gz
+```
+
+Optional inputs such as high-resolution counts, BAF, annotation tracks, and
+truth tables can be omitted when they are not available. Stage-specific options
+can be forwarded with `--preprocess-args`, `--infer-args`, `--call-args`,
+`--eval-args`, and `--plot-args`.
 
 For large cohorts, run preprocessing once and then run inference from the cached
 preprocessed directory:
