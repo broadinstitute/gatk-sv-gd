@@ -34,7 +34,6 @@ from matplotlib.backends.backend_pdf import PdfPages
 
 from gatk_sv_gd._util import (
     posterior_called_state_to_qual,
-    posterior_probability_to_qual,
     setup_logging,
 )
 from gatk_sv_gd.annotations import (
@@ -92,7 +91,6 @@ PLOT_TIMING_ENABLED = os.getenv("GATK_SV_GD_PLOT_TIMING", "").strip().lower() in
 }
 
 PDF_MAX_SIGNAL_BINS = 300
-DEFAULT_CARRIER_CONFIDENCE_THRESHOLD = 60
 
 
 def _print_timing(label: str, start_time: float) -> None:
@@ -139,32 +137,22 @@ class ViterbiOverlayData:
     """
 
     def __init__(self, paths_df: pd.DataFrame):
-        # Ensure the cn_state column exists.  Support old files that used
-        # a ``mean_cn`` column (float) by rounding to int.
-        if "cn_state" not in paths_df.columns:
-            if "mean_cn" in paths_df.columns:
-                print(
-                    "  WARNING: viterbi_paths.tsv.gz uses the old mean_cn "
-                    "column.  Re-run gd_cnv_call.py to get the new cn_state "
-                    "format.  Falling back to rounding mean_cn to int."
-                )
-                paths_df = paths_df.copy()
-                paths_df["cn_state"] = paths_df["mean_cn"].round().astype(int)
-            else:
-                raise ValueError(
-                    "viterbi_paths.tsv.gz has neither 'cn_state' nor 'mean_cn' "
-                    "columns.  Please re-run gd_cnv_call.py to regenerate it."
-                )
-        if "category" not in paths_df.columns:
-            paths_df = paths_df.copy()
-            paths_df["category"] = paths_df["cn_state"].apply(
-                lambda cn: "DEL" if cn < 2 else ("DUP" if cn > 2 else "REF")
+        required_columns = {
+            "sample",
+            "cluster",
+            "haplotype",
+            "start",
+            "end",
+            "cn_state",
+            "category",
+        }
+        missing_columns = sorted(required_columns.difference(paths_df.columns))
+        if missing_columns:
+            raise ValueError(
+                "viterbi_paths.tsv.gz is missing required columns: "
+                f"{missing_columns}. Re-run the current call command to "
+                "regenerate viterbi paths with the modern schema."
             )
-
-        # Add haplotype column if absent (backward compat with pre-diploid files)
-        if "haplotype" not in paths_df.columns:
-            paths_df = paths_df.copy()
-            paths_df["haplotype"] = 0
 
         # Index by (sample, cluster, haplotype) for O(1) lookup.
         # Merge consecutive records with the same category into single
@@ -317,18 +305,16 @@ def _build_eval_pdf_specs(
     eval_report_df: pd.DataFrame,
     calls_df: pd.DataFrame,
     loci_by_cluster: Dict[str, GDLocus],
-    confidence_threshold: float,
 ) -> Dict[str, List[dict]]:
     """Build TP/FP/FN page specs from an eval report and calls table."""
-    confidence_column = _get_confidence_column(calls_df)
-    carrier_mask = _build_carrier_best_match_mask(calls_df)
-    selected_calls = calls_df[
-        carrier_mask & (calls_df[confidence_column] >= confidence_threshold)
-    ].copy()
-    predicted_by_gd = {
-        str(gd_id): set(group["sample"].astype(str).unique())
-        for gd_id, group in selected_calls.groupby("GD_ID")
-    }
+    required_columns = {"GD_ID", "TP_samples", "FP_samples", "FN_samples"}
+    missing_columns = sorted(required_columns.difference(eval_report_df.columns))
+    if missing_columns:
+        raise ValueError(
+            "Eval report is missing required columns for eval PDFs: "
+            f"{missing_columns}. Re-run eval with the current package version."
+        )
+
     gd_to_cluster = _build_gd_to_cluster_map(loci_by_cluster)
 
     specs: Dict[str, List[dict]] = {
@@ -350,15 +336,9 @@ def _build_eval_pdf_specs(
 
         fp_samples = set(_parse_eval_sample_list(row.get("FP_samples", "")))
         fn_samples = set(_parse_eval_sample_list(row.get("FN_samples", "")))
-        tp_samples = sorted(predicted_by_gd.get(gd_id, set()) - fp_samples)
-
-        expected_tp = int(row.get("TP", len(tp_samples)))
-        if expected_tp != len(tp_samples):
-            print(
-                f"  WARNING: derived TP count is {len(tp_samples)} "
-                f"but eval report says {expected_tp}. "
-                "Make sure the carrier confidence threshold matches the eval run."
-            )
+        tp_samples = sorted(
+            set(_parse_eval_sample_list(row.get("TP_samples", "")))
+        )
 
         for category_name, sample_ids in (
             ("true_positives", tp_samples),
@@ -386,7 +366,6 @@ def _render_pdf_sample_page(
     region_df: pd.DataFrame,
     cluster_calls_df: pd.DataFrame,
     confidence_column: str,
-    confidence_threshold: float,
     gtf: Optional[GTFParser],
     segdup: Optional[SegDupAnnotation],
     min_gene_label_spacing: float,
@@ -409,7 +388,7 @@ def _render_pdf_sample_page(
     page_start = perf_counter()
 
     sample_calls = cluster_calls_df[cluster_calls_df["sample"] == sample_id]
-    pdf_calls = sample_calls[sample_calls[confidence_column] >= confidence_threshold]
+    pdf_calls = sample_calls
     target_entry = _get_locus_gd_entry(locus, target_gd_id)
     if target_entry is not None:
         target_gd_id_str = str(target_entry["GD_ID"])
@@ -2068,21 +2047,15 @@ def create_carrier_pdf(
     lowres_median_bin_size: Optional[float] = None,
     highres_path: Optional[str] = None,
     viterbi_data: Optional[ViterbiOverlayData] = None,
-    confidence_threshold: float = 0.5,
     baf_temperature_by_sample: Optional[Dict[str, float]] = None,
 ):
-    """Create a PDF with plots for calls above the confidence threshold."""
+    """Create a PDF with plots for confident calls emitted by the call step."""
     confidence_column = _get_confidence_column(calls_df)
     carriers_mask = _build_carrier_best_match_mask(calls_df)
-    carriers = calls_df[
-        carriers_mask & (calls_df[confidence_column] >= confidence_threshold)
-    ].copy()
+    carriers = calls_df[carriers_mask].copy()
 
     if len(carriers) == 0:
-        print(
-            "No calls at or above the carrier PDF confidence threshold "
-            f"({confidence_threshold:.2f})."
-        )
+        print("No confident carrier calls were emitted by the call step.")
         return
 
     raw_sample_medians = _compute_raw_sample_medians(raw_counts_df)
@@ -2108,10 +2081,7 @@ def create_carrier_pdf(
                 continue
 
             cluster_carriers = carriers[carriers["cluster"] == cluster]["sample"].unique()
-            print(
-                f"  Adding {len(cluster_carriers)} high-confidence sample plot(s) "
-                f"(threshold={confidence_threshold:.2f})"
-            )
+            print(f"  Adding {len(cluster_carriers)} confident sample plot(s)")
 
             chrom = locus.chrom
             stage_start = perf_counter()
@@ -2188,7 +2158,6 @@ def create_carrier_pdf(
                     region_df,
                     cluster_calls_df,
                     confidence_column,
-                    confidence_threshold,
                     gtf,
                     segdup,
                     min_gene_label_spacing,
@@ -2236,7 +2205,6 @@ def create_eval_category_pdfs(
     lowres_median_bin_size: Optional[float] = None,
     highres_path: Optional[str] = None,
     viterbi_data: Optional[ViterbiOverlayData] = None,
-    confidence_threshold: float = 0.5,
     baf_temperature_by_sample: Optional[Dict[str, float]] = None,
 ):
     """Create TP/FP/FN review PDFs when an eval report is provided."""
@@ -2252,7 +2220,6 @@ def create_eval_category_pdfs(
         eval_report_df,
         calls_df,
         loci_by_cluster,
-        confidence_threshold,
     )
     output_paths = {
         "true_positives": os.path.join(output_dir, "true_positives.pdf"),
@@ -2366,7 +2333,6 @@ def create_eval_category_pdfs(
                         region_df,
                         cluster_calls_df,
                         confidence_column,
-                        confidence_threshold,
                         gtf,
                         segdup,
                         min_gene_label_spacing,
@@ -2531,14 +2497,6 @@ def parse_args():
         help="truth_evaluation_report.tsv produced by the eval tool. When provided, "
              "plot.py writes true_positives.pdf, false_positives.pdf, and "
              "false_negatives.pdf instead of carrier_plots.pdf.",
-    )
-    parser.add_argument(
-        "--carrier-confidence-threshold",
-        type=float,
-        default=DEFAULT_CARRIER_CONFIDENCE_THRESHOLD,
-        help="Minimum QUAL required for a call to appear in carrier_plots.pdf when "
-             "QUAL columns are present. Uses the selected confidence column's native "
-             "scale otherwise.",
     )
     return parser.parse_args()
 
@@ -2863,7 +2821,6 @@ def main():
             lowres_median_bin_size=lowres_median_bin_size,
             highres_path=highres_path,
             viterbi_data=viterbi_data,
-            confidence_threshold=args.carrier_confidence_threshold,
             baf_temperature_by_sample=baf_temperature_by_sample,
         )
     else:
@@ -2884,7 +2841,6 @@ def main():
             lowres_median_bin_size=lowres_median_bin_size,
             highres_path=highres_path,
             viterbi_data=viterbi_data,
-            confidence_threshold=args.carrier_confidence_threshold,
             baf_temperature_by_sample=baf_temperature_by_sample,
         )
 

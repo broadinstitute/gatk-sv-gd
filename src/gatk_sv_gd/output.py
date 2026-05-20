@@ -315,15 +315,9 @@ def write_locus_metadata(
     #   chr          – chromosome
     #   interval_start, interval_end – genomic coordinates of the sub-interval
     gd_entry_rows = []
-    unresolved_entries = 0
     for cluster, locus in included_loci.items():
         for entry in locus.gd_entries:
             covered = locus.get_intervals_between(entry["BP1"], entry["BP2"])
-            if not covered:
-                # BP1/BP2 names not found in this locus (should not happen for
-                # well-formed input, but guard against it gracefully).
-                unresolved_entries += 1
-                continue
             for iv_start, iv_end, iv_name in covered:
                 gd_entry_rows.append({
                     "GD_ID": entry["GD_ID"],
@@ -340,8 +334,6 @@ def write_locus_metadata(
     gd_entry_df = pd.DataFrame(gd_entry_rows)
     gd_entry_output = os.path.join(output_dir, "gd_entry_intervals.tsv.gz")
     gd_entry_df.to_csv(gd_entry_output, sep="\t", index=False, compression="gzip")
-    if unresolved_entries:
-        print(f"  WARNING: omitted {unresolved_entries} GD entries with unresolved breakpoints")
     print("  Saved GD-entry interval mapping table")
     print(f"  Rows: {len(gd_entry_df):,} (GD entry × interval)")
 

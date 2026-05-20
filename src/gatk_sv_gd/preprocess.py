@@ -1,10 +1,5 @@
 """
 High-resolution bin processing and locus bin collection.
-
-Handles querying tabix-indexed high-resolution count files, normalising
-them to match the low-resolution scale, and assembling all bins across
-GD loci into a single combined DataFrame.
-
 Also serves as the CLI entry-point for the ``preprocess`` subcommand,
 which runs data loading, normalisation, quality filtering, ploidy
 estimation, and bin collection *without* model training, writing the
@@ -856,6 +851,7 @@ def collect_all_locus_bins(
                             f"remain under-covered after high-res; retrying rebin with "
                             f"--max-bins-per-interval={fallback_max_bins_per_interval}"
                         )
+
                         fallback_locus_df, fallback_interval_bins = _filter_and_prepare_locus_bins(
                             hr_norm_df,
                             locus,
@@ -1465,8 +1461,6 @@ def parse_args():
     )
 
     # Data filtering
-    parser.add_argument("--skip-bin-filter", action="store_true", default=False,
-                        help="Skip bin quality filtering")
     parser.add_argument("--median-min", type=float, default=1.0,
                         help="Min median depth for bins")
     parser.add_argument("--median-max", type=float, default=3.0,
@@ -1571,13 +1565,12 @@ def main():
     ploidy_map = build_ploidy_map(ploidy_df)
 
     # Filter low quality bins
-    if not args.skip_bin_filter:
-        df = filter_low_quality_bins(
-            df, median_min=args.median_min,
-            median_max=args.median_max, mad_max=args.mad_max,
-            ploidy_map=ploidy_map,
-            par_mask=par_mask,
-        )
+    df = filter_low_quality_bins(
+        df, median_min=args.median_min,
+        median_max=args.median_max, mad_max=args.mad_max,
+        ploidy_map=ploidy_map,
+        par_mask=par_mask,
+    )
 
     # Build quality-filter params
     filter_params: dict = {

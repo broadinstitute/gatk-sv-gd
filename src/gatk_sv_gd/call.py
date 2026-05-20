@@ -146,6 +146,20 @@ def determine_posterior_carrier_breakpoints(
     return selected_by_svtype
 
 
+def _annotate_best_and_confident_calls(
+    calls: List[dict],
+    *,
+    best_by_svtype: Dict[str, Optional[str]],
+    confident_by_svtype: Dict[str, Optional[str]],
+) -> None:
+    """Mark best-match and confident carrier state on one sample/locus call list."""
+    for call in calls:
+        svtype = str(call.get("svtype", ""))
+        gd_id = str(call.get("GD_ID", ""))
+        call["is_best_match"] = gd_id == best_by_svtype.get(svtype)
+        call["is_carrier"] = gd_id == confident_by_svtype.get(svtype)
+
+
 def get_pair_state_columns(
     cn_posteriors_df: pd.DataFrame,
 ) -> Tuple[List[str], List[Tuple[int, int]]]:
@@ -411,38 +425,67 @@ def call_cnvs_from_posteriors(
     all_event_records: List[dict] = []
     sample_ids = cn_posteriors_df["sample"].unique()
 
+    if ploidy_df is None:
+        raise ValueError("ploidy_df is required for calling; provide --ploidy-table")
+    required_ploidy_columns = {"sample", "contig", "ploidy"}
+    missing_ploidy_columns = sorted(required_ploidy_columns.difference(ploidy_df.columns))
+    if missing_ploidy_columns:
+        raise ValueError(
+            "Ploidy table is missing required columns: "
+            f"{missing_ploidy_columns}"
+        )
+    duplicate_ploidy = ploidy_df.duplicated(subset=["sample", "contig"])
+    if duplicate_ploidy.any():
+        raise ValueError("Ploidy table contains duplicate sample/contig rows")
+
     ploidy_lookup: Dict[Tuple[str, str], int] = {}
-    if ploidy_df is not None:
-        for _, row in ploidy_df.iterrows():
-            ploidy_lookup[(str(row["sample"]), str(row["contig"]))] = int(row["ploidy"])
-        print(f"  Loaded ploidy for {len(ploidy_lookup)} sample/contig pairs")
-    else:
-        print("  No ploidy table provided; assuming diploid (ploidy=2) everywhere")
+    for _, row in ploidy_df.iterrows():
+        ploidy_lookup[(str(row["sample"]), str(row["contig"]))] = int(row["ploidy"])
+
+    required_ploidy_pairs = {
+        (str(sample_id), str(locus.chrom))
+        for sample_id in sample_ids
+        for locus in gd_table.loci.values()
+    }
+    missing_ploidy_pairs = sorted(required_ploidy_pairs.difference(ploidy_lookup))
+    if missing_ploidy_pairs:
+        examples = ", ".join(f"{sample}/{contig}" for sample, contig in missing_ploidy_pairs[:5])
+        raise ValueError(
+            f"Ploidy table is missing {len(missing_ploidy_pairs)} required "
+            f"sample/contig pair(s), for example: {examples}"
+        )
+    print(f"  Loaded ploidy for {len(ploidy_lookup)} sample/contig pairs")
 
     n_bins = len(bin_mappings_df)
     n_samples = len(sample_ids)
     expected_rows = n_bins * n_samples
     if len(cn_posteriors_df) != expected_rows:
-        print(
-            f"  WARNING: cn_posteriors has {len(cn_posteriors_df)} rows, "
-            f"expected {expected_rows} ({n_bins} bins × {n_samples} samples)"
+        raise ValueError(
+            f"cn_posteriors has {len(cn_posteriors_df)} rows, expected "
+            f"{expected_rows} ({n_bins} bins × {n_samples} samples)"
         )
+    if bin_mappings_df["array_idx"].duplicated().any():
+        raise ValueError("bin_mappings contains duplicate array_idx values")
 
-    first_sample = sample_ids[0]
-    first_sample_rows = cn_posteriors_df[cn_posteriors_df["sample"] == first_sample]
-    if len(first_sample_rows) == n_bins:
+    map_coords = list(
+        zip(
+            bin_mappings_df["chr"].values,
+            bin_mappings_df["start"].values,
+            bin_mappings_df["end"].values,
+        )
+    )
+    for sample_id in sample_ids:
+        sample_rows = cn_posteriors_df[cn_posteriors_df["sample"] == sample_id]
+        if len(sample_rows) != n_bins:
+            raise ValueError(
+                f"cn_posteriors has {len(sample_rows)} rows for sample {sample_id}, "
+                f"expected {n_bins}"
+            )
         post_coords = list(
             zip(
-                first_sample_rows["chr"].values,
-                first_sample_rows["start"].values,
-                first_sample_rows["end"].values,
-            )
-        )
-        map_coords = list(
-            zip(
-                bin_mappings_df["chr"].values,
-                bin_mappings_df["start"].values,
-                bin_mappings_df["end"].values,
+                sample_rows["chr"].values,
+                sample_rows["start"].values,
+                sample_rows["end"].values,
             )
         )
         if post_coords != map_coords:
@@ -450,12 +493,7 @@ def call_cnvs_from_posteriors(
                 "Bin coordinates in cn_posteriors do not match bin_mappings. "
                 "Please re-run infer to regenerate both files."
             )
-        print(f"  Validated: bin coordinates match between posteriors and mappings ({n_bins} bins)")
-    else:
-        print(
-            f"  WARNING: one sample has {len(first_sample_rows)} bins, "
-            f"expected {n_bins}; skipping alignment check"
-        )
+    print(f"  Validated: bin coordinates match between posteriors and mappings ({n_bins} bins)")
 
     print("  Organizing data for fast access...")
     pair_prob_cols, pair_state_labels = get_pair_state_columns(cn_posteriors_df)
@@ -526,7 +564,7 @@ def call_cnvs_from_posteriors(
         all_cluster_bins = sorted(all_cluster_idxs - bp_set)
 
         for s_idx, sample_id in enumerate(sample_ids):
-            sample_ploidy = ploidy_lookup.get((str(sample_id), locus.chrom), 2)
+            sample_ploidy = ploidy_lookup[(str(sample_id), locus.chrom)]
 
             cluster_pair_probs = pair_prob_3d[s_idx, cluster_bin_indices, :]
             cluster_event_probs = compute_event_marginal_probabilities(
@@ -580,10 +618,20 @@ def call_cnvs_from_posteriors(
                             "haplotype": haplotype,
                         }
                     )
-                best_by_svtype = determine_best_breakpoints(
+                confident_by_svtype = determine_best_breakpoints(
                     calls,
                     calling_mode="viterbi",
                     carrier_only=True,
+                )
+                best_by_svtype = determine_best_breakpoints(
+                    calls,
+                    calling_mode="viterbi",
+                    carrier_only=False,
+                )
+                _annotate_best_and_confident_calls(
+                    calls,
+                    best_by_svtype=best_by_svtype,
+                    confident_by_svtype=confident_by_svtype,
                 )
             else:
                 calls = [
@@ -597,23 +645,23 @@ def call_cnvs_from_posteriors(
                     )
                     for entry in locus.gd_entries
                 ]
-                selected_by_svtype = determine_posterior_carrier_breakpoints(
+                confident_by_svtype = determine_posterior_carrier_breakpoints(
                     calls,
                     min_interval_confidence=min_posterior_interval_confidence,
                     min_flank_non_event_confidence=min_flank_non_event_confidence,
                 )
-                best_by_svtype = {}
-                for call in calls:
-                    is_selected = str(call["GD_ID"]) == selected_by_svtype.get(
-                        call["svtype"]
-                    )
-                    call["is_carrier"] = bool(is_selected)
-                    call["is_best_match"] = bool(is_selected)
+                best_by_svtype = determine_best_breakpoints(
+                    calls,
+                    calling_mode="posterior-marginal",
+                    carrier_only=False,
+                )
+                _annotate_best_and_confident_calls(
+                    calls,
+                    best_by_svtype=best_by_svtype,
+                    confident_by_svtype=confident_by_svtype,
+                )
 
             for call in calls:
-                svtype = call["svtype"]
-                best_gd_for_svtype = best_by_svtype.get(svtype)
-
                 covered_bin_indices: List[int] = []
                 for interval_name in call["intervals"]:
                     if interval_name in interval_bin_arrays:
@@ -632,7 +680,7 @@ def call_cnvs_from_posteriors(
                     "chrom": call["chrom"],
                     "start": call["start"],
                     "end": call["end"],
-                    "svtype": svtype,
+                        "svtype": call["svtype"],
                     "BP1": call["BP1"],
                     "BP2": call["BP2"],
                     "is_terminal": call["is_terminal"],
@@ -661,18 +709,26 @@ def call_cnvs_from_posteriors(
                         np.nan,
                     ),
                     "is_carrier": bool(call.get("is_carrier", False)),
-                    "is_best_match": (
-                        bool(call.get("is_best_match", False))
-                        if calling_mode == "posterior-marginal"
-                        else (
-                            call["GD_ID"] == best_gd_for_svtype
-                            if best_gd_for_svtype is not None else False
-                        )
-                    ),
+                    "is_best_match": bool(call.get("is_best_match", False)),
                     "log_prob_score": call.get("log_prob_score", confidence_score),
                     "confidence_score": confidence_score,
                     "qual_score": call.get("qual_score", np.nan),
                     "calling_method": calling_mode,
+                    "call_criteria_mean_coverage": (
+                        float(min_mean_coverage)
+                        if calling_mode == "viterbi"
+                        else np.nan
+                    ),
+                    "call_criteria_interval_confidence": (
+                        float(min_posterior_interval_confidence)
+                        if calling_mode == "posterior-marginal"
+                        else np.nan
+                    ),
+                    "call_criteria_flank_non_event_confidence": (
+                        float(min_flank_non_event_confidence)
+                        if calling_mode == "posterior-marginal"
+                        else np.nan
+                    ),
                 }
                 all_results.append(result)
 
@@ -717,6 +773,9 @@ def call_cnvs_from_posteriors(
             "confidence_score",
             "qual_score",
             "calling_method",
+            "call_criteria_mean_coverage",
+            "call_criteria_interval_confidence",
+            "call_criteria_flank_non_event_confidence",
         ],
     )
     paths_df = pd.DataFrame(
@@ -771,10 +830,9 @@ def parse_args():
     )
     parser.add_argument(
         "--ploidy-table",
-        required=False,
+           required=True,
         help="Ploidy estimates TSV (ploidy_estimates.tsv) from gd_cnv_pyro.py. "
-             "Columns: sample, contig, median_depth, ploidy. "
-             "If not provided, ploidy=2 is assumed for all sample/contig pairs.",
+               "Columns: sample, contig, median_depth, ploidy.",
     )
     parser.add_argument(
         "--output-dir", "-o",
@@ -860,11 +918,9 @@ def main():
     gd_table = GDTable(args.gd_table)
     print(f"    {len(gd_table.loci)} loci")
 
-    ploidy_df = None
-    if args.ploidy_table:
-        print("  Loading ploidy table")
-        ploidy_df = pd.read_csv(args.ploidy_table, sep="\t")
-        print(f"    {len(ploidy_df)} sample/contig ploidy records")
+    print("  Loading ploidy table")
+    ploidy_df = pd.read_csv(args.ploidy_table, sep="\t")
+    print(f"    {len(ploidy_df)} sample/contig ploidy records")
 
     transition_matrix = None
     breakpoint_transition_matrix = None

@@ -11,7 +11,7 @@ and cohort-level depth effects make standard structural-variant calling hard.
 The package provides a staged workflow:
 
 ```text
-preprocess -> infer -> call -> plot -> eval
+preprocess -> infer -> call -> plot -> eval -> aggregate
 ```
 
 ## Installation
@@ -22,11 +22,26 @@ Install the package from the repository root with:
 python -m pip install .
 ```
 
-For editable installs during development, use:
+For editable installs during development, use a modern `pip` with PEP 660
+support or `uv`:
 
 ```bash
-python -m pip install -e .[dev]
+python -m pip install -e '.[dev]'
 ```
+
+```bash
+uv pip install -e '.[dev]'
+```
+
+If your virtual environment does not have `pip` bootstrapped yet, run:
+
+```bash
+python -m ensurepip --upgrade
+```
+
+Editable installs with very old `pip` releases may fall back to deprecated
+`setup.py develop` behavior. This project is configured for standards-based
+builds and editable installs.
 
 It also includes utilities to extract putative GD events from VCFs and to spike
 synthetic GD events into read-depth and BAF matrices for benchmarking.
@@ -193,13 +208,32 @@ gatk-sv-gd eval \
   --truth-table truth_table.tsv \
   --gd-table preprocessed/gd_table_filtered.tsv \
   --ploidy-table preprocessed/ploidy_estimates.tsv \
-  --min-confidence \
   --output-dir evaluation
 ```
 
-When `--min-confidence` is provided without a value, evaluation uses the default
-QUAL equivalent of posterior probability 0.95. If the flag is omitted, no
-confidence threshold is applied.
+The eval command scores the confident carrier calls emitted by `call`; it does
+not apply an additional confidence cutoff.
+
+Aggregate one or more completed `run_gd.sh` work directories into a cohort-level
+PDF report and machine-readable sidecar tables:
+
+```bash
+gatk-sv-gd aggregate gd_work_a gd_work_b \
+  --output-dir aggregate \
+  --batch-label batch_a \
+  --batch-label batch_b
+```
+
+The aggregate command expects each input directory to contain standard
+`preprocess` and `call` outputs, including `preprocess/ploidy_estimates.tsv`,
+`preprocess/gd_table_filtered.tsv`, and `call/gd_cnv_calls.tsv.gz`. Optional
+`infer`, `eval`, and `plot` artifacts are inventoried when present and listed in
+`aggregate_missing_artifacts.tsv` when absent. Aggregate does not re-render
+full signal plots; it summarizes calls and evaluation reports across work
+directories, adds per-case evidence plots from call metrics, records where
+existing plot artifacts were found, and derives call-selection criteria from the
+call outputs so confident and non-confident case sections stay consistent with
+the original calling step.
 
 ### One-Step Inference Mode
 
@@ -426,6 +460,11 @@ Known limitations and distrust signals include:
 All subcommands write logs in their output directories. Most tabular outputs are
 TSV or bgzipped TSV files.
 
+Logs are intentionally quiet and privacy-safe. They include run metadata,
+dependency versions, lifecycle messages, and warning/error diagnostics, but do
+not include raw data values, sample identifiers, or input/output file paths.
+Routine per-sample, per-bin, and progress-style messages are suppressed.
+
 ### `preprocess` Outputs
 
 | File | Description |
@@ -490,6 +529,20 @@ The evaluator accepts two truth-table formats:
   `samples`, `NAHR_GD`, and `NAHR_GD_atypical` columns.
 - Synthesize-format truth table with `sample_id` and `GD_ID` columns.
 
+### `aggregate` Outputs
+
+| File | Description |
+| --- | --- |
+| `aggregate_report.pdf` | Cohort-level PDF with ploidy-style front matter, batch inventory, summary metrics, carrier case index, locus burden, confident and non-confident case detail pages with evidence plots, optional evaluation summary, missing optional artifacts, and field guide. |
+| `aggregate_summary.tsv` | Compact metric/value table with batch, sample, GD_ID, carrier, and optional evaluation totals. |
+| `aggregate_inventory.tsv` | One row per input work directory with sample, locus, call, carrier, evaluation, and optional artifact counts. |
+| `aggregate_calls.tsv` | All input `gd_cnv_calls.tsv.gz` rows with batch labels, sample keys, normalized confidence values, and carrier categories. |
+| `aggregate_cases.tsv` | Reportable carrier calls after applying `is_carrier` and, when present, `is_best_match`; carriers are split into high- and low-confidence categories. |
+| `aggregate_locus_summary.tsv` | Per-batch, per-GD_ID carrier burden and confidence summaries. |
+| `aggregate_eval.tsv` | Concatenated optional `truth_evaluation_report.tsv` rows with batch columns. |
+| `aggregate_missing_artifacts.tsv` | Optional aggregate inputs not found or unreadable in each work directory. |
+| `aggregate_log.txt` | Command and aggregate log. |
+
 ### `extract` Outputs
 
 | File | Description |
@@ -527,4 +580,5 @@ PYTHONPATH=src python3 -m gatk_sv_gd.cli --help
 PYTHONPATH=src python3 -m gatk_sv_gd.cli preprocess --help
 PYTHONPATH=src python3 -m gatk_sv_gd.cli infer --help
 PYTHONPATH=src python3 -m gatk_sv_gd.cli call --help
+PYTHONPATH=src python3 -m gatk_sv_gd.cli aggregate --help
 ```

@@ -592,10 +592,11 @@ def _run_diploid_viterbi(
     )
 
     if not candidates:
-        # Fallback: return all-reference
-        T = total_cn_log_priors.shape[0]
-        fallback = [(np.ones(T, dtype=int), np.ones(T, dtype=int), -1e30)]
-        return fallback, pair_states
+        raise ValueError(
+            "Viterbi produced no candidate paths"
+            f" for sample={sample_id or '<unknown>'}, cluster={cluster or '<unknown>'}, "
+            f"bins={total_cn_log_priors.shape[0]}"
+        )
 
     # Collect all near-tied candidate decompositions.
     # Each candidate within score_tolerance of the best is decomposed
@@ -681,8 +682,11 @@ def _run_pair_state_viterbi(
     )
 
     if not candidates:
-        n_bins = pair_log_priors.shape[0]
-        return [(np.ones(n_bins, dtype=int), np.ones(n_bins, dtype=int), -1e30)]
+        raise ValueError(
+            "Viterbi produced no candidate paths"
+            f" for sample={sample_id or '<unknown>'}, cluster={cluster or '<unknown>'}, "
+            f"bins={pair_log_priors.shape[0]}"
+        )
 
     ref_pair_idx = None
     for pair_idx, (h1, h2) in enumerate(pair_states):

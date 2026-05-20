@@ -44,7 +44,6 @@ from typing import Dict, List, Optional, Set, Tuple
 
 import numpy as np
 import pysam
-from tqdm import tqdm
 
 from gatk_sv_gd._util import setup_logging
 from gatk_sv_gd.models import GDLocus, GDTable
@@ -461,8 +460,6 @@ def generate_salted_flank_bleed_events(
                 breakpoint_names[right_idx],
             )
             if not covered_intervals:
-                covered_intervals = locus.get_intervals()
-            if not covered_intervals:
                 continue
             if _matches_canonical_breakpoint_pair(
                 locus,
@@ -826,10 +823,7 @@ def _concat_bgzf_parts(
     """
     n_parts = len(part_paths)
     with open(output_path, "wb") as fout:
-        for i, path in enumerate(
-            tqdm(part_paths, desc=f"  [{label}] Concatenating",
-                 unit=" parts", dynamic_ncols=True)
-        ):
+        for i, path in enumerate(part_paths):
             fsize = os.path.getsize(path)
             is_last = (i == n_parts - 1)
             with open(path, "rb") as fin:
@@ -876,7 +870,7 @@ def _rewrite_counts_file(
         input_path: Block-gzipped input (``.rd.txt.gz``).
         output_path: Block-gzipped output path.
         interval_map: ``(chrom, start, end) → [(sample_id, mult), …]``.
-        label: Human-readable label for progress bars.
+        label: Human-readable table label used in internal status messages.
         n_workers: Parallel worker processes.
 
     Returns:
@@ -944,10 +938,7 @@ def _rewrite_counts_file(
         total_modified = 0
 
         if effective_workers <= 1:
-            for group in tqdm(
-                groups, desc=f"  [{label}] Processing",
-                unit=" groups", dynamic_ncols=True,
-            ):
+            for group in groups:
                 n_rows, n_mod = _process_contig_group(
                     input_path, group, resolved, start_col, end_col,
                 )
@@ -965,17 +956,10 @@ def _rewrite_counts_file(
                     ): i
                     for i, group in enumerate(groups)
                 }
-                with tqdm(
-                    total=n_groups,
-                    desc=f"  [{label}] Processing",
-                    unit=" groups",
-                    dynamic_ncols=True,
-                ) as pbar:
-                    for future in as_completed(futures):
-                        n_rows, n_mod = future.result()
-                        total_rows += n_rows
-                        total_modified += n_mod
-                        pbar.update(1)
+                for future in as_completed(futures):
+                    n_rows, n_mod = future.result()
+                    total_rows += n_rows
+                    total_modified += n_mod
 
         # ── Concatenate BGZF parts in contig order ───────────────────
         ordered_parts = [header_path] + [tp for _, tp in contig_temp_paths]
@@ -1144,7 +1128,7 @@ def _rewrite_baf_file(
         total_rows = 0
         total_modified = 0
         if effective_workers <= 1:
-            for group in tqdm(groups, desc=f"  [{label}] Processing", unit=" groups", dynamic_ncols=True):
+            for group in groups:
                 n_rows, n_mod = _process_baf_contig_group(
                     input_path, group, resolved, pos_col, baf_col, sample_col,
                 )
@@ -1164,12 +1148,10 @@ def _rewrite_baf_file(
                     ): i
                     for i, group in enumerate(groups)
                 }
-                with tqdm(total=n_groups, desc=f"  [{label}] Processing", unit=" groups", dynamic_ncols=True) as pbar:
-                    for future in as_completed(futures):
-                        n_rows, n_mod = future.result()
-                        total_rows += n_rows
-                        total_modified += n_mod
-                        pbar.update(1)
+                for future in as_completed(futures):
+                    n_rows, n_mod = future.result()
+                    total_rows += n_rows
+                    total_modified += n_mod
 
         ordered_parts = [header_path] + [tp for _, tp in contig_temp_paths]
         _concat_bgzf_parts(output_path, ordered_parts, label=label)

@@ -8,7 +8,9 @@ from gatk_sv_gd.models import GDLocus
 from gatk_sv_gd.annotations import FlankCompressor
 from gatk_sv_gd._util import posterior_called_state_to_qual
 from gatk_sv_gd.plot import (
+    ViterbiOverlayData,
     _apply_carrier_pdf_x_axis_layout,
+    _build_eval_pdf_specs,
     _build_raw_region_df,
     _plot_baf_signal_panel,
     _plot_event_marginal_panel,
@@ -26,6 +28,93 @@ def _make_locus() -> GDLocus:
         is_nahr=True,
         is_terminal=False,
     )
+
+
+def _make_eval_locus() -> GDLocus:
+    locus = _make_locus()
+    locus.gd_entries = [
+        {
+            "GD_ID": "GD1",
+            "svtype": "DEL",
+            "start_GRCh38": 46005406,
+            "end_GRCh38": 49845537,
+        }
+    ]
+    return locus
+
+
+def test_build_eval_pdf_specs_rejects_missing_eval_sample_columns():
+    calls_df = pd.DataFrame(
+        {
+            "sample": ["S1"],
+            "cluster": ["10q11.2"],
+            "GD_ID": ["GD1"],
+            "is_carrier": [True],
+            "is_best_match": [True],
+            "qual_score": [20.0],
+        }
+    )
+    eval_report_df = pd.DataFrame(
+        {
+            "GD_ID": ["GD1"],
+            "TP": [1],
+            "FP_samples": [""],
+            "FN_samples": [""],
+        }
+    )
+
+    with pytest.raises(ValueError, match="TP_samples"):
+        _build_eval_pdf_specs(
+            eval_report_df,
+            calls_df,
+            {"10q11.2": _make_eval_locus()},
+        )
+
+
+def test_build_eval_pdf_specs_uses_reported_tp_samples(capsys):
+    calls_df = pd.DataFrame(
+        {
+            "sample": ["S1"],
+            "cluster": ["10q11.2"],
+            "GD_ID": ["GD1"],
+            "is_carrier": [True],
+            "is_best_match": [True],
+            "qual_score": [20.0],
+        }
+    )
+    eval_report_df = pd.DataFrame(
+        {
+            "GD_ID": ["GD1"],
+            "TP": [1],
+            "TP_samples": ["S1"],
+            "FP_samples": [""],
+            "FN_samples": [""],
+        }
+    )
+
+    specs = _build_eval_pdf_specs(
+        eval_report_df,
+        calls_df,
+        {"10q11.2": _make_eval_locus()},
+    )
+
+    assert [spec["sample"] for spec in specs["true_positives"]] == ["S1"]
+    assert "derived TP count" not in capsys.readouterr().out
+
+
+def test_viterbi_overlay_data_rejects_legacy_schema():
+    paths_df = pd.DataFrame(
+        {
+            "sample": ["S1"],
+            "cluster": ["10q11.2"],
+            "start": [1],
+            "end": [2],
+            "mean_cn": [2.0],
+        }
+    )
+
+    with pytest.raises(ValueError, match="cn_state"):
+        ViterbiOverlayData(paths_df)
 
 
 def test_build_raw_region_df_keeps_lowres_when_processed_counts_do_not_exceed_it():

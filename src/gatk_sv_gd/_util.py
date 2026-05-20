@@ -14,6 +14,8 @@ import re
 import subprocess
 import sys
 import threading
+import time
+import warnings
 from datetime import datetime, timezone
 from importlib import metadata as importlib_metadata
 from typing import Any, Dict, Optional
@@ -107,19 +109,17 @@ class _JSONFormatter(logging.Formatter):
 
 
 class LoggingStream:
-    """File-like stream that routes writes through ``logging``.
+    """File-like stream that keeps only warning and error diagnostics.
 
-    ``print`` calls in existing modules are diagnostic output.  Replacing
-    stdout/stderr with this stream keeps stdout clean for data while still
-    preserving the diagnostic text in stderr and the per-run log file.
-    Carriage-return progress updates are collapsed to their final line so
-    log files are not filled with terminal redraws.
+    Existing command modules still contain many ``print`` calls that report
+    per-locus, per-bin, or per-sample status.  Routing stdout/stderr through
+    this stream keeps those routine messages off the console and out of log
+    files while preserving explicit warning and error lines. Carriage-return
+    updates are discarded so terminal redraw noise cannot leak into logs.
     """
 
-    def __init__(self, logger: logging.Logger, level: int, passthrough_stream=None):
+    def __init__(self, logger: logging.Logger):
         self.logger = logger
-        self.level = level
-        self._passthrough_stream = passthrough_stream
         self.encoding = getattr(sys.__stderr__, "encoding", "utf-8")
         self._buffer = ""
         self._closed = False
@@ -135,10 +135,6 @@ class LoggingStream:
         if self._closed:
             return 0
         text = str(message)
-        if self._passthrough_stream is not None and "\r" in text:
-            passthrough_text = _sanitize_log_text(_ANSI_ESCAPE_RE.sub("", text))
-            self._passthrough_stream.write(passthrough_text)
-            self._passthrough_stream.flush()
         with self._lock:
             for character in text:
                 if character == "\r":
@@ -151,7 +147,9 @@ class LoggingStream:
         return len(text)
 
     def flush(self):
-        return None
+        with self._lock:
+            self._emit_buffer()
+            self._buffer = ""
 
     def close(self):
         with self._lock:
@@ -163,15 +161,20 @@ class LoggingStream:
         cleaned = _sanitize_log_text(_ANSI_ESCAPE_RE.sub("", self._buffer).strip())
         if not cleaned:
             return
-        self.logger.log(self._level_for_message(cleaned), cleaned)
+        level = self._level_for_message(cleaned)
+        if level is None:
+            return
+        if level >= logging.ERROR and _logging_session is not None:
+            _logging_session.had_error = True
+        self.logger.log(level, cleaned)
 
-    def _level_for_message(self, message: str) -> int:
+    def _level_for_message(self, message: str) -> Optional[int]:
         upper_message = message.lstrip().upper()
         if upper_message.startswith(("ERROR", "FATAL", "CRITICAL")):
             return logging.ERROR
         if upper_message.startswith(("WARNING", "WARN")) or " WARNING:" in upper_message:
             return logging.WARNING
-        return self.level
+        return None
 
 
 class LoggingSession:
@@ -182,35 +185,77 @@ class LoggingSession:
         log_path: str,
         original_stdout,
         original_stderr,
+        original_excepthook,
+        original_warning_filters,
         handlers,
+        command: Optional[str],
     ):
         self.log_path = log_path
         self._original_stdout = original_stdout
         self._original_stderr = original_stderr
+        self._original_excepthook = original_excepthook
+        self._original_warning_filters = original_warning_filters
         self._handlers = list(handlers)
+        self._command = command or _infer_command_name()
+        self._start_time = time.perf_counter()
+        self._completed = False
         self._closed = False
+        self.had_error = False
+
+    def excepthook(self, exc_type, exc_value, exc_traceback):
+        self.had_error = True
+        elapsed = time.perf_counter() - self._start_time
+        get_logger().exception(
+            "gatk-sv-gd %s failed after %.2f seconds",
+            self._command,
+            elapsed,
+            exc_info=(exc_type, exc_value, exc_traceback),
+        )
 
     def flush(self):
         if self._closed:
             return
+        if isinstance(sys.stdout, LoggingStream):
+            sys.stdout.flush()
+        if isinstance(sys.stderr, LoggingStream):
+            sys.stderr.flush()
         for handler in self._handlers:
             handler.flush()
+
+    def complete(self):
+        if self._closed or self._completed:
+            return
+        self.flush()
+        if not self.had_error:
+            elapsed = time.perf_counter() - self._start_time
+            get_logger().info(
+                "gatk-sv-gd %s completed successfully in %.2f seconds",
+                self._command,
+                elapsed,
+            )
+        self._completed = True
 
     def close(self):
         if self._closed:
             return
+        self.complete()
         if isinstance(sys.stdout, LoggingStream):
             sys.stdout.close()
             sys.stdout = self._original_stdout
         if isinstance(sys.stderr, LoggingStream):
             sys.stderr.close()
             sys.stderr = self._original_stderr
-        root_logger = logging.getLogger()
+        if sys.excepthook == self.excepthook:
+            sys.excepthook = self._original_excepthook
+        package_logger = logging.getLogger(_LOGGER_NAME)
         for handler in self._handlers:
             handler.flush()
-            root_logger.removeHandler(handler)
+            package_logger.removeHandler(handler)
             handler.close()
         logging.captureWarnings(False)
+        warnings.filters[:] = self._original_warning_filters
+        if hasattr(warnings, "_filters_mutated"):
+            warnings._filters_mutated()
         self._closed = True
 
 
@@ -226,6 +271,18 @@ def get_logger(name: Optional[str] = None) -> logging.Logger:
 def vlog(msg: str) -> None:
     """Emit a verbose developer diagnostic at DEBUG level."""
     get_logger().debug(msg)
+
+
+def _suppress_expected_torch_tracer_warnings() -> None:
+    """Suppress expected PyTorch JIT tracing warnings during GD inference."""
+    try:
+        import torch
+    except Exception:
+        return
+    tracer_warning = getattr(getattr(torch, "jit", None), "TracerWarning", None)
+    if tracer_warning is None:
+        return
+    warnings.filterwarnings("ignore", category=tracer_warning)
 
 
 def posterior_probability_to_qual(
@@ -296,26 +353,27 @@ def setup_logging(
     seed_info: Optional[Dict[str, Any]] = None,
     log_format: Optional[str] = None,
 ) -> LoggingSession:
-    """Configure timestamped diagnostics for a GD subcommand.
+    """Configure privacy-safe diagnostics for a GD subcommand.
 
-    Diagnostics are written to stderr and to ``output_dir/filename``.
-    Existing diagnostic ``print`` calls are routed through logging so stdout
-    remains clean for machine-readable data.  Set ``GATK_SV_GD_LOG_FORMAT``
-    to ``json`` for JSON-lines logs.
+    High-level lifecycle messages and warning/error lines are written to
+    stderr and to ``output_dir/filename``. Routine ``print`` diagnostics and
+    progress redraws are discarded so logs remain concise and privacy-safe.
     """
     global _logging_session
 
+    del verbose
     os.makedirs(output_dir, exist_ok=True)
     if _logging_session is not None:
         _logging_session.close()
 
     log_path = os.path.join(output_dir, filename)
     selected_format = (log_format or os.getenv("GATK_SV_GD_LOG_FORMAT", "text")).lower()
-    log_level = logging.DEBUG if verbose else logging.INFO
+    log_level = logging.INFO
 
-    root_logger = logging.getLogger()
-    _remove_managed_handlers(root_logger)
-    root_logger.setLevel(log_level)
+    package_logger = logging.getLogger(_LOGGER_NAME)
+    _remove_managed_handlers(package_logger)
+    package_logger.setLevel(log_level)
+    package_logger.propagate = False
 
     formatter: logging.Formatter
     if selected_format == "json":
@@ -332,28 +390,30 @@ def setup_logging(
         setattr(handler, _MANAGED_HANDLER_ATTR, True)
         handler.setLevel(log_level)
         handler.setFormatter(formatter)
-        root_logger.addHandler(handler)
+        package_logger.addHandler(handler)
 
     logging.captureWarnings(True)
     logging.getLogger("py.warnings").setLevel(logging.WARNING)
-    get_logger().setLevel(log_level)
+    original_warning_filters = list(warnings.filters)
+    _suppress_expected_torch_tracer_warnings()
 
     original_stdout = sys.stdout
     original_stderr = sys.stderr
-    sys.stdout = LoggingStream(get_logger("stdout"), logging.INFO)
-    sys.stderr = LoggingStream(
-        get_logger("stderr"),
-        logging.ERROR,
-        passthrough_stream=sys.__stderr__,
-    )
+    original_excepthook = sys.excepthook
+    sys.stdout = LoggingStream(get_logger("stdout"))
+    sys.stderr = LoggingStream(get_logger("stderr"))
 
     _logging_session = LoggingSession(
         log_path=log_path,
         original_stdout=original_stdout,
         original_stderr=original_stderr,
+        original_excepthook=original_excepthook,
+        original_warning_filters=original_warning_filters,
         handlers=handlers,
+        command=command,
     )
-    atexit.register(_logging_session.flush)
+    sys.excepthook = _logging_session.excepthook
+    atexit.register(_logging_session.complete)
 
     log_startup_metadata(
         command=command,
@@ -371,31 +431,24 @@ def log_startup_metadata(
     seed_info: Optional[Dict[str, Any]],
     log_path: str,
 ) -> None:
-    """Log enough run metadata to reproduce the invocation."""
-    metadata_payload = {
-        "event": "run_start",
-        "command": command or _infer_command_name(),
-        "software": {
-            "package": "gatk-sv-gd",
-            "version": _dependency_version("gatk-sv-gd"),
-            "git": _git_metadata(),
-        },
-        "python": {
-            "version": platform.python_version(),
-        },
-        "dependencies": _dependency_versions(),
-        "invocation": _privacy_safe_invocation(args),
-        "environment": _environment_metadata(),
-        "random_seeds": seed_info or {},
-    }
-    get_logger().info("run_start", extra={"fields": metadata_payload})
+    """Log privacy-safe startup metadata for reproducibility."""
+    del log_path
+    logger = get_logger()
+    command_name = command or _infer_command_name()
+    logger.info("Starting gatk-sv-gd %s", command_name)
+    logger.info("Git metadata: %s", _json_dumps(_git_metadata()))
+    logger.info("Dependency versions: %s", _json_dumps(_dependency_versions()))
+    logger.info("Runtime environment: %s", _json_dumps(_environment_metadata()))
+    logger.info("Command arguments: %s", _json_dumps(_privacy_safe_invocation(args)))
+    if seed_info:
+        logger.info("Random seeds: %s", _json_dumps(seed_info))
 
 
 def _sanitize_log_text(message: str) -> str:
     if not message:
         return message
-    message = _PATH_OR_URI_RE.sub("<redacted-path>", str(message))
-    return _FILENAME_RE.sub("<redacted-file>", message)
+    message = _PATH_OR_URI_RE.sub("<path>", str(message))
+    return _FILENAME_RE.sub("<file>", message)
 
 
 def _sanitize_log_fields(value: Any) -> Any:
@@ -433,14 +486,14 @@ def _privacy_safe_arg_value(key: str, value: Any) -> Any:
     if value is None or isinstance(value, bool):
         return value
     if _is_sensitive_arg_key(key):
-        return _redacted_summary(value)
+        return _private_value_summary(value)
     if isinstance(value, (int, float)):
         return value
     if isinstance(value, (list, tuple, set)):
         return {"count": len(value)}
     if isinstance(value, str):
         if _PATH_OR_URI_RE.search(value) or _FILENAME_RE.search(value):
-            return "<redacted>"
+            return {"provided": True}
         return value
     return str(type(value).__name__)
 
@@ -450,14 +503,23 @@ def _is_sensitive_arg_key(key: str) -> bool:
     return any(token in lowered for token in _SENSITIVE_ARG_KEYWORDS)
 
 
-def _redacted_summary(value: Any) -> Any:
+def _private_value_summary(value: Any) -> Any:
     if value is None or isinstance(value, bool):
         return value
     if isinstance(value, (list, tuple, set)):
-        return {"count": len(value), "value": "<redacted>"}
+        return {"count": len(value), "provided": bool(value)}
     if isinstance(value, dict):
-        return {"count": len(value), "value": "<redacted>"}
-    return "<redacted>"
+        return {"count": len(value), "provided": bool(value)}
+    return {"provided": True}
+
+
+def _json_dumps(value: Any) -> str:
+    return json.dumps(
+        _sanitize_log_fields(value),
+        sort_keys=True,
+        separators=(",", ":"),
+        default=str,
+    )
 
 
 def _remove_managed_handlers(logger: logging.Logger) -> None:
@@ -482,19 +544,20 @@ def _dependency_versions() -> Dict[str, str]:
     return {
         distribution_name: _dependency_version(distribution_name)
         for distribution_name in (
+            "gatk-sv-gd",
             "numpy",
             "pandas",
             "pysam",
+            "intervaltree",
             "torch",
             "pyro-ppl",
             "matplotlib",
-            "intervaltree",
         )
     }
 
 
 def _git_metadata() -> Dict[str, str]:
-    repo_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "..", ".."))
+    repo_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
     commit = _run_git_command(repo_root, ["rev-parse", "HEAD"])
     dirty_status = _run_git_command(repo_root, ["status", "--porcelain"])
     return {

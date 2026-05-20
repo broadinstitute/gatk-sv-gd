@@ -13,9 +13,9 @@ dependencies = [
     "numpy",
     "pandas",
     "pysam",
+    "intervaltree",
     "torch",
     "pyro-ppl",
-    "tqdm",
     "matplotlib",
 ]
 

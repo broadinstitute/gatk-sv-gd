@@ -14,7 +14,6 @@ import numpy as np
 import pandas as pd
 import torch
 from intervaltree import IntervalTree
-from tqdm import tqdm
 
 import pyro
 import pyro.distributions as dist
@@ -26,7 +25,7 @@ from pyro.infer.autoguide.initialization import init_to_value
 from pyro.infer import JitTraceEnum_ELBO, TraceEnum_ELBO
 from pyro.infer.svi import SVI
 
-from gatk_sv_gd._util import get_sample_columns
+from gatk_sv_gd._util import get_logger, get_sample_columns
 
 
 def build_diploid_pair_states(max_hap_cn: int = 2) -> List[Tuple[int, int]]:
@@ -770,6 +769,7 @@ class CNVModel:
         convergence_rtol: float,
         progress_desc: str,
         record_history: bool,
+        model_fn=None,
     ) -> None:
         scheduler = pyro.optim.LambdaLR(
             {
@@ -786,15 +786,22 @@ class CNVModel:
         else:
             loss = TraceEnum_ELBO()
 
-        svi = SVI(self.model, guide, optim=scheduler, loss=loss)
+        svi_model = self.model if model_fn is None else model_fn
+        svi = SVI(svi_model, guide, optim=scheduler, loss=loss)
 
-        print(f"{progress_desc} for up to {max_iter} iterations...")
+        logger = get_logger("training")
+        logger.info(
+            "%s started: max_iter=%d early_stopping=%s",
+            progress_desc,
+            max_iter,
+            bool(early_stopping),
+        )
         if early_stopping:
-            print(
-                "Early stopping enabled: "
-                f"patience={patience}, "
-                f"elbo_window={convergence_window}, "
-                f"elbo_rtol={convergence_rtol}"
+            logger.info(
+                "Early stopping enabled: patience=%d elbo_window=%d elbo_rtol=%s",
+                patience,
+                convergence_window,
+                convergence_rtol,
             )
 
         patience_counter = 0
@@ -802,75 +809,52 @@ class CNVModel:
         stop_relative_change = None
         epoch_loss = float("nan")
 
-        with tqdm(
-            range(max_iter),
-            desc=progress_desc,
-            unit="epoch",
-            mininterval=0.1,
-            dynamic_ncols=True,
-        ) as pbar:
-            for epoch in pbar:
-                epoch_loss = svi.step(
-                    depth=data.depth,
-                    interval_sizes=data.interval_sizes,
-                    n_bins=data.n_bins,
-                    n_samples=data.n_samples,
+        del log_freq
+        for epoch in range(max_iter):
+            epoch_loss = svi.step(
+                depth=data.depth,
+                interval_sizes=data.interval_sizes,
+                n_bins=data.n_bins,
+                n_samples=data.n_samples,
+            )
+            scheduler.step()
+
+            if record_history:
+                self.loss_history["epoch"].append(epoch)
+                self.loss_history["elbo"].append(epoch_loss)
+
+            relative_change = None
+            if early_stopping and record_history:
+                relative_change = _windowed_relative_elbo_change(
+                    self.loss_history["elbo"],
+                    convergence_window,
                 )
-                scheduler.step()
 
-                if record_history:
-                    self.loss_history["epoch"].append(epoch)
-                    self.loss_history["elbo"].append(epoch_loss)
-
-                relative_change = None
-                if early_stopping and record_history:
-                    relative_change = _windowed_relative_elbo_change(
-                        self.loss_history["elbo"],
-                        convergence_window,
-                    )
-
-                if relative_change is None:
-                    pbar.set_postfix(loss=f"{epoch_loss:.4f}")
+            if early_stopping and relative_change is not None:
+                if relative_change < convergence_rtol:
+                    patience_counter += 1
                 else:
-                    pbar.set_postfix(
-                        loss=f"{epoch_loss:.4f}",
-                        rel=f"{relative_change:.2e}",
-                    )
+                    patience_counter = 0
 
-                if (epoch + 1) % log_freq == 0:
-                    if relative_change is None:
-                        tqdm.write(f"[epoch {epoch + 1:04d}]  loss: {epoch_loss:.4f}")
-                    else:
-                        tqdm.write(
-                            f"[epoch {epoch + 1:04d}]  loss: {epoch_loss:.4f}  "
-                            f"rel_change: {relative_change:.2e}"
-                        )
-
-                if early_stopping and relative_change is not None:
-                    if relative_change < convergence_rtol:
-                        patience_counter += 1
-                    else:
-                        patience_counter = 0
-
-                    if patience_counter >= patience:
-                        tqdm.write(
-                            f"\nEarly stopping at epoch {epoch + 1} "
-                            f"(window={convergence_window}, "
-                            f"rel_change={relative_change:.2e})"
-                        )
-                        stopped_early = True
-                        stop_relative_change = relative_change
-                        break
+                if patience_counter >= patience:
+                    stopped_early = True
+                    stop_relative_change = relative_change
+                    break
 
         if stopped_early:
-            print(
-                f"\nTraining stopped early after {epoch + 1} epochs "
-                f"(rel_change={stop_relative_change:.2e})"
+            logger.info(
+                "%s stopped early: epochs=%d rel_change=%.2e final_loss=%.4f",
+                progress_desc,
+                epoch + 1,
+                stop_relative_change,
+                epoch_loss,
             )
-            print(f"Final loss: {epoch_loss:.4f}")
         else:
-            print(
-                f"\nTraining complete after {max_iter} epochs, final loss: {epoch_loss:.4f}"
+            logger.info(
+                "%s completed: epochs=%d final_loss=%.4f",
+                progress_desc,
+                max_iter,
+                epoch_loss,
             )
 
     def _fixed_bin_bias_values(self, n_bins: int) -> np.ndarray:
@@ -1143,6 +1127,7 @@ class CNVModel:
                 self._run_svi_training(
                     data,
                     guide=warmup_guide,
+                    model_fn=warmup_model,
                     max_iter=guide_warmup_iter,
                     lr_init=lr_init,
                     lr_min=lr_min,

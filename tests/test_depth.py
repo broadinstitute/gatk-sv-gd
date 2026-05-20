@@ -13,27 +13,6 @@ from gatk_sv_gd.depth import (
 import gatk_sv_gd.depth as depth_module
 
 
-class _FakeTqdm:
-    def __init__(self, iterable=None, *args, **kwargs):
-        self._iterable = list(iterable) if iterable is not None else []
-
-    def __enter__(self):
-        return self
-
-    def __exit__(self, exc_type, exc, tb):
-        return False
-
-    def __iter__(self):
-        return iter(self._iterable)
-
-    def set_postfix(self, *args, **kwargs):
-        return None
-
-    @staticmethod
-    def write(message):
-        return None
-
-
 def test_windowed_relative_elbo_change_uses_two_latest_windows():
     assert _windowed_relative_elbo_change([100.0, 100.0, 100.01], window=2) is None
 
@@ -71,7 +50,6 @@ def test_train_early_stopping_uses_windowed_relative_elbo_change(monkeypatch):
     monkeypatch.setattr(depth_module.pyro.optim, "LambdaLR", lambda config: FakeScheduler())
     monkeypatch.setattr(depth_module, "TraceEnum_ELBO", lambda: object())
     monkeypatch.setattr(depth_module, "SVI", FakeSVI)
-    monkeypatch.setattr(depth_module, "tqdm", _FakeTqdm)
 
     data = SimpleNamespace(
         depth=object(),
@@ -94,6 +72,66 @@ def test_train_early_stopping_uses_windowed_relative_elbo_change(monkeypatch):
         [100.0, 100.0, 100.01, 100.01, 100.01001]
     )
     assert model.loss_history["epoch"] == [0, 1, 2, 3, 4]
+    assert model.current_data is None
+
+
+def test_train_uses_conditioned_model_for_map_warmup(monkeypatch):
+    model = object.__new__(CNVModel)
+    base_model = object()
+    warmup_model = object()
+    warmup_guide = object()
+    final_guide = object()
+    model.model = base_model
+    model.guide = final_guide
+    model.guide_type = "diagonal"
+    model.loss_history = {"epoch": [], "elbo": []}
+    model.current_data = None
+    model._warmup_model_and_initial_values = lambda: (
+        warmup_model,
+        ["sample_var"],
+        {"baf_temperature": object()},
+    )
+    model._extract_guide_latent_values = lambda guide, data: {}
+
+    def fake_build_guide(guide_type, **kwargs):
+        if guide_type == "delta":
+            return warmup_guide
+        return final_guide
+
+    class FakeScheduler:
+        def step(self):
+            return None
+
+    svi_calls = []
+
+    class FakeSVI:
+        def __init__(self, svi_model, guide, **kwargs):
+            svi_calls.append((svi_model, guide))
+
+        def step(self, **kwargs):
+            return 100.0
+
+    model._build_guide = fake_build_guide
+    monkeypatch.setattr(depth_module.pyro, "clear_param_store", lambda: None)
+    monkeypatch.setattr(depth_module.pyro.optim, "LambdaLR", lambda config: FakeScheduler())
+    monkeypatch.setattr(depth_module, "TraceEnum_ELBO", lambda: object())
+    monkeypatch.setattr(depth_module, "SVI", FakeSVI)
+
+    data = SimpleNamespace(
+        depth=object(),
+        interval_sizes=object(),
+        n_bins=1,
+        n_samples=1,
+    )
+
+    model.train(
+        data,
+        max_iter=1,
+        guide_warmup_iter=1,
+        early_stopping=False,
+    )
+
+    assert svi_calls == [(warmup_model, warmup_guide), (base_model, final_guide)]
     assert model.current_data is None
 
 

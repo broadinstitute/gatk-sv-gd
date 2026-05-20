@@ -72,6 +72,9 @@ def _install_test_stub_modules():
     pyro.distributions = types.ModuleType("pyro.distributions")
     pyro.poutine = types.ModuleType("pyro.poutine")
     pyro.clear_param_store = lambda: None
+    pyro.enable_validation = lambda value: None
+    pyro.distributions.enable_validation = lambda value: None
+    pyro.set_rng_seed = lambda value: None
 
     pyro_ops = types.ModuleType("pyro.ops")
     pyro_ops_indexing = types.ModuleType("pyro.ops.indexing")

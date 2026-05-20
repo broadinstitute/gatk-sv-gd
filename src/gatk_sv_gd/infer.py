@@ -25,6 +25,9 @@ import pandas as pd
 import pyro
 import torch
 
+if not hasattr(pyro, "enable_validation") and hasattr(pyro.distributions, "enable_validation"):
+    pyro.enable_validation = pyro.distributions.enable_validation
+
 from gatk_sv_gd import _util
 from gatk_sv_gd._util import get_sample_columns, setup_logging
 from gatk_sv_gd.bins import filter_low_quality_bins, read_data
@@ -523,14 +526,6 @@ def parse_args():
         default=1000,
         help="Number of samples for discrete inference",
     )
-
-    # Data filtering
-    parser.add_argument(
-        "--skip-bin-filter",
-        action="store_true",
-        default=False,
-        help="Skip bin quality filtering",
-    )
     parser.add_argument(
         "--median-min",
         type=float,
@@ -581,6 +576,20 @@ def parse_args():
     return args
 
 
+def _setup_pyro(args: argparse.Namespace) -> None:
+    """Configure deterministic Pyro state for infer runs.
+
+    Validation stays off for JIT because distribution checks convert tensor
+    masks to Python booleans while tracing.
+    """
+    validate = bool(args.disable_jit)
+    pyro.enable_validation(validate)
+    pyro.distributions.enable_validation(validate)
+    pyro.set_rng_seed(42)
+    torch.manual_seed(42)
+    np.random.seed(42)
+
+
 def main():
     """Main function to run GD CNV detection pipeline."""
     args = parse_args()
@@ -611,11 +620,7 @@ def main():
         )
 
         # Set up Pyro
-        pyro.enable_validation(True)
-        pyro.distributions.enable_validation(True)
-        pyro.set_rng_seed(42)
-        torch.manual_seed(42)
-        np.random.seed(42)
+        _setup_pyro(args)
 
         # Run GD analysis with preprocessed data (no bin collection)
         run_gd_analysis(
@@ -705,21 +710,16 @@ def main():
         ploidy_map = build_ploidy_map(ploidy_df)
 
         # Filter low quality bins
-        if not args.skip_bin_filter:
-            df = filter_low_quality_bins(
-                df,
-                median_min=args.median_min,
-                median_max=args.median_max,
-                mad_max=args.mad_max,
-                ploidy_map=ploidy_map,
-            )
+        df = filter_low_quality_bins(
+            df,
+            median_min=args.median_min,
+            median_max=args.median_max,
+            mad_max=args.mad_max,
+            ploidy_map=ploidy_map,
+        )
 
         # Set up Pyro
-        pyro.enable_validation(True)
-        pyro.distributions.enable_validation(True)
-        pyro.set_rng_seed(42)
-        torch.manual_seed(42)
-        np.random.seed(42)
+        _setup_pyro(args)
 
         # Log high-res counts file if provided
         if args.high_res_counts:

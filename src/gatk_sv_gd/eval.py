@@ -20,10 +20,7 @@ from typing import Dict, Optional
 import numpy as np
 import pandas as pd
 
-from gatk_sv_gd._util import posterior_probability_to_qual, setup_logging
-
-
-DEFAULT_MIN_CONFIDENCE = float(posterior_probability_to_qual(0.95))
+from gatk_sv_gd._util import setup_logging
 
 
 # =============================================================================
@@ -168,19 +165,6 @@ def load_truth_table(filepath: str) -> pd.DataFrame:
         return _load_truth_table_synthesize_format(df)
 
     return _load_truth_table_bed_format(df)
-
-
-def _get_confidence_column(calls_df: pd.DataFrame) -> Optional[str]:
-    """Return the preferred confidence column present in the calls file."""
-    if "qual_score" in calls_df.columns:
-        return "qual_score"
-    if "confidence_score" in calls_df.columns:
-        return "confidence_score"
-    if "log_prob_score" in calls_df.columns:
-        return "log_prob_score"
-    return None
-
-
 # =============================================================================
 # Evaluation
 # =============================================================================
@@ -191,7 +175,6 @@ def evaluate_against_truth(
     truth_df: pd.DataFrame,
     output_dir: str,
     batch_samples: Optional[set] = None,
-    min_confidence: Optional[float] = None,
 ) -> pd.DataFrame:
     """
     Cross-reference predicted GD calls against a truth table and report
@@ -212,11 +195,6 @@ def evaluate_against_truth(
         batch_samples: Optional set of sample IDs present in the current
             batch.  If provided, truth carriers not in this set are removed
             before scoring.
-        min_confidence: Optional minimum confidence required for a predicted
-            carrier call to count during evaluation. Uses
-            ``qual_score`` when present, otherwise falls back to
-            ``confidence_score`` and then ``log_prob_score``. If ``None``, no
-            confidence filter is applied.
 
     Returns:
         Per-site report DataFrame.
@@ -228,21 +206,10 @@ def evaluate_against_truth(
     if batch_samples is not None:
         print(f"  Batch contains {len(batch_samples)} samples; "
               "truth carriers will be restricted to this set.")
-    score_column = None
-    if min_confidence is not None:
-        score_column = _get_confidence_column(calls_df)
-        if score_column is None:
-            raise ValueError(
-                "--min-confidence requires a calls file with either "
-                "qual_score, confidence_score, or log_prob_score column"
-            )
-        print(
-            f"  Enforcing call confidence threshold: "
-            f"{score_column} >= {min_confidence:.2f}"
-        )
 
     # Build predicted carrier sets keyed by GD_ID.
-    # Only count samples whose call is both a carrier AND the best-match
+    # Only count samples whose call was emitted as a confident carrier by
+    # the call step and, when present, is the selected best-match
     # breakpoint configuration for its svtype.
     pred_by_gd: Dict[str, set] = {}
     pred_meta_by_gd: Dict[str, dict] = {}
@@ -251,8 +218,6 @@ def evaluate_against_truth(
         carrier_mask = grp["is_carrier"] == True  # noqa: E712
         if "is_best_match" in grp.columns:
             carrier_mask = carrier_mask & (grp["is_best_match"] == True)  # noqa: E712
-        if min_confidence is not None:
-            carrier_mask = carrier_mask & (grp[score_column] >= min_confidence)
         pred_by_gd[gd_id_str] = set(
             grp.loc[carrier_mask, "sample"].unique()
         )
@@ -297,6 +262,9 @@ def evaluate_against_truth(
         tp = len(truth_set & pred_set)
         fp = len(pred_set - truth_set)
         fn = len(truth_set - pred_set)
+        tp_samples = sorted(truth_set & pred_set)
+        fp_samples = sorted(pred_set - truth_set)
+        fn_samples = sorted(truth_set - pred_set)
         sensitivity = tp / (tp + fn) if (tp + fn) > 0 else float("nan")
         precision = tp / (tp + fp) if (tp + fp) > 0 else float("nan")
 
@@ -320,8 +288,9 @@ def evaluate_against_truth(
             "FN": fn,
             "sensitivity": round(sensitivity, 4) if not np.isnan(sensitivity) else "NA",
             "precision": round(precision, 4) if not np.isnan(precision) else "NA",
-            "FP_samples": ",".join(sorted(pred_set - truth_set)) if fp > 0 else "",
-            "FN_samples": ",".join(sorted(truth_set - pred_set)) if fn > 0 else "",
+            "TP_samples": ",".join(tp_samples) if tp > 0 else "",
+            "FP_samples": ",".join(fp_samples) if fp > 0 else "",
+            "FN_samples": ",".join(fn_samples) if fn > 0 else "",
         })
 
     report_df = pd.DataFrame(rows)
@@ -398,19 +367,6 @@ def parse_args():
         required=True,
         help="Output directory for evaluation report",
     )
-    parser.add_argument(
-        "--min-confidence",
-        nargs="?",
-           const=DEFAULT_MIN_CONFIDENCE,
-        default=None,
-        type=float,
-        help="Optional minimum confidence required for a predicted carrier to "
-               "count in evaluation. Uses qual_score when present, otherwise falls "
-               "back to confidence_score and then log_prob_score. If the flag is "
-               "provided without a value, uses the QUAL equivalent of 0.95 event "
-               "probability. If omitted entirely, no confidence threshold is "
-               "enforced.",
-    )
     return parser.parse_args()
 
 
@@ -470,7 +426,6 @@ def main():
     evaluate_against_truth(
         calls_df, truth_df, args.output_dir,
         batch_samples=batch_samples,
-        min_confidence=args.min_confidence,
     )
 
     print("\n" + "=" * 80)

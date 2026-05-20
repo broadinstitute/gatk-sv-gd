@@ -71,14 +71,16 @@ class GDLocus:
         Returns:
             List of (start, end, interval_name) tuples for every interval
             whose left BP is at or after *bp1_name* and whose right BP is
-            at or before *bp2_name* in the ordering.  Returns an empty
-            list if either name is not found.
+            at or before *bp2_name* in the ordering.
         """
         try:
             pos1 = self.breakpoint_names.index(bp1_name)
             pos2 = self.breakpoint_names.index(bp2_name)
         except ValueError:
-            return []
+            raise ValueError(
+                f"Unknown breakpoint name(s) for locus {self.cluster}: "
+                f"BP1={bp1_name!r}, BP2={bp2_name!r}"
+            ) from None
         if pos1 > pos2:
             pos1, pos2 = pos2, pos1
         all_intervals = self.get_intervals()
