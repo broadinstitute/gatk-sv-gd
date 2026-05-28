@@ -164,6 +164,10 @@ gatk-sv-gd preprocess \
   --output-dir preprocessed
 ```
 
+If specific bins must survive preprocessing even when they overlap exclusion
+regions or fail median/MAD filtering, provide BED intervals with
+`--hard-inclusion-intervals forced_keep.bed.gz`.
+
 ```bash
 gatk-sv-gd infer \
   --preprocessed-dir preprocessed \

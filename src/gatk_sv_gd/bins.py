@@ -23,6 +23,18 @@ if TYPE_CHECKING:
     from gatk_sv_gd.depth import ExclusionMask
 
 
+def _mask_overlap_bool(
+    mask: Optional[ExclusionMask],
+    chrom: str,
+    starts: np.ndarray,
+    ends: np.ndarray,
+) -> np.ndarray:
+    """Return a boolean array for bins overlapping *mask* at all."""
+    if mask is None or len(starts) == 0:
+        return np.zeros(len(starts), dtype=bool)
+    return mask.get_overlap_fractions_batch(chrom, starts, ends) > 0.0
+
+
 def _ploidy_adjust_depths(
     depths: np.ndarray,
     df: pd.DataFrame,
@@ -141,6 +153,7 @@ def compute_bin_quality_mask(
     mad_max: float,
     ploidy_map: Optional[Dict[Tuple[str, str], int]] = None,
     par_mask: Optional[ExclusionMask] = None,
+    hard_inclusion_mask: Optional[ExclusionMask] = None,
 ) -> Tuple[np.ndarray, Dict[str, int]]:
     """Return a keep mask for median/MAD bin filtering.
 
@@ -163,6 +176,7 @@ def compute_bin_quality_mask(
     chroms = df["Chr"].values
     keep_mask = np.zeros(len(df), dtype=bool)
     par_ignored = np.zeros(len(df), dtype=bool)
+    hard_included = np.zeros(len(df), dtype=bool)
     no_informative = np.zeros(len(df), dtype=bool)
 
     for chrom, chrom_df in df.groupby("Chr", sort=False):
@@ -190,12 +204,23 @@ def compute_bin_quality_mask(
             par_ignored[row_positions] = chrom_par
             chrom_keep |= chrom_par
 
+        chrom_hard_include = _mask_overlap_bool(
+            hard_inclusion_mask,
+            chrom,
+            chrom_df["Start"].values,
+            chrom_df["End"].values,
+        )
+        if chrom_hard_include.any():
+            hard_included[row_positions] = chrom_hard_include
+            chrom_keep |= chrom_hard_include
+
         no_informative[row_positions] = informative_counts == 0
         keep_mask[row_positions] = chrom_keep
 
     stats = {
         "filtered": int((~keep_mask).sum()),
         "par_ignored": int(par_ignored.sum()),
+        "hard_included": int(hard_included.sum()),
         "no_informative": int((no_informative & ~par_ignored).sum()),
     }
     return keep_mask, stats
@@ -239,6 +264,7 @@ def extract_locus_bins(
     exclusion_threshold: float = 0.5,
     padding: int = 0,
     exclusion_bypass_regions: Optional[List[Tuple[int, int]]] = None,
+    hard_inclusion_mask: Optional[ExclusionMask] = None,
 ) -> pd.DataFrame:
     """
     Extract bins overlapping a GD locus, optionally masking regions
@@ -254,6 +280,8 @@ def extract_locus_bins(
         exclusion_bypass_regions: List of (start, end) genomic ranges where
             masking is skipped.  Bins that have any true interval overlap
             with a bypass range are kept regardless of mask overlap.
+        hard_inclusion_mask: Optional mask of regions whose overlapping
+            bins are always kept regardless of exclusion overlap.
 
     Returns:
         DataFrame with bins for this locus
@@ -279,6 +307,12 @@ def extract_locus_bins(
         bypass = exclusion_bypass_regions or []
         bin_starts = locus_df["Start"].values
         bin_ends = locus_df["End"].values
+        hard_include = _mask_overlap_bool(
+            hard_inclusion_mask,
+            chrom,
+            bin_starts,
+            bin_ends,
+        )
 
         # True interval-overlap bypass check (no midpoint heuristic).
         # A bin is "in bypass" if it has any real overlap with a bypass range:
@@ -297,7 +331,7 @@ def extract_locus_bins(
                 bin_ends[non_bypass],
             )
 
-        keep_mask = in_bypass | (overlaps < exclusion_threshold)
+        keep_mask = hard_include | in_bypass | (overlaps < exclusion_threshold)
         n_bypassed = int(in_bypass.sum())
         n_masked = int((~keep_mask).sum())
 
@@ -1163,6 +1197,7 @@ def filter_low_quality_bins(
     mad_max: float = 0.5,
     ploidy_map: Optional[Dict[Tuple[str, str], int]] = None,
     par_mask: Optional[ExclusionMask] = None,
+    hard_inclusion_mask: Optional[ExclusionMask] = None,
 ):
     """
     Filter out low quality bins based on median and MAD thresholds.
@@ -1186,6 +1221,8 @@ def filter_low_quality_bins(
             used to adjust depths before computing statistics.
         par_mask: Optional pseudoautosomal interval mask. Overlapping
             bins are kept without applying median/MAD thresholds.
+        hard_inclusion_mask: Optional mask of regions whose overlapping
+            bins are always kept regardless of median/MAD thresholds.
 
     Returns:
         Filtered DataFrame
@@ -1197,6 +1234,7 @@ def filter_low_quality_bins(
         mad_max=mad_max,
         ploidy_map=ploidy_map,
         par_mask=par_mask,
+        hard_inclusion_mask=hard_inclusion_mask,
     )
 
     print(f"\n{'=' * 80}")
@@ -1209,6 +1247,8 @@ def filter_low_quality_bins(
     print(f"Thresholds: median [{median_min}, {median_max}], MAD <= {mad_max}")
     if quality_stats["par_ignored"] > 0:
         print(f"PAR bins ignored: {quality_stats['par_ignored']}")
+    if quality_stats["hard_included"] > 0:
+        print(f"Hard-included bins kept: {quality_stats['hard_included']}")
     if quality_stats["no_informative"] > 0:
         print(f"Bins with no informative samples: {quality_stats['no_informative']}")
     print(f"Bins filtered: {n_filtered}")
@@ -1218,6 +1258,7 @@ def filter_low_quality_bins(
         print("  [verbose] Filter breakdown:")
         print(f"    filtered bins: {quality_stats['filtered']}")
         print(f"    PAR-ignored bins: {quality_stats['par_ignored']}")
+        print(f"    hard-included bins: {quality_stats['hard_included']}")
         print(f"    bins without informative samples: {quality_stats['no_informative']}")
 
     print(f"{'=' * 80}\n")

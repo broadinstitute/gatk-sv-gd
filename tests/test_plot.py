@@ -376,6 +376,18 @@ def test_apply_carrier_pdf_x_axis_layout_moves_labels_to_annotation_panel():
         plt.close(fig)
 
 
+def test_flank_compressor_limits_minor_ticks_for_tiny_body_regions():
+    xform = FlankCompressor(0, 100000, 50000, 50001, flank_scale=0.2)
+
+    fig, ax = plt.subplots()
+    try:
+        xform.format_genomic_ticks(ax, breakpoints=[(50000, 50001)], label_x=True)
+
+        assert len(ax.get_xticks(minor=True)) <= 50
+    finally:
+        plt.close(fig)
+
+
 def test_plot_event_marginal_panel_uses_called_state_qual_scale():
     locus = _make_locus()
     x_positions = pd.Series([46050000, 48190000, 49800000], dtype=float).to_numpy()

@@ -25,6 +25,8 @@ Optional annotation and mask inputs:
 --gtf FILE
 --par-bed FILE                     Recommended when chrX bins are present
 --custom-mask-bed FILE
+--hard-inclusion-bed FILE
+--hard-inclusion-intervals FILE [FILE ...]
 --flank-exclusion-interval FILE
 --flank-exclusion-intervals FILE [FILE ...]
 
@@ -75,6 +77,7 @@ CALL_ARGS=""
 EVAL_ARGS=""
 PLOT_ARGS=""
 
+HARD_INCLUSION_INTERVALS=()
 FLANK_EXCLUSION_INTERVALS=()
 POSITIONAL_ARGS=()
 
@@ -117,6 +120,17 @@ while [[ $# -gt 0 ]]; do
         --custom-mask-bed)
             CUSTOM_MASK_BED="$2"
             shift 2
+            ;;
+        --hard-inclusion-bed)
+            HARD_INCLUSION_INTERVALS+=("$2")
+            shift 2
+            ;;
+        --hard-inclusion-intervals)
+            shift
+            while [[ $# -gt 0 && "$1" != --* ]]; do
+                HARD_INCLUSION_INTERVALS+=("$1")
+                shift
+            done
             ;;
         --flank-exclusion-interval)
             FLANK_EXCLUSION_INTERVALS+=("$2")
@@ -253,6 +267,10 @@ fi
 
 if [[ -n "${CUSTOM_MASK_BED}" ]]; then
     PREPROCESS_CMD+=(-e "${CUSTOM_MASK_BED}")
+fi
+
+if [[ ${#HARD_INCLUSION_INTERVALS[@]} -gt 0 ]]; then
+    PREPROCESS_CMD+=(--hard-inclusion-intervals "${HARD_INCLUSION_INTERVALS[@]}")
 fi
 
 if [[ -n "${PAR_BED}" ]]; then

@@ -345,6 +345,75 @@ def test_collect_all_locus_bins_excludes_par_from_flanks():
     assert all(not (m.start < 320 and m.end > 240) for m in right_flank)
 
 
+def test_filter_low_quality_bins_keeps_hard_included_bin():
+    df = pd.DataFrame([
+        {"Chr": "chr1", "Start": 0, "End": 100, "sample1": 0.2},
+        {"Chr": "chr1", "Start": 100, "End": 200, "sample1": 2.0},
+    ])
+
+    filtered_df = preprocess_module.filter_low_quality_bins(
+        df,
+        median_min=1.0,
+        median_max=3.0,
+        mad_max=0.5,
+        hard_inclusion_mask=_IntervalMask("chr1", 0, 100),
+    )
+
+    assert filtered_df[["Start", "End"]].values.tolist() == [[0, 100], [100, 200]]
+
+
+def test_filter_and_prepare_locus_bins_keeps_hard_included_body_bin():
+    locus = _FakeLocus()
+    locus_df = pd.DataFrame([
+        {"Chr": "chr1", "Start": 100, "End": 150, "sample1": 0.2},
+        {"Chr": "chr1", "Start": 150, "End": 200, "sample1": 2.0},
+        {"Chr": "chr1", "Start": 200, "End": 250, "sample1": 2.0},
+        {"Chr": "chr1", "Start": 250, "End": 300, "sample1": 2.0},
+    ])
+
+    processed_df, interval_bins = preprocess_module._filter_and_prepare_locus_bins(
+        locus_df,
+        locus,
+        [],
+        100,
+        300,
+        0,
+        exclusion_mask=_IntervalMask("chr1", 100, 150),
+        exclusion_threshold=0.1,
+        filter_params={"median_min": 1.0, "median_max": 3.0, "mad_max": 0.5},
+        hard_inclusion_mask=_IntervalMask("chr1", 100, 150),
+    )
+
+    retained = list(zip(processed_df["Start"].tolist(), processed_df["End"].tolist()))
+
+    assert (100, 150) in retained
+    assert len(interval_bins["A-C"]) == 2
+
+
+def test_collect_all_locus_bins_keeps_hard_included_par_flank_bin():
+    locus = _ChrXLocus()
+    par_mask = _IntervalMask("chrX", 240, 320)
+    hard_inclusion_mask = _IntervalMask("chrX", 240, 260)
+
+    _, mappings, _ = preprocess_module.collect_all_locus_bins(
+        _chr_x_flank_df(),
+        _FakeGDTable(locus),
+        None,
+        par_mask=par_mask,
+        hard_inclusion_mask=hard_inclusion_mask,
+        min_bins_per_interval=1,
+        max_bins_per_interval=0,
+        min_flank_bases=100,
+        min_flank_bins=1,
+        min_flank_coverage=0.0,
+    )
+
+    right_flank = [m for m in mappings if m.interval_name == "right_flank"]
+
+    assert (240, 260) in [(m.start, m.end) for m in right_flank]
+    assert (260, 280) not in [(m.start, m.end) for m in right_flank]
+
+
 def test_filter_and_prepare_locus_bins_excludes_par_from_flanks():
     locus = _ChrXLocus()
     par_mask = _IntervalMask("chrX", 240, 320)

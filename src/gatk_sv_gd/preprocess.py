@@ -89,6 +89,18 @@ def _locus_overlaps_regions(
     return False
 
 
+def _mask_overlap_bool(
+    mask: Optional[ExclusionMask],
+    chrom: str,
+    starts: np.ndarray,
+    ends: np.ndarray,
+) -> np.ndarray:
+    """Return a boolean array for bins overlapping *mask* at all."""
+    if mask is None or len(starts) == 0:
+        return np.zeros(len(starts), dtype=bool)
+    return mask.get_overlap_fractions_batch(chrom, starts, ends) > 0.0
+
+
 def _filter_and_prepare_locus_bins(
     locus_df: pd.DataFrame,
     locus: GDLocus,
@@ -104,6 +116,7 @@ def _filter_and_prepare_locus_bins(
     min_rebin_coverage: float = 0.5,
     ploidy_map: Optional[Dict[Tuple[str, str], int]] = None,
     par_mask: Optional[ExclusionMask] = None,
+    hard_inclusion_mask: Optional[ExclusionMask] = None,
 ) -> Tuple[pd.DataFrame, Dict[str, List[int]]]:
     """
     Shared helper: apply mask filtering, quality filtering, trimming,
@@ -137,6 +150,9 @@ def _filter_and_prepare_locus_bins(
         par_mask: Optional pseudoautosomal interval mask. Body bins that
             overlap PAR are temporarily exempted from quality filtering;
             flank bins that overlap PAR are excluded from baseline regions.
+        hard_inclusion_mask: Optional mask of regions whose overlapping
+            bins are always retained regardless of exclusion, PAR, or
+            quality filtering.
 
     Returns:
         Tuple of (processed DataFrame, interval_bins dict).
@@ -158,6 +174,18 @@ def _filter_and_prepare_locus_bins(
     is_body = (bin_mids >= locus.start) & (bin_mids < locus.end)
     body_df = locus_df[is_body].copy()
     flank_df = locus_df[~is_body].copy()
+    body_hard_include = _mask_overlap_bool(
+        hard_inclusion_mask,
+        locus.chrom,
+        body_df["Start"].values,
+        body_df["End"].values,
+    )
+    flank_hard_include = _mask_overlap_bool(
+        hard_inclusion_mask,
+        locus.chrom,
+        flank_df["Start"].values,
+        flank_df["End"].values,
+    )
 
     # Body bins: exclusion masking with threshold + bypass
     if exclusion_mask is not None and len(body_df) > 0:
@@ -173,7 +201,7 @@ def _filter_and_prepare_locus_bins(
             overlaps[non_bypass] = exclusion_mask.get_overlap_fractions_batch(
                 locus.chrom, _bs[non_bypass], _be[non_bypass],
             )
-        body_keep = in_bypass | (overlaps < exclusion_threshold)
+        body_keep = body_hard_include | in_bypass | (overlaps < exclusion_threshold)
         n_masked = int((~body_keep).sum())
         if n_masked > 0:
             print(f"    Masked {n_masked} body bins due to exclusion overlap")
@@ -184,7 +212,7 @@ def _filter_and_prepare_locus_bins(
         flank_ov = exclusion_mask.get_overlap_fractions_batch(
             locus.chrom, flank_df["Start"].values, flank_df["End"].values,
         )
-        flank_keep = flank_ov == 0.0
+        flank_keep = flank_hard_include | (flank_ov == 0.0)
         n_masked = int((~flank_keep).sum())
         if n_masked > 0:
             print(f"    Masked {n_masked} flank bins due to exclusion overlap")
@@ -195,7 +223,12 @@ def _filter_and_prepare_locus_bins(
         fe_ov = flank_exclusion_mask.get_overlap_fractions_batch(
             locus.chrom, flank_df["Start"].values, flank_df["End"].values,
         )
-        fe_keep = fe_ov == 0.0
+        fe_keep = _mask_overlap_bool(
+            hard_inclusion_mask,
+            locus.chrom,
+            flank_df["Start"].values,
+            flank_df["End"].values,
+        ) | (fe_ov == 0.0)
         n_masked = int((~fe_keep).sum())
         if n_masked > 0:
             print(f"    Masked {n_masked} flank bins due to flank-exclusion overlap")
@@ -205,7 +238,12 @@ def _filter_and_prepare_locus_bins(
         par_ov = par_mask.get_overlap_fractions_batch(
             locus.chrom, flank_df["Start"].values, flank_df["End"].values,
         )
-        par_keep = par_ov == 0.0
+        par_keep = _mask_overlap_bool(
+            hard_inclusion_mask,
+            locus.chrom,
+            flank_df["Start"].values,
+            flank_df["End"].values,
+        ) | (par_ov == 0.0)
         n_masked = int((~par_keep).sum())
         if n_masked > 0:
             print(f"    Masked {n_masked} flank bins due to PAR overlap")
@@ -225,6 +263,7 @@ def _filter_and_prepare_locus_bins(
                 mad_max=quality_params["mad_max"],
                 ploidy_map=ploidy_map,
                 par_mask=par_mask,
+                hard_inclusion_mask=hard_inclusion_mask,
             )
             n_filt = quality_stats["filtered"]
             if n_filt > 0:
@@ -363,6 +402,7 @@ def collect_all_locus_bins(
     min_flank_coverage: float = 0.1,
     regions: Optional[List[Tuple[str, Optional[int], Optional[int]]]] = None,
     ploidy_map: Optional[Dict[Tuple[str, str], int]] = None,
+    hard_inclusion_mask: Optional[ExclusionMask] = None,
 ) -> Tuple[pd.DataFrame, List[LocusBinMapping], Dict[str, GDLocus]]:
     """
     Collect all bins across all GD loci into a single DataFrame.
@@ -431,6 +471,9 @@ def collect_all_locus_bins(
             to adjust per-sample depths to diploid-equivalent before
             computing bin-level median/MAD statistics for quality
             filtering on sex chromosomes.
+        hard_inclusion_mask: Optional mask of regions whose overlapping
+            bins are always retained regardless of exclusion, PAR, or
+            quality filtering.
 
     Returns:
         Tuple of:
@@ -483,6 +526,12 @@ def collect_all_locus_bins(
         n_quality = 0
         n_par_excluded = 0
         par_overlap = np.zeros(len(chrom_df), dtype=bool)
+        hard_include = _mask_overlap_bool(
+            hard_inclusion_mask,
+            chrom,
+            chrom_df["Start"].values,
+            chrom_df["End"].values,
+        )
         chrom_flank_filter_params = get_flank_filter_params(_flank_filter_params, chrom)
         if exclusion_mask is not None:
             overlaps = exclusion_mask.get_overlap_fractions_batch(
@@ -492,15 +541,15 @@ def collect_all_locus_bins(
             # used exclusively for flank boundary computation.  Flanks
             # establish baseline depth and must be free of any exclusion-
             # region contamination, so only truly clean bins are kept.
-            exclusion_keep = overlaps == 0.0
+            exclusion_keep = hard_include | (overlaps == 0.0)
             n_excluded = int((~exclusion_keep).sum())
             keep &= exclusion_keep
         if par_mask is not None:
             par_overlap = par_mask.get_overlap_fractions_batch(
                 chrom, chrom_df["Start"].values, chrom_df["End"].values,
             ) > 0.0
-            n_par_excluded = int(par_overlap.sum())
-            keep &= ~par_overlap
+            n_par_excluded = int((par_overlap & ~hard_include).sum())
+            keep &= (~par_overlap) | hard_include
         if chrom_flank_filter_params is not None:
             quality_keep = np.ones(len(chrom_df), dtype=bool)
             quality_positions = np.flatnonzero(~par_overlap)
@@ -512,6 +561,7 @@ def collect_all_locus_bins(
                     mad_max=chrom_flank_filter_params["mad_max"],
                     ploidy_map=ploidy_map,
                     par_mask=None,
+                    hard_inclusion_mask=hard_inclusion_mask,
                 )
                 quality_keep[quality_positions] = subset_keep
                 n_quality = quality_stats["filtered"]
@@ -660,6 +710,7 @@ def collect_all_locus_bins(
             exclusion_threshold=exclusion_threshold,
             padding=locus_padding,
             exclusion_bypass_regions=exclusion_bypass_regions,
+            hard_inclusion_mask=hard_inclusion_mask,
         )
         if _util.VERBOSE:
             print(f"  Body bins after filtering: {len(body_df)}")
@@ -681,7 +732,13 @@ def collect_all_locus_bins(
                     _fe_ov = flank_exclusion_mask.get_overlap_fractions_batch(
                         locus.chrom, matched["Start"].values, matched["End"].values,
                     )
-                    matched = matched[_fe_ov == 0.0]
+                    _hi = _mask_overlap_bool(
+                        hard_inclusion_mask,
+                        locus.chrom,
+                        matched["Start"].values,
+                        matched["End"].values,
+                    )
+                    matched = matched[_hi | (_fe_ov == 0.0)]
                 if len(matched) > 0:
                     flank_dfs.append(matched)
         flank_df = pd.concat(flank_dfs) if flank_dfs else pd.DataFrame(columns=df.columns)
@@ -824,6 +881,7 @@ def collect_all_locus_bins(
                     min_rebin_coverage=min_rebin_coverage,
                     ploidy_map=ploidy_map,
                     par_mask=par_mask,
+                    hard_inclusion_mask=hard_inclusion_mask,
                 )
 
                 interval_replacements = _select_highres_interval_replacements(
@@ -867,6 +925,7 @@ def collect_all_locus_bins(
                             min_rebin_coverage=min_rebin_coverage,
                             ploidy_map=ploidy_map,
                             par_mask=par_mask,
+                            hard_inclusion_mask=hard_inclusion_mask,
                         )
 
                         retry_undercovered = [
@@ -1453,6 +1512,10 @@ def parse_args():
         help="BED file(s) of pseudoautosomal intervals to exclude from flanks and ignore during ploidy-aware body filtering",
     )
     parser.add_argument(
+        "--hard-inclusion-intervals", nargs="+", action="append", default=[],
+        help="BED file(s) of regions whose overlapping bins are always retained, overriding exclusion, PAR, and quality filtering",
+    )
+    parser.add_argument(
         "-o", "--output-dir", required=True,
         help="Output directory for preprocessed files",
     )
@@ -1525,6 +1588,7 @@ def main():
     args.exclusion_intervals = _flatten_multi_args(args.exclusion_intervals)
     args.flank_exclusion_intervals = _flatten_multi_args(args.flank_exclusion_intervals)
     args.par_intervals = _flatten_multi_args(args.par_intervals)
+    args.hard_inclusion_intervals = _flatten_multi_args(args.hard_inclusion_intervals)
     _util.VERBOSE = args.verbose
 
     os.makedirs(args.output_dir, exist_ok=True)
@@ -1575,6 +1639,14 @@ def main():
             label="pseudoautosomal intervals",
         )
 
+    hard_inclusion_mask = None
+    if args.hard_inclusion_intervals:
+        print(f"\nLoading {len(args.hard_inclusion_intervals)} hard inclusion interval file(s)")
+        hard_inclusion_mask = ExclusionMask(
+            args.hard_inclusion_intervals,
+            label="hard inclusion regions",
+        )
+
     # Load and normalise read depth data
     df = read_data(args.input)
     sample_cols = get_sample_columns(df)
@@ -1612,6 +1684,7 @@ def main():
         median_max=args.median_max, mad_max=args.mad_max,
         ploidy_map=ploidy_map,
         par_mask=par_mask,
+        hard_inclusion_mask=hard_inclusion_mask,
     )
 
     # Build quality-filter params
@@ -1649,6 +1722,7 @@ def main():
         min_flank_coverage=args.min_flank_coverage,
         regions=parsed_regions,
         ploidy_map=ploidy_map,
+        hard_inclusion_mask=hard_inclusion_mask,
     )
 
     if len(combined_df) == 0:

@@ -27,6 +27,8 @@ PLOT_TIMING_ENABLED = os.getenv("GATK_SV_GD_PLOT_TIMING", "").strip().lower() in
     "1", "true", "yes", "on",
 }
 
+_MAX_MINOR_TICKS = 50
+
 
 def _print_overview_timing(label: str, start_time: float) -> None:
     if PLOT_TIMING_ENABLED:
@@ -372,7 +374,8 @@ class FlankCompressor:
         #    display range so the compression is visible ----------------
         body_genomic = self.locus_end - self.locus_start
         if body_genomic > 0:
-            step = body_genomic * 0.10
+            region_genomic = max(self.region_end - self.region_start, 1.0)
+            step = max(body_genomic * 0.10, region_genomic / _MAX_MINOR_TICKS)
             minor_genomic = []
             # Left from locus_start into left flank
             pos = self.locus_start - step

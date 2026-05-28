@@ -141,6 +141,7 @@ def run_gd_analysis(
     df: pd.DataFrame,
     gd_table: GDTable,
     exclusion_mask: Optional[ExclusionMask],
+    hard_inclusion_mask: Optional[ExclusionMask],
     args: argparse.Namespace,
     device: str = "cpu",
     column_medians: Optional[np.ndarray] = None,
@@ -165,6 +166,8 @@ def run_gd_analysis(
         df: DataFrame with normalized read depth
         gd_table: GDTable with locus definitions
         exclusion_mask: Optional ExclusionMask for filtering
+        hard_inclusion_mask: Optional mask of regions whose overlapping
+            bins are always retained during preprocessing.
         args: Command line arguments
         device: Torch device
         column_medians: Per-sample autosomal median raw counts (before
@@ -213,6 +216,7 @@ def run_gd_analysis(
             min_flank_bins=args.min_flank_bins,
             min_flank_coverage=args.min_flank_coverage,
             ploidy_map=ploidy_map,
+            hard_inclusion_mask=hard_inclusion_mask,
         )
 
     if len(combined_df) == 0:
@@ -346,6 +350,13 @@ def parse_args():
              "mask.  Only the first three columns (chr, start, end) are "
              "required; additional columns are ignored.  May be specified "
              "multiple times or as a space-separated list.",
+    )
+    parser.add_argument(
+        "--hard-inclusion-intervals",
+        nargs="+",
+        action="append",
+        default=[],
+        help="BED file(s) of regions whose overlapping bins are always retained, overriding exclusion and quality filtering.",
     )
     parser.add_argument(
         "-o", "--output-dir",
@@ -732,6 +743,7 @@ def main():
     """Main function to run GD CNV detection pipeline."""
     args = parse_args()
     args.exclusion_intervals = _flatten_multi_args(args.exclusion_intervals)
+    args.hard_inclusion_intervals = _flatten_multi_args(args.hard_inclusion_intervals)
 
     _util.VERBOSE = args.verbose
 
@@ -792,7 +804,7 @@ def main():
 
         # Run GD analysis with preprocessed data (no bin collection)
         run_gd_analysis(
-            pd.DataFrame(), GDTable.__new__(GDTable), None, args,
+            pd.DataFrame(), GDTable.__new__(GDTable), None, None, args,
             device=args.device,
             preprocessed_bins=preprocessed_bins,
             preprocessed_mappings=preprocessed_mappings,
@@ -828,6 +840,14 @@ def main():
             exclusion_mask = ExclusionMask(
                 args.exclusion_intervals,
                 label="exclusion regions",
+            )
+
+        hard_inclusion_mask = None
+        if args.hard_inclusion_intervals:
+            print(f"\nLoading {len(args.hard_inclusion_intervals)} hard inclusion interval file(s)")
+            hard_inclusion_mask = ExclusionMask(
+                args.hard_inclusion_intervals,
+                label="hard inclusion regions",
             )
 
         # Load read depth data
@@ -892,6 +912,7 @@ def main():
             median_max=args.median_max,
             mad_max=args.mad_max,
             ploidy_map=ploidy_map,
+            hard_inclusion_mask=hard_inclusion_mask,
         )
 
         # Set up Pyro
@@ -905,7 +926,7 @@ def main():
 
         # Run GD analysis (training and inference only)
         run_gd_analysis(
-            df, gd_table, exclusion_mask, args, device=args.device,
+            df, gd_table, exclusion_mask, hard_inclusion_mask, args, device=args.device,
             column_medians=column_medians,
             lowres_median_bin_size=lowres_median_bin_size,
             normalization_metadata=normalization_metadata,
