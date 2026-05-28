@@ -171,6 +171,12 @@ gatk-sv-gd infer \
   --device cpu
 ```
 
+`preprocess` writes `normalization_metadata.tsv`, which records the per-sample
+raw-count medians and the reference low-resolution bin size used by the
+count-anchored spatial variance model. `infer` now requires that metadata when
+reading a preprocessed directory; if it is missing, rerun `preprocess` or also
+provide `--input` so `infer` can recompute it.
+
 Call carriers from posterior probabilities. The default calling mode is direct
 posterior marginal scoring:
 
@@ -220,6 +226,7 @@ PDF report and machine-readable sidecar tables:
 ```bash
 gatk-sv-gd aggregate gd_work_a gd_work_b \
   --output-dir aggregate \
+  --min-confidence 0.5 \
   --batch-label batch_a \
   --batch-label batch_b
 ```
@@ -233,7 +240,9 @@ full signal plots; it summarizes calls and evaluation reports across work
 directories, adds per-case evidence plots from call metrics, records where
 existing plot artifacts were found, and derives call-selection criteria from the
 call outputs so confident and non-confident case sections stay consistent with
-the original calling step.
+the original calling step. `--min-confidence` is only a lower bound for showing
+non-confident best-match calls in the aggregate outputs; it does not affect the
+confident carriers emitted by `call`.
 
 ### One-Step Inference Mode
 
@@ -250,7 +259,9 @@ gatk-sv-gd infer \
 ```
 
 This mode performs bin collection before model training and writes the same
-posterior outputs as the two-step workflow.
+posterior outputs as the two-step workflow. In direct-input mode, `infer`
+computes and writes `normalization_metadata.tsv` automatically from the raw
+depth matrix before fitting the count-anchored spatial variance model.
 
 ### Auxiliary Commands
 
@@ -316,9 +327,18 @@ For bin `b` and sample `s`:
 
 ```text
 z[b,s] ~ Categorical(pair_state_probs[b])
-depth[b,s] ~ Normal(total_cn[z[b,s]] * bin_bias[b], sqrt(variance[b,s]))
-variance[b,s] = (sample_var[s] + bin_var[b]) * bin_size_factor / interval_size[b]
+expected_depth[b,s] = total_cn[z[b,s]] * bin_bias[b]
+depth[b,s] ~ Normal(expected_depth[b,s], sqrt(variance[b,s]))
+reference_variance[s] = 4 / raw_count_median[s] * reference_bin_size / bin_size_factor
+poisson_variance[b,s] = reference_variance[s] * bin_size_factor / interval_size[b] * expected_depth[b,s] / 2
+variance[b,s] = poisson_variance[b,s] + expected_depth[b,s]^2 * sample_var[s] * f(interval_size[b]; length_scale_var)
 ```
+
+Here `raw_count_median[s]` and `reference_bin_size` come from
+`normalization_metadata.tsv`, and `f(L; ell)` is the continuous-AR(1) spatial
+aggregation factor. It approaches 1 for short bins and decays approximately as
+`2 * ell / L` once the interval length is much larger than the learned shared
+correlation length `length_scale_var`.
 
 When BAF summaries are available, an additional centered log-likelihood term
 compares observed minor-allele BAF with the expected BAF for the pair state. BAF
@@ -333,9 +353,10 @@ The material assumptions are:
 | Assumption | Type | Justification and consequence |
 | --- | --- | --- |
 | Retained depth bins are comparable across samples after median scaling. | Domain-supported | Upstream GATK-SV coverage normalization and per-sample median rescaling put diploid depth near 2.0. Residual bin and sample effects are modeled explicitly. |
+| Sample-level raw-count medians capture the dominant Poisson baseline at the reference bin size. | Domain-supported | The count-anchored variance term uses preprocessing-time raw-count medians to tie the depth likelihood to observed sampling depth instead of a free variance floor. |
 | Most bins and samples are reference at any given GD locus. | Domain-supported | GD events are rare in a cohort, so priors favor the diploid pair state `(1,1)`. |
 | Bin-specific bias is multiplicative. | Convenience-driven | GC, mappability, and recurrent bin effects often act as stable multiplicative depth shifts. |
-| Sample and bin variance contributions are additive before bin-size scaling. | Convenience-driven | This is a simple identifiable noise model that captures noisy samples and noisy bins without a large interaction term. |
+| Excess depth variance is sample-specific and decays with interval length according to a shared physical correlation scale. | Mechanistic approximation | The spatial aggregation factor preserves full excess variance for short bins and shrinks it toward zero for long bins, matching the idea that adjacent counting noise averages out over longer intervals. |
 | BAF observations are conditionally informative when SNP support exists. | Domain-supported | Allele balance distinguishes copy states with the same or similar depth evidence, but unsupported bins are masked out. |
 | GD entries are represented by annotated breakpoint intervals. | Domain-supported | The GD table defines the recurrent events being tested. Unknown or atypical breakpoints are outside the primary model target. |
 | Samples are conditionally exchangeable within a bin given shared bin parameters. | Unverified | This enables cohort-level pooling; batch-specific effects not captured by filtering or variance terms can reduce calibration. |
@@ -349,9 +370,14 @@ The model uses these main latent variables and priors:
 | `pair_state_probs[b]` | Dirichlet with `alpha_ref` on `(1,1)` and `alpha_non_ref` on other pair states | Per-bin state prior shared across samples. |
 | `z[b,s]` | Categorical over `pair_state_probs[b]` | Latent sample/bin copy state. |
 | `bin_bias[b]` | LogNormal centered at 1.0, unless frozen | Per-bin mean depth bias. |
-| `sample_var[s]` | Exponential | Sample-level noise. |
-| `bin_var[b]` | Exponential, unless frozen | Bin-level noise. |
+| `reference_variance[s]` | Deterministic from `raw_count_median[s]` and `reference_bin_size` | Sample-specific count-anchored Poisson baseline at diploid depth. |
+| `sample_var[s]` | Exponential | Sample-level excess variance above the Poisson baseline. |
+| `length_scale_var` | Exponential | Shared physical correlation length controlling how quickly excess variance averages out across longer bins. |
 | `baf_temperature` | LogNormal, or fixed with `--fixed-baf-temperature` | Global scale for BAF variance. |
+
+The old per-bin excess variance latent is no longer part of the fitted model.
+Compatibility CLI flags such as `--var-bin` and `--unfreeze-bin-var` are still
+accepted, but they do not change the spatial count-anchored likelihood.
 
 Continuous latent variables are fit with stochastic variational inference using
 Pyro. The default guide is `AutoDiagonalNormal` with an optional AutoDelta MAP
@@ -388,9 +414,10 @@ The workflow includes several defenses against sparse, noisy, or biased data:
 ### Scaling Strategy
 
 For small datasets, the strongest stabilizers are the reference-favoring
-Dirichlet prior, partial pooling through shared bin parameters, optional fixed
-variance or bias parameters, and exact six-state posterior computation after
-fitting. These keep the model identifiable when carrier counts are sparse.
+Dirichlet prior, the count-anchored Poisson baseline, partial pooling through
+shared bin parameters, optional fixed bias parameters, and exact six-state
+posterior computation after fitting. These keep the model identifiable when
+carrier counts are sparse.
 
 For large datasets, preprocessing can be cached and reused; high-resolution
 counts and BAF records are queried by tabix over regions of interest; and model
@@ -422,7 +449,8 @@ state changes more likely at annotated breakpoint boundaries.
 The intended validation loop is:
 
 - Run prior and parameter-sensitivity checks by varying `alpha_ref`,
-  `alpha_non_ref`, variance priors, BAF temperature, and calling thresholds.
+  `alpha_non_ref`, `var_sample`, `var_length_scale`, BAF temperature, and
+  calling thresholds.
 - Inspect posterior predictive behavior through carrier plots, locus overview
   plots, event-marginal traces, and BAF panels.
 - Evaluate calls against either a curated BED-style truth table or the
@@ -473,6 +501,7 @@ Routine per-sample, per-bin, and progress-style messages are suppressed.
 | `bin_mappings.tsv.gz` | Mapping from model array index to cluster, interval, chromosome, start, and end. Required by `call`. |
 | `locus_intervals.tsv.gz` | Interval coordinates for each retained locus. |
 | `gd_entry_intervals.tsv.gz` | Mapping from each GD_ID and breakpoint pair to the one or more modeled sub-intervals it covers. |
+| `normalization_metadata.tsv` | Per-sample raw-count medians and the shared reference low-resolution bin size used by the count-anchored spatial variance model. Required by `infer`. |
 | `ploidy_estimates.tsv` | Per-sample, per-contig median depth and rounded ploidy. |
 | `gd_table_filtered.tsv` | GD table restricted to loci that survived preprocessing. Recommended for downstream `call`, `plot`, and `eval`. |
 | `preprocessed_baf.tsv.gz` | Optional BAF records filtered to retained regions. |
@@ -484,8 +513,9 @@ Routine per-sample, per-bin, and progress-style messages are suppressed.
 | File | Description |
 | --- | --- |
 | `cn_posteriors.tsv.gz` | One row per bin/sample with depth, total-CN posterior columns such as `prob_cn_0`, pair-state posterior columns such as `prob_pair_0_1`, MAP state columns, and optional BAF summaries. |
-| `sample_posteriors.tsv.gz` | Sample-level MAP noise parameters and BAF temperature/variance scale when present. |
-| `bin_posteriors.tsv.gz` | Bin-level MAP bias, variance, total-CN priors, and pair-state priors. |
+| `sample_posteriors.tsv.gz` | Sample-level MAP parameters including `sample_var_map`, shared `length_scale_var_map`, and BAF temperature/variance scale when present. |
+| `bin_posteriors.tsv.gz` | Bin-level MAP bias, compatibility `bin_var_map` values (currently zero under the spatial model), total-CN priors, and pair-state priors. |
+| `normalization_metadata.tsv` | Copy of the normalization metadata used to anchor the depth variance model. Written in both direct-input and preprocessed modes. |
 | `bin_mappings.tsv.gz` | Written in direct-input mode; reused from `preprocess` in preprocessed mode. |
 | `locus_intervals.tsv.gz` | Written in direct-input mode. |
 | `gd_entry_intervals.tsv.gz` | Written in direct-input mode. |

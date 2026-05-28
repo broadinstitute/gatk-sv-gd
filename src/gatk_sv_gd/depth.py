@@ -28,6 +28,123 @@ from pyro.infer.svi import SVI
 from gatk_sv_gd._util import get_logger, get_sample_columns
 
 
+_MINOR_BAF_UNIFORM_LOG_DENSITY = math.log(2.0)
+_NORMALIZED_DIPLOID_DEPTH = 2.0
+_MIN_DEPTH_VARIANCE_SCALE = 1e-6
+_MIN_SPATIAL_AGGREGATE_RATIO = 1e-8
+_SPATIAL_AGGREGATE_TAYLOR_THRESHOLD = 1e-2
+
+
+def _lognormal_location_from_mean(mean: float, scale: float) -> float:
+    """Return the LogNormal location matching a natural-scale mean."""
+    return math.log(float(mean)) - 0.5 * float(scale) ** 2
+
+
+def _depth_variance_scale_torch(
+    expected_depth: torch.Tensor,
+    power: Union[float, torch.Tensor] = 1.0,
+) -> torch.Tensor:
+    """Scale variance with expected normalized depth relative to diploid depth."""
+    scaled_depth = torch.clamp(
+        expected_depth / _NORMALIZED_DIPLOID_DEPTH,
+        min=_MIN_DEPTH_VARIANCE_SCALE,
+    )
+    return torch.clamp(
+        torch.pow(scaled_depth, power),
+        min=_MIN_DEPTH_VARIANCE_SCALE,
+    )
+
+
+def _depth_variance_scale_numpy(
+    expected_depth: np.ndarray,
+    power: Union[float, np.ndarray] = 1.0,
+) -> np.ndarray:
+    """NumPy counterpart of :func:`_depth_variance_scale_torch`."""
+    expected_depth = np.asarray(expected_depth, dtype=np.float64)
+    scaled_depth = np.maximum(
+        expected_depth / _NORMALIZED_DIPLOID_DEPTH,
+        _MIN_DEPTH_VARIANCE_SCALE,
+    )
+    return np.maximum(
+        np.power(scaled_depth, power),
+        _MIN_DEPTH_VARIANCE_SCALE,
+    )
+
+
+def _count_anchored_reference_variance_torch(
+    sample_raw_count_medians: torch.Tensor,
+    reference_bin_size: float,
+    bin_size_factor: float,
+) -> torch.Tensor:
+    """Return diploid Poisson variance in normalized-depth units."""
+    variance = 4.0 / sample_raw_count_medians
+    if bin_size_factor > 0:
+        variance = variance * (reference_bin_size / bin_size_factor)
+    return variance.view(1, -1)
+
+
+def _count_anchored_reference_variance_numpy(
+    sample_raw_count_medians: np.ndarray,
+    reference_bin_size: float,
+    bin_size_factor: float,
+) -> np.ndarray:
+    """NumPy counterpart of :func:`_count_anchored_reference_variance_torch`."""
+    sample_raw_count_medians = np.asarray(sample_raw_count_medians, dtype=np.float64).reshape(-1)
+    variance = 4.0 / sample_raw_count_medians
+    if bin_size_factor > 0:
+        variance = variance * (reference_bin_size / bin_size_factor)
+    return variance.reshape(1, -1)
+
+
+def _size_modifier_torch(interval_sizes: torch.Tensor, bin_size_factor: float) -> torch.Tensor:
+    """Return the active bin-size modifier for depth variance."""
+    if bin_size_factor > 0:
+        return bin_size_factor / interval_sizes
+    return torch.ones_like(interval_sizes)
+
+
+def _size_modifier_numpy(interval_sizes: np.ndarray, bin_size_factor: float) -> np.ndarray:
+    """NumPy counterpart of :func:`_size_modifier_torch`."""
+    interval_sizes = np.asarray(interval_sizes, dtype=np.float64)
+    if bin_size_factor > 0:
+        return bin_size_factor / interval_sizes
+    return np.ones_like(interval_sizes, dtype=np.float64)
+
+
+def _spatial_aggregate_variance_scale_torch(
+    interval_sizes: torch.Tensor,
+    length_scale: torch.Tensor,
+) -> torch.Tensor:
+    """Return the continuous-AR(1) spatial aggregation factor for interval size."""
+    safe_length_scale = torch.clamp(length_scale, min=_MIN_SPATIAL_AGGREGATE_RATIO)
+    x = torch.clamp(interval_sizes / safe_length_scale, min=_MIN_SPATIAL_AGGREGATE_RATIO)
+    one_minus_exp_neg_x = -torch.expm1(-x)
+    small_x_val = 1.0 - (x / 3.0)
+    large_x_val = (2.0 / x) * (1.0 - (one_minus_exp_neg_x / x))
+    return torch.clamp(
+        torch.where(x < _SPATIAL_AGGREGATE_TAYLOR_THRESHOLD, small_x_val, large_x_val),
+        min=0.0,
+    )
+
+
+def _spatial_aggregate_variance_scale_numpy(
+    interval_sizes: np.ndarray,
+    length_scale: Union[float, np.ndarray],
+) -> np.ndarray:
+    """NumPy counterpart of :func:`_spatial_aggregate_variance_scale_torch`."""
+    interval_sizes = np.asarray(interval_sizes, dtype=np.float64)
+    safe_length_scale = np.clip(np.asarray(length_scale, dtype=np.float64), _MIN_SPATIAL_AGGREGATE_RATIO, None)
+    x = np.clip(interval_sizes / safe_length_scale, _MIN_SPATIAL_AGGREGATE_RATIO, None)
+    one_minus_exp_neg_x = -np.expm1(-x)
+    small_x_val = 1.0 - (x / 3.0)
+    large_x_val = (2.0 / x) * (1.0 - (one_minus_exp_neg_x / x))
+    return np.clip(
+        np.where(x < _SPATIAL_AGGREGATE_TAYLOR_THRESHOLD, small_x_val, large_x_val),
+        0.0,
+        None,
+    )
+
+
 def build_diploid_pair_states(max_hap_cn: int = 2) -> List[Tuple[int, int]]:
     """Return canonical unordered diploid pair states with h1 <= h2."""
     return [
@@ -105,6 +222,27 @@ def _center_state_log_likelihood_table_numpy(
     return centered
 
 
+def _select_state_log_likelihood_torch(
+    log_lik_table: torch.Tensor,
+    state_index: torch.Tensor,
+) -> torch.Tensor:
+    """Select per-cell state log-likelihoods from a state-major tensor."""
+    data_ndim = log_lik_table.dim() - 1
+    enum_shape = state_index.shape[:-data_ndim]
+    target_shape = enum_shape + log_lik_table.shape[1:]
+    gather_dim = len(enum_shape)
+
+    expanded_state_index = state_index.expand(target_shape)
+    expanded_log_lik_table = log_lik_table.view((1,) * gather_dim + log_lik_table.shape).expand(
+        enum_shape + log_lik_table.shape
+    )
+    return torch.gather(
+        expanded_log_lik_table,
+        dim=gather_dim,
+        index=expanded_state_index.unsqueeze(gather_dim),
+    ).squeeze(gather_dim)
+
+
 def _clip_baf_variance_torch(value: torch.Tensor) -> torch.Tensor:
     """Clamp scaled BAF variances to a finite range before Normal log-probs."""
     return torch.clamp(
@@ -140,6 +278,47 @@ def _clip_baf_variance_numpy(value: np.ndarray) -> np.ndarray:
         np.nan_to_num(value, nan=1e6, posinf=1e6, neginf=1e-6),
         1e-6,
         1e6,
+    )
+
+
+def _robust_baf_log_likelihood_torch(
+    log_lik_table: torch.Tensor,
+    outlier_rate: float,
+) -> torch.Tensor:
+    """Mix Gaussian BAF evidence with a uniform minor-allele noise floor."""
+    if outlier_rate <= 0.0:
+        return log_lik_table
+    if outlier_rate >= 1.0:
+        return torch.full_like(log_lik_table, _MINOR_BAF_UNIFORM_LOG_DENSITY)
+    inlier_log_weight = torch.tensor(
+        math.log1p(-outlier_rate),
+        device=log_lik_table.device,
+        dtype=log_lik_table.dtype,
+    )
+    outlier_log_weight = torch.tensor(
+        math.log(outlier_rate),
+        device=log_lik_table.device,
+        dtype=log_lik_table.dtype,
+    )
+    uniform_log_lik = torch.full_like(log_lik_table, _MINOR_BAF_UNIFORM_LOG_DENSITY)
+    return torch.logaddexp(
+        log_lik_table + inlier_log_weight,
+        uniform_log_lik + outlier_log_weight,
+    )
+
+
+def _robust_baf_log_likelihood_numpy(
+    log_lik_table: np.ndarray,
+    outlier_rate: float,
+) -> np.ndarray:
+    """NumPy counterpart of :func:`_robust_baf_log_likelihood_torch`."""
+    if outlier_rate <= 0.0:
+        return log_lik_table
+    if outlier_rate >= 1.0:
+        return np.full_like(log_lik_table, _MINOR_BAF_UNIFORM_LOG_DENSITY)
+    return np.logaddexp(
+        log_lik_table + math.log1p(-outlier_rate),
+        _MINOR_BAF_UNIFORM_LOG_DENSITY + math.log(outlier_rate),
     )
 
 
@@ -538,10 +717,11 @@ class CNVModel:
         n_states: int = 6,
         alpha_ref: float = 50.0,
         alpha_non_ref: float = 1.0,
-        state_prior_weight: float = 1.0,
         baf_temperature: float = 25.0,
         learn_baf_temperature: bool = True,
         baf_temperature_prior_scale: float = 0.5,
+        baf_outlier_rate: float = 0.0,
+        null_state_prior: float = 1e-4,
         var_bias_bin: float = 0.1,
         var_sample: float = 0.2,
         var_bin: float = 0.2,
@@ -549,6 +729,9 @@ class CNVModel:
         freeze_bin_var: bool = False,
         freeze_pair_state_priors: bool = False,
         bin_size_factor: float = 10000.0,
+        sample_raw_count_medians: Optional[Sequence[float]] = None,
+        reference_bin_size: Optional[float] = None,
+        var_length_scale: float = 20000.0,
         device: str = "cpu",
         dtype: torch.dtype = torch.float32,
         debug: bool = False,
@@ -561,9 +744,6 @@ class CNVModel:
                 values [0, 1, 2]: (0,0), (0,1), (0,2), (1,1), (1,2), (2,2).
             alpha_ref: Dirichlet concentration for reference state ((1,1))
             alpha_non_ref: Dirichlet concentration for non-reference states
-            state_prior_weight: Multiplicative weight applied to the learned
-                per-bin pair-state log-prior when reconstructing analytical
-                discrete posteriors. Values < 1.0 temper overly sharp priors.
             baf_temperature: Fixed global multiplicative BAF variance scale
                 when ``learn_baf_temperature`` is disabled; otherwise the
                 LogNormal prior median for the learned global BAF variance
@@ -573,20 +753,48 @@ class CNVModel:
                 temperature instead of keeping ``baf_temperature`` fixed.
             baf_temperature_prior_scale: LogNormal prior scale for the learned
                 global BAF variance temperature.
+            baf_outlier_rate: Mixture weight for a uniform minor-allele BAF
+                noise component. Positive values cap the penalty from
+                contradictory off-model BAF bins without weakening coherent
+                BAF evidence everywhere.
+            null_state_prior: Prior probability assigned to an outer null
+                state during exact discrete inference. The null state carries
+                no depth or BAF evidence and contributes neutral 1:1 event
+                odds for off-model bins. Set to 0 to disable it.
             var_bias_bin: Variance for per-bin mean bias (log-normal)
-            var_sample: Variance for per-sample variance factor (log-normal)
-            var_bin: Variance for per-bin variance factor (log-normal)
+            var_sample: Mean of the Exponential prior on per-sample excess
+                overdispersion above the count-anchored Poisson baseline.
+            var_bin: Deprecated compatibility parameter. The spatial
+                count-anchored model does not use per-bin excess variance and
+                this value is ignored.
             freeze_bin_bias: If true, fix per-bin mean bias at 1.0 instead
                 of inferring it.
-            freeze_bin_var: If true, fix per-bin variance at ``var_bin``
-                instead of inferring a separate value per bin.
+            freeze_bin_var: Deprecated compatibility flag retained for API
+                stability. Per-bin excess variance is no longer inferred.
             freeze_pair_state_priors: If true, fix per-bin pair-state priors
                 to the Dirichlet prior mean implied by ``alpha_ref`` and
                 ``alpha_non_ref``.
             bin_size_factor: Reference bin size (bp) for variance scaling.
                 The total variance is multiplied by
-                ``bin_size_factor / interval_size`` so that smaller bins
-                have proportionally higher variance.
+                ``(bin_size_factor / interval_size) * (expected_depth / 2.0)``
+                so that smaller bins and higher expected normalized depth
+                both increase variance relative to a diploid depth baseline
+                of 2.0.
+            sample_raw_count_medians: Optional per-sample autosomal median raw
+                counts at the reference low-resolution bin size. Training and
+                exact inference require these values together with
+                ``reference_bin_size``; callers may omit them only when
+                instantiating the model for configuration-only use.
+            reference_bin_size: Reference bin size in bp corresponding to the
+                supplied ``sample_raw_count_medians``.
+            var_length_scale: Mean of the Exponential prior on the shared
+                physical correlation length-scale ``length_scale_var`` in bp.
+                In the count-anchored path the excess variance is modeled as
+                ``d**2 * sample_var * f(L; length_scale_var)`` where
+                ``f`` is the continuous-AR(1) spatial aggregation factor.
+                This saturates to ``d**2 * sample_var`` for small bins and
+                decays approximately as ``d**2 * sample_var * 2 * ell / L``
+                for bins much larger than the correlation length.
             device: torch device
             dtype: torch data type
             debug: Whether to print debug statements in model()
@@ -595,10 +803,11 @@ class CNVModel:
         self.n_states = n_states
         self.alpha_ref = alpha_ref
         self.alpha_non_ref = alpha_non_ref
-        self.state_prior_weight = state_prior_weight
         self.baf_temperature = float(baf_temperature)
         self.learn_baf_temperature = learn_baf_temperature
         self.baf_temperature_prior_scale = baf_temperature_prior_scale
+        self.baf_outlier_rate = float(baf_outlier_rate)
+        self.null_state_prior = float(null_state_prior)
         self.var_bias_bin = var_bias_bin
         self.var_sample = var_sample
         self.var_bin = var_bin
@@ -606,6 +815,10 @@ class CNVModel:
         self.freeze_bin_var = freeze_bin_var
         self.freeze_pair_state_priors = freeze_pair_state_priors
         self.bin_size_factor = bin_size_factor
+        self.sample_raw_count_medians = None
+        self.reference_bin_size = None
+        self.var_length_scale = float(var_length_scale)
+        self.learn_length_scale_var = True
         self.device = device
         self.dtype = dtype
         self.debug = debug
@@ -614,6 +827,12 @@ class CNVModel:
             raise ValueError("baf_temperature must be non-negative.")
         if self.baf_temperature_prior_scale <= 0:
             raise ValueError("baf_temperature_prior_scale must be positive.")
+        if not 0.0 <= self.baf_outlier_rate < 1.0:
+            raise ValueError("baf_outlier_rate must be in [0, 1).")
+        if not 0.0 <= self.null_state_prior < 1.0:
+            raise ValueError("null_state_prior must be in [0, 1).")
+        if self.var_length_scale <= 0:
+            raise ValueError("var_length_scale must be positive.")
         if self.learn_baf_temperature and self.baf_temperature <= 0:
             raise ValueError("learn_baf_temperature requires baf_temperature > 0.")
         self.pair_states = build_diploid_pair_states(max_hap_cn=2)
@@ -641,6 +860,35 @@ class CNVModel:
             device=self.device,
             dtype=self.dtype,
         )
+        self._length_scale_var_rate_t = torch.tensor(
+            1.0 / self.var_length_scale,
+            device=self.device,
+            dtype=self.dtype,
+        )
+        self._count_anchored_reference_variance_t = None
+        self._count_anchored_reference_variance_np = None
+        if (sample_raw_count_medians is None) != (reference_bin_size is None):
+            raise ValueError(
+                "sample_raw_count_medians and reference_bin_size must be provided together."
+            )
+        if sample_raw_count_medians is not None:
+            sample_raw_count_medians = np.asarray(sample_raw_count_medians, dtype=np.float64).reshape(-1)
+            if np.any(sample_raw_count_medians <= 0):
+                raise ValueError("sample_raw_count_medians must all be positive.")
+            if float(reference_bin_size) <= 0:
+                raise ValueError("reference_bin_size must be positive.")
+            self.sample_raw_count_medians = sample_raw_count_medians
+            self.reference_bin_size = float(reference_bin_size)
+            self._count_anchored_reference_variance_np = _count_anchored_reference_variance_numpy(
+                self.sample_raw_count_medians,
+                self.reference_bin_size,
+                self.bin_size_factor,
+            )
+            self._count_anchored_reference_variance_t = torch.tensor(
+                self._count_anchored_reference_variance_np,
+                device=self.device,
+                dtype=self.dtype,
+            )
         self._baf_temperature_log_t = torch.tensor(
             _positive_clipped_log(self.baf_temperature),
             device=self.device,
@@ -656,13 +904,6 @@ class CNVModel:
             device=self.device,
             dtype=self.dtype,
         )
-        self._bin_var_rate_t = None
-        if self.var_bin > 0:
-            self._bin_var_rate_t = torch.tensor(
-                1.0 / self.var_bin,
-                device=self.device,
-                dtype=self.dtype,
-            )
         self._pair_state_prior_mean_np = self._pair_state_prior_mean_values().astype(np.float64, copy=False)
         self._pair_state_prior_mean_t = torch.tensor(
             self._pair_state_prior_mean_np,
@@ -685,10 +926,9 @@ class CNVModel:
         if not self.freeze_bin_bias:
             self.latent_sites.append("bin_bias")
         self.latent_sites.append("sample_var")
+        self.latent_sites.append("length_scale_var")
         if self.learn_baf_temperature:
             self.latent_sites.append("baf_temperature")
-        if not self.freeze_bin_var:
-            self.latent_sites.append("bin_var")
         if not self.freeze_pair_state_priors:
             self.latent_sites.append("pair_state_probs")
 
@@ -809,7 +1049,6 @@ class CNVModel:
         stop_relative_change = None
         epoch_loss = float("nan")
 
-        del log_freq
         for epoch in range(max_iter):
             epoch_loss = svi.step(
                 depth=data.depth,
@@ -829,6 +1068,23 @@ class CNVModel:
                     self.loss_history["elbo"],
                     convergence_window,
                 )
+
+            if log_freq > 0 and (epoch + 1) % log_freq == 0:
+                if relative_change is None:
+                    logger.info(
+                        "%s progress: epoch=%d loss=%.4f",
+                        progress_desc,
+                        epoch + 1,
+                        epoch_loss,
+                    )
+                else:
+                    logger.info(
+                        "%s progress: epoch=%d loss=%.4f rel_change=%.2e",
+                        progress_desc,
+                        epoch + 1,
+                        epoch_loss,
+                        relative_change,
+                    )
 
             if early_stopping and relative_change is not None:
                 if relative_change < convergence_rtol:
@@ -897,11 +1153,33 @@ class CNVModel:
         repeated_probs = np.broadcast_to(base_probs, (n_bins, 1, self.n_states)).copy()
         return torch.tensor(repeated_probs, device=self.device, dtype=self.dtype)
 
+    def _null_state_prior_value(self) -> float:
+        return float(getattr(self, "null_state_prior", 0.0))
+
+    def _effective_pair_state_prior_values(self, pair_state_probs: np.ndarray) -> np.ndarray:
+        probs = np.asarray(pair_state_probs, dtype=np.float64)
+        if probs.ndim == 1:
+            probs = probs.reshape(1, -1)
+        row_sums = probs.sum(axis=1, keepdims=True)
+        normalized = np.divide(
+            probs,
+            np.maximum(row_sums, 1e-30),
+            out=np.zeros_like(probs, dtype=np.float64),
+            where=row_sums > 0,
+        )
+        return normalized * (1.0 - self._null_state_prior_value())
+
     def _baf_scale_numpy(self, maps: dict, n_samples: int = 0) -> float:
         if "baf_temperature" in maps:
             values = np.asarray(maps["baf_temperature"]).squeeze()
             return float(np.asarray(values, dtype=np.float64).mean())
         return float(self.baf_temperature)
+
+    def _length_scale_var_numpy(self, maps: dict) -> float:
+        if "length_scale_var" in maps:
+            values = np.asarray(maps["length_scale_var"]).squeeze()
+            return float(np.asarray(values, dtype=np.float64).mean())
+        return float(getattr(self, "var_length_scale", 1.0))
 
     def _baf_reference_probs_tensor(self) -> torch.Tensor:
         return self._pair_state_prior_mean_t
@@ -924,16 +1202,25 @@ class CNVModel:
             print(f"depth.shape: {depth.shape}")
 
         zero_t = self._zero_t
+        if self._count_anchored_reference_variance_t is None:
+            raise RuntimeError(
+                "sample_raw_count_medians and reference_bin_size are required "
+                "to train the count-anchored spatial variance model."
+            )
 
         # Plates for bins and samples
         plate_bins = pyro.plate("bins", n_bins, dim=-2, device=self.device)
         plate_samples = pyro.plate("samples", n_samples, dim=-1, device=self.device)
 
-        # Per-sample variance factor (log-normal prior)
+        # Per-sample excess variance or overdispersion factor.
         with plate_samples:
             sample_var = pyro.sample(
                 "sample_var", dist.Exponential(self._sample_var_rate_t)
             )
+        length_scale_var = pyro.sample(
+            "length_scale_var",
+            dist.Exponential(self._length_scale_var_rate_t),
+        )
         if self.learn_baf_temperature:
             baf_temperature = pyro.sample(
                 "baf_temperature",
@@ -959,11 +1246,7 @@ class CNVModel:
             if self.debug:
                 print(f"bin_bias.shape: {bin_bias.shape}")
 
-            # Per-bin variance factor (log-normal prior)
-            if self.freeze_bin_var:
-                bin_var = self._fixed_bin_var_tensor(n_bins)
-            else:
-                bin_var = pyro.sample("bin_var", dist.Exponential(self._bin_var_rate_t))
+            bin_var = torch.zeros((n_bins, 1), device=self.device, dtype=self.dtype)
             if self.debug:
                 print(f"bin_var.shape: {bin_var.shape}")
 
@@ -993,13 +1276,26 @@ class CNVModel:
                 print(f"expected_depth.shape: {expected_depth.shape}")
 
             # Variance: combination of sample and bin variance,
-            # scaled inversely by bin size so that smaller bins have
-            # proportionally higher variance.
+            # scaled by both bin size and expected normalized depth.
             if self.debug:
                 print(f"bin_var).shape: {bin_var.shape}")
-            base_variance = sample_var + bin_var
-            size_modifier = self.bin_size_factor / interval_sizes
-            variance = base_variance * size_modifier
+            size_modifier = _size_modifier_torch(interval_sizes, self.bin_size_factor)
+            linear_depth_modifier = _depth_variance_scale_torch(expected_depth)
+            if self._count_anchored_reference_variance_t.shape[-1] != n_samples:
+                raise ValueError(
+                    "sample_raw_count_medians length does not match the modeled sample count."
+                )
+            poisson_variance = (
+                self._count_anchored_reference_variance_t
+                * size_modifier
+                * linear_depth_modifier
+            )
+            spatial_factor = _spatial_aggregate_variance_scale_torch(
+                interval_sizes,
+                length_scale_var,
+            )
+            excess_variance = (expected_depth ** 2) * sample_var * spatial_factor
+            variance = poisson_variance + excess_variance
             if self.debug:
                 print(f"variance.shape: {variance.shape}")
             std = torch.sqrt(variance)
@@ -1037,22 +1333,23 @@ class CNVModel:
                 std_expanded = baf_std.unsqueeze(0)
                 safe_baf_obs = torch.where(valid_mask.unsqueeze(0), obs_expanded, state_mean)
                 raw_baf_log_lik = dist.Normal(state_mean, std_expanded).log_prob(safe_baf_obs)
-                raw_baf_log_lik = torch.where(
-                    valid_mask.unsqueeze(0),
+                robust_baf_log_lik = _robust_baf_log_likelihood_torch(
                     raw_baf_log_lik,
-                    torch.zeros_like(raw_baf_log_lik),
+                    self.baf_outlier_rate,
+                )
+                robust_baf_log_lik = torch.where(
+                    valid_mask.unsqueeze(0),
+                    robust_baf_log_lik,
+                    torch.zeros_like(robust_baf_log_lik),
                 )
                 centered_baf_log_lik = _center_state_log_likelihood_table_torch(
-                    raw_baf_log_lik,
+                    robust_baf_log_lik,
                     self._baf_reference_probs_tensor(),
                 )
-                baf_rel_lik = torch.zeros_like(baf_obs)
-                for state_idx in range(self.n_states):
-                    baf_rel_lik = baf_rel_lik + torch.where(
-                        pair_state == state_idx,
-                        centered_baf_log_lik[state_idx],
-                        torch.zeros_like(baf_obs),
-                    )
+                baf_rel_lik = _select_state_log_likelihood_torch(
+                    centered_baf_log_lik,
+                    pair_state,
+                )
                 pyro.factor("baf_lik", baf_rel_lik)
         if self.debug:
             print("=== END MODEL DEBUG ===\n")
@@ -1221,18 +1518,16 @@ class CNVModel:
         map_estimates["sample_var"] = (
             guide_trace.nodes["sample_var"]["value"].detach().cpu().numpy()
         )
+        map_estimates["length_scale_var"] = (
+            guide_trace.nodes["length_scale_var"]["value"].detach().cpu().numpy()
+        )
         if self.learn_baf_temperature:
             map_estimates["baf_temperature"] = (
                 guide_trace.nodes["baf_temperature"]["value"].detach().cpu().numpy()
             )
         else:
             map_estimates["baf_temperature"] = self._fixed_baf_temperature_values()
-        if self.freeze_bin_var:
-            map_estimates["bin_var"] = self._fixed_bin_var_values(data.n_bins)
-        else:
-            map_estimates["bin_var"] = (
-                guide_trace.nodes["bin_var"]["value"].detach().cpu().numpy()
-            )
+        map_estimates["bin_var"] = np.zeros(data.n_bins, dtype=np.float32)
         if self.freeze_pair_state_priors:
             map_estimates["pair_state_probs"] = self._fixed_pair_state_probs_values(data.n_bins)
         else:
@@ -1248,11 +1543,22 @@ class CNVModel:
         map_estimates["pair_state_labels"] = self.pair_states
 
         pair_state_probs = np.asarray(map_estimates["pair_state_probs"]).squeeze()
-        if pair_state_probs.ndim == 1:
-            pair_state_probs = pair_state_probs.reshape(1, -1)
-        cn_probs = np.zeros((pair_state_probs.shape[0], self.max_total_cn + 1), dtype=np.float32)
+        effective_pair_state_probs = self._effective_pair_state_prior_values(pair_state_probs)
+        map_estimates["effective_pair_state_probs"] = effective_pair_state_probs.astype(
+            np.float32,
+            copy=False,
+        )
+        map_estimates["null_state_prior"] = np.full(
+            effective_pair_state_probs.shape[0],
+            self._null_state_prior_value(),
+            dtype=np.float32,
+        )
+        cn_probs = np.zeros(
+            (effective_pair_state_probs.shape[0], self.max_total_cn + 1),
+            dtype=np.float32,
+        )
         for pair_idx, total_cn in enumerate(total_cn_lookup):
-            cn_probs[:, total_cn] += pair_state_probs[:, pair_idx]
+            cn_probs[:, total_cn] += effective_pair_state_probs[:, pair_idx]
         map_estimates["cn_probs"] = cn_probs
 
         return map_estimates
@@ -1292,38 +1598,72 @@ class CNVModel:
         maps = self.get_map_estimates(data)
         bin_bias = maps["bin_bias"]       # (n_bins,) or (n_bins, 1)
         sample_var = maps["sample_var"]   # (n_samples,) or (1, n_samples)
-        bin_var = maps["bin_var"]         # (n_bins,) or (n_bins, 1)
-        pair_state_probs = maps["pair_state_probs"]
+        pair_state_probs = maps.get(
+            "effective_pair_state_probs",
+            self._effective_pair_state_prior_values(maps["pair_state_probs"]),
+        )
+        null_state_prior = np.asarray(
+            maps.get("null_state_prior", self._null_state_prior_value()),
+            dtype=np.float64,
+        ).squeeze()
         baf_temperature = self._baf_scale_numpy(maps, data.n_samples)
+        length_scale_var = self._length_scale_var_numpy(maps)
 
         # Flatten to 1-D / 2-D where needed (guide may add singleton
         # plate dimensions).
         bin_bias = bin_bias.squeeze()
         sample_var = sample_var.squeeze()
-        bin_var = bin_var.squeeze()
-        pair_state_probs = pair_state_probs.squeeze()   # (n_bins, n_pair_states)
+        pair_state_probs = np.asarray(pair_state_probs, dtype=np.float64).squeeze()
+        if pair_state_probs.ndim == 1:
+            pair_state_probs = pair_state_probs.reshape(1, -1)
 
         # 2. Prepare data matrices
         obs = data.depth.detach().cpu().numpy()  # (n_bins, n_samples)
         interval_sizes = data.interval_sizes.detach().cpu().numpy().squeeze()  # (n_bins,)
         pair_total_cn = pair_state_total_cn(self.pair_states)
         pair_minor_baf = pair_state_minor_baf(self.pair_states)
+        if np.asarray(null_state_prior).ndim == 0:
+            null_state_prior = np.full(pair_state_probs.shape[0], float(null_state_prior), dtype=np.float64)
+        else:
+            null_state_prior = np.asarray(null_state_prior, dtype=np.float64).reshape(-1)
 
-        # Combined variance: (sample_var + bin_var) * bin_size_factor / interval_size
-        # → shape (n_bins, n_samples)
-        base_variance = sample_var[np.newaxis, :] + bin_var[:, np.newaxis]
-        size_modifier = self.bin_size_factor / interval_sizes[:, np.newaxis]
-        variance = base_variance * size_modifier
-        std = np.sqrt(variance)
-
-        # 3. Compute log-likelihoods for all states simultaneously
+        # 3. Compute state-specific expected depth and depth-aware variance.
         # states: (n_states, 1, 1);  bin_bias: (1, n_bins, 1)
         states_total_cn = pair_total_cn.reshape(-1, 1, 1)
         expected_depth = states_total_cn * bin_bias[np.newaxis, :, np.newaxis]
+        size_modifier = _size_modifier_numpy(interval_sizes[:, np.newaxis], self.bin_size_factor)
+        linear_depth_modifier = _depth_variance_scale_numpy(expected_depth)
+        count_anchored_reference_variance = getattr(self, "_count_anchored_reference_variance_np", None)
+        if count_anchored_reference_variance is None:
+            raise RuntimeError(
+                "sample_raw_count_medians and reference_bin_size are required "
+                "to run exact discrete inference with the count-anchored "
+                "spatial variance model."
+            )
+        if count_anchored_reference_variance.shape[-1] != sample_var.shape[0]:
+            raise ValueError(
+                "sample_raw_count_medians length does not match the inferred sample count."
+            )
+        poisson_variance = (
+            count_anchored_reference_variance[np.newaxis, :, :]
+            * size_modifier[np.newaxis, :, :]
+            * linear_depth_modifier
+        )
+        spatial_factor = _spatial_aggregate_variance_scale_numpy(
+            interval_sizes[:, np.newaxis],
+            length_scale_var,
+        )
+        excess_variance = (
+            (expected_depth ** 2)
+            * sample_var[np.newaxis, :]
+            * spatial_factor[np.newaxis, :, :]
+        )
+        variance = poisson_variance + excess_variance
+        std = np.sqrt(variance)
 
         # Broadcast obs and std to (1, n_bins, n_samples)
         obs_b = obs[np.newaxis, :, :]
-        std_b = std[np.newaxis, :, :]
+        std_b = std
 
         # Gaussian log-PDF
         log_lik = -0.5 * np.log(2 * np.pi * std_b ** 2) - (
@@ -1332,8 +1672,6 @@ class CNVModel:
 
         # 4. Add log-prior over pair states.
         log_prior = np.log(np.maximum(pair_state_probs.T[:, :, np.newaxis], 1e-10))
-        if self.state_prior_weight != 1.0:
-            log_prior = self.state_prior_weight * log_prior
         log_unnormalized = log_lik + log_prior
 
         # 4b. Optional BAF log-likelihood contribution.
@@ -1356,20 +1694,39 @@ class CNVModel:
                 raw_baf_log_lik = -0.5 * np.log(2 * np.pi * baf_std ** 2) - (
                     (baf_obs - exp_minor_baf) ** 2
                 ) / (2 * baf_std ** 2)
-                raw_baf_log_lik = np.where(valid[np.newaxis, :, :], raw_baf_log_lik, 0.0)
-                centered_baf_log_lik = _center_state_log_likelihood_table_numpy(
+                robust_baf_log_lik = _robust_baf_log_likelihood_numpy(
                     raw_baf_log_lik,
+                    self.baf_outlier_rate,
+                )
+                robust_baf_log_lik = np.where(valid[np.newaxis, :, :], robust_baf_log_lik, 0.0)
+                centered_baf_log_lik = _center_state_log_likelihood_table_numpy(
+                    robust_baf_log_lik,
                     self._baf_reference_probs_numpy(),
                 )
                 log_unnormalized += centered_baf_log_lik
+
+        if np.any(null_state_prior > 0.0):
+            null_log_unnormalized = np.log(
+                np.maximum(null_state_prior.reshape(1, -1, 1), 1e-10)
+            ) + np.zeros((1, pair_state_probs.shape[0], obs.shape[1]), dtype=np.float64)
+            log_unnormalized = np.concatenate(
+                [log_unnormalized, null_log_unnormalized],
+                axis=0,
+            )
 
         # 5. Log-sum-exp softmax across the state dimension (axis 0)
         max_log = np.max(log_unnormalized, axis=0, keepdims=True)
         exp_vals = np.exp(log_unnormalized - max_log)
         posterior = exp_vals / np.sum(exp_vals, axis=0, keepdims=True)
 
+        if np.any(null_state_prior > 0.0):
+            null_posterior = np.transpose(posterior[-1], (0, 1)).astype(np.float32, copy=False)
+            posterior = posterior[:-1]
+        else:
+            null_posterior = np.zeros((obs.shape[0], obs.shape[1]), dtype=np.float32)
+
         # Transpose from (n_states, n_bins, n_samples) → (n_bins, n_samples, n_states)
-        pair_posterior = np.transpose(posterior, (1, 2, 0))
+        pair_posterior = np.transpose(posterior, (1, 2, 0)).astype(np.float32, copy=False)
 
         cn_posterior = np.zeros(
             (pair_posterior.shape[0], pair_posterior.shape[1], self.max_total_cn + 1),
@@ -1382,6 +1739,7 @@ class CNVModel:
         return {
             "cn_posterior": cn_posterior,
             "pair_state_posterior": pair_posterior,
+            "null_posterior": null_posterior,
             "pair_state_labels": self.pair_states,
         }
 

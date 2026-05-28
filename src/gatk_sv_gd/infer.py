@@ -31,15 +31,110 @@ if not hasattr(pyro, "enable_validation") and hasattr(pyro.distributions, "enabl
 from gatk_sv_gd import _util
 from gatk_sv_gd._util import get_sample_columns, setup_logging
 from gatk_sv_gd.bins import filter_low_quality_bins, read_data
-from gatk_sv_gd.depth import CNVModel, DepthData, ExclusionMask
+from gatk_sv_gd.depth import CNVModel, DepthData, ExclusionMask, _windowed_relative_elbo_change
 from gatk_sv_gd.models import GDTable
 from gatk_sv_gd.output import build_ploidy_map, estimate_ploidy, write_locus_metadata, write_posterior_tables
-from gatk_sv_gd.preprocess import collect_all_locus_bins, load_preprocessed_data
+from gatk_sv_gd.preprocess import (
+    build_normalization_metadata,
+    collect_all_locus_bins,
+    load_preprocessed_data,
+    write_normalization_metadata,
+)
 
 
 def _flatten_multi_args(arg_groups: List[List[str]]) -> List[str]:
     """Flatten argparse lists produced by repeated multi-value options."""
     return [value for group in arg_groups for value in group]
+
+
+def _align_normalization_metadata(
+    normalization_metadata: Optional[pd.DataFrame],
+    sample_ids: List[str],
+) -> tuple[Optional[np.ndarray], Optional[float]]:
+    """Align per-sample raw-count medians to the modeled sample order."""
+    if normalization_metadata is None or normalization_metadata.empty:
+        raise ValueError(
+            "Normalization metadata is required for the count-anchored spatial variance model."
+        )
+
+    required_columns = {"sample", "raw_count_median", "reference_bin_size"}
+    missing_columns = required_columns.difference(normalization_metadata.columns)
+    if missing_columns:
+        raise ValueError(
+            "Normalization metadata is missing required columns: "
+            f"{sorted(missing_columns)}"
+        )
+
+    metadata = normalization_metadata.copy()
+    metadata["sample"] = metadata["sample"].astype(str)
+    metadata = metadata.drop_duplicates(subset=["sample"], keep="last")
+    raw_count_lookup = metadata.set_index("sample")["raw_count_median"]
+
+    missing_samples = [str(sample_id) for sample_id in sample_ids if str(sample_id) not in raw_count_lookup.index]
+    if missing_samples:
+        raise ValueError(
+            "Normalization metadata is missing raw-count medians for samples: "
+            f"{missing_samples[:5]}"
+            + ("..." if len(missing_samples) > 5 else "")
+        )
+
+    reference_bin_sizes = metadata["reference_bin_size"].dropna().astype(float).unique()
+    if len(reference_bin_sizes) != 1:
+        raise ValueError(
+            "Normalization metadata must contain exactly one reference_bin_size value."
+        )
+
+    aligned_raw_count_medians = np.asarray(
+        [raw_count_lookup[str(sample_id)] for sample_id in sample_ids],
+        dtype=np.float64,
+    )
+    return aligned_raw_count_medians, float(reference_bin_sizes[0])
+
+
+def _write_training_loss_history(model: CNVModel, args: argparse.Namespace) -> None:
+    """Persist ELBO history and log a compact convergence summary."""
+    logger = _util.get_logger("infer")
+    loss_history = getattr(model, "loss_history", None) or {}
+    if "epoch" not in loss_history or "elbo" not in loss_history:
+        loss_df = pd.DataFrame(columns=["epoch", "elbo"])
+    else:
+        loss_df = pd.DataFrame(loss_history)
+
+    loss_path = os.path.join(args.output_dir, "training_loss.tsv")
+    loss_df.to_csv(loss_path, sep="\t", index=False)
+    logger.info("Wrote training loss history: epochs=%d", len(loss_df))
+
+    if loss_df.empty:
+        logger.warning("Training produced no ELBO history.")
+        return
+
+    elbo_history = loss_df["elbo"].to_numpy(dtype=np.float64)
+    logger.info(
+        "ELBO history summary: initial=%.4f final=%.4f best=%.4f",
+        float(elbo_history[0]),
+        float(elbo_history[-1]),
+        float(np.min(elbo_history)),
+    )
+
+    relative_change = _windowed_relative_elbo_change(
+        elbo_history,
+        args.elbo_window,
+    )
+    if relative_change is None:
+        logger.info(
+            "ELBO convergence summary: final_window_change=unavailable window=%d target_rtol=%s",
+            args.elbo_window,
+            args.elbo_rtol,
+        )
+        return
+
+    logger.info(
+        "ELBO convergence summary: final_window_change=%.2e window=%d target_rtol=%s within_tolerance=%s",
+        relative_change,
+        args.elbo_window,
+        args.elbo_rtol,
+        relative_change < args.elbo_rtol,
+    )
 
 
 def run_gd_analysis(
@@ -50,6 +145,7 @@ def run_gd_analysis(
     device: str = "cpu",
     column_medians: Optional[np.ndarray] = None,
     lowres_median_bin_size: Optional[float] = None,
+    normalization_metadata: Optional[pd.DataFrame] = None,
     preprocessed_bins: Optional[pd.DataFrame] = None,
     preprocessed_mappings=None,
     preprocessed_baf_summary: Optional[pd.DataFrame] = None,
@@ -75,6 +171,9 @@ def run_gd_analysis(
             normalisation).  Needed when ``args.high_res_counts`` is set.
         lowres_median_bin_size: Median bin size (bp) of the low-res file.
             Needed when ``args.high_res_counts`` is set.
+        normalization_metadata: Optional per-sample raw-count medians and
+            reference bin size used to build a count-anchored variance
+            baseline.
         preprocessed_bins: Optional combined DataFrame from the
             ``preprocess`` subcommand.  When set, *preprocessed_mappings*
             must also be provided.
@@ -131,16 +230,22 @@ def run_gd_analysis(
     if preprocessed_baf_summary is not None:
         combined_data.attach_baf_summary(preprocessed_baf_summary, mappings)
 
+    sample_raw_count_medians, reference_bin_size = _align_normalization_metadata(
+        normalization_metadata,
+        combined_data.sample_ids,
+    )
+
     # Initialize and train a single model on all bins
     print("\nInitializing unified CNV model...")
     model = CNVModel(
         n_states=6,
         alpha_ref=args.alpha_ref,
         alpha_non_ref=args.alpha_non_ref,
-        state_prior_weight=args.state_prior_weight,
+        null_state_prior=args.null_state_prior,
         baf_temperature=args.baf_temperature,
         learn_baf_temperature=not args.fixed_baf_temperature and args.baf_temperature > 0,
         baf_temperature_prior_scale=args.baf_temperature_prior_scale,
+        baf_outlier_rate=args.baf_outlier_rate,
         var_bias_bin=args.var_bias_bin,
         var_sample=args.var_sample,
         var_bin=args.var_bin,
@@ -148,6 +253,9 @@ def run_gd_analysis(
         freeze_bin_var=args.freeze_bin_var,
         freeze_pair_state_priors=args.freeze_pair_state_priors,
         bin_size_factor=args.bin_size_factor,
+        sample_raw_count_medians=sample_raw_count_medians,
+        reference_bin_size=reference_bin_size,
+        var_length_scale=args.var_length_scale,
         device=device,
         dtype=torch.float32,
         guide_type=args.guide_type,
@@ -168,6 +276,7 @@ def run_gd_analysis(
         convergence_window=args.elbo_window,
         convergence_rtol=args.elbo_rtol,
     )
+    _write_training_loss_history(model, args)
 
     # Get MAP estimates and posterior for all bins
     print("\nComputing MAP estimates...")
@@ -216,7 +325,9 @@ def parse_args():
         "-i", "--input",
         required=False,
         help="Input TSV file with normalized read depth (bins x samples). "
-             "Not required when --preprocessed-dir is set.",
+             "Not required when --preprocessed-dir is set, but still useful "
+             "there for rebuilding count-anchored normalization metadata "
+             "from a legacy preprocess output.",
     )
     parser.add_argument(
         "-g", "--gd-table",
@@ -352,14 +463,6 @@ def parse_args():
         help="Dirichlet concentration for non-reference CN states",
     )
     parser.add_argument(
-        "--state-prior-weight",
-        type=float,
-        default=0.0,
-        help="Weight applied to the learned per-bin pair-state log-prior "
-             "when reconstructing analytical discrete posteriors. "
-             "Values below 1.0 temper overly sharp priors.",
-    )
-    parser.add_argument(
         "--baf-temperature",
         type=float,
         default=25.0,
@@ -384,6 +487,23 @@ def parse_args():
         help="LogNormal prior scale for the learned global BAF variance temperature.",
     )
     parser.add_argument(
+        "--baf-outlier-rate",
+        type=float,
+        default=0.0,
+        help="Mixture weight for a uniform minor-allele BAF noise component. "
+             "Positive values cap the penalty from contradictory off-model "
+             "BAF bins; 0 disables the noise component.",
+    )
+    parser.add_argument(
+        "--null-state-prior",
+        type=float,
+        default=1e-3,
+        help="Prior probability assigned to an outer null state during exact "
+             "discrete inference. The null state contributes neutral 1:1 "
+             "event-vs-non-event odds for extreme off-model bins. Set to 0 "
+             "to disable it.",
+    )
+    parser.add_argument(
         "--var-bias-bin",
         type=float,
         default=0.01,
@@ -393,18 +513,18 @@ def parse_args():
         "--var-sample",
         type=float,
         default=0.01,
-        help="Variance for per-sample variance factor",
+        help="Mean of the Exponential prior on per-sample excess variance above the count-anchored Poisson baseline",
     )
     parser.add_argument(
         "--var-bin",
         type=float,
         default=0,
-        help="Variance for per-bin variance factor",
+        help="Deprecated compatibility option; per-bin excess variance is no longer used by the spatial count-anchored model",
     )
     parser.add_argument(
         "--freeze-bin-bias",
         action="store_true",
-        default=False,
+        default=True, # TODO
         help="Fix per-bin mean bias at 1.0 instead of inferring it",
     )
     parser.add_argument(
@@ -412,12 +532,12 @@ def parse_args():
         action="store_false",
         dest="freeze_bin_var",
         default=True,
-        help="Infer per-bin variance instead of fixing it at --var-bin",
+        help="Deprecated compatibility flag; per-bin excess variance is no longer inferred",
     )
     parser.add_argument(
         "--freeze-pair-state-priors",
         action="store_true",
-        default=False,
+        default=True, # TODO 
         help="Fix per-bin pair-state priors to the Dirichlet prior mean instead of inferring them",
     )
     parser.add_argument(
@@ -425,16 +545,28 @@ def parse_args():
         type=float,
         default=10000.0,
         help="Reference bin size (bp) for variance scaling.  The total "
-             "variance is multiplied by bin_size_factor / interval_size "
-             "so that smaller bins have proportionally higher variance.  "
+             "variance is multiplied by (bin_size_factor / interval_size) "
+             "* (expected_depth / 2.0) so that smaller bins and higher "
+             "expected normalized depth have proportionally higher variance.  "
              "Note that this is redundant with the other scale factors "
              "and is only exposed for debugging. Set to 0 to disable "
              "bin-size variance scaling.",
     )
     parser.add_argument(
+           "--var-length-scale",
+        type=float,
+              default=20000.0,
+           help="Mean of the Exponential prior on the shared physical "
+               "correlation length-scale (in bp) used by the count-anchored "
+               "spatial aggregation variance model. The excess variance is "
+               "modeled as d**2 * sample_var * f(L; length_scale_var), where "
+               "f saturates for small bins and decays approximately as 2*ell/L "
+               "for bins much larger than the correlation length.",
+    )
+    parser.add_argument(
         "--guide-type",
         type=str,
-        default="diagonal",
+        default="delta",
         choices=["delta", "diagonal"],
         help="Type of variational guide",
     )
@@ -570,6 +702,12 @@ def parse_args():
         parser.error("--baf-temperature must be non-negative.")
     if args.baf_temperature_prior_scale <= 0:
         parser.error("--baf-temperature-prior-scale must be positive.")
+    if not 0.0 <= args.baf_outlier_rate < 1.0:
+        parser.error("--baf-outlier-rate must be in [0, 1).")
+    if not 0.0 <= args.null_state_prior < 1.0:
+        parser.error("--null-state-prior must be in [0, 1).")
+    if args.var_length_scale <= 0:
+        parser.error("--var-length-scale must be positive.")
     if args.guide_warmup_iter < 0:
         parser.error("--guide-warmup-iter must be non-negative.")
 
@@ -615,9 +753,39 @@ def main():
     # ------------------------------------------------------------------
     if args.preprocessed_dir:
         print("\nLoading preprocessed data")
-        preprocessed_bins, preprocessed_mappings, preprocessed_baf_summary = load_preprocessed_data(
-            args.preprocessed_dir
-        )
+        (
+            preprocessed_bins,
+            preprocessed_mappings,
+            preprocessed_baf_summary,
+            normalization_metadata,
+        ) = load_preprocessed_data(args.preprocessed_dir)
+
+        if (normalization_metadata is None or normalization_metadata.empty) and args.input:
+            print("  Recomputing normalization metadata from --input for count-anchored variance")
+            raw_df = read_data(args.input)
+            sample_cols = get_sample_columns(raw_df)
+            autosome_mask = ~raw_df["Chr"].isin(["chrX", "chrY"])
+            if autosome_mask.any():
+                column_medians = np.median(raw_df.loc[autosome_mask, sample_cols], axis=0)
+            else:
+                column_medians = np.median(raw_df[sample_cols], axis=0)
+            lowres_bin_sizes = (raw_df["End"] - raw_df["Start"]).values
+            lowres_median_bin_size = float(np.median(lowres_bin_sizes))
+            normalization_metadata = build_normalization_metadata(
+                sample_cols,
+                column_medians,
+                lowres_median_bin_size,
+            )
+            write_normalization_metadata(normalization_metadata, args.output_dir)
+        elif normalization_metadata is None or normalization_metadata.empty:
+            print(
+                "Error: normalization metadata is required when loading "
+                "preprocessed data. Re-run preprocess or also provide --input "
+                "so infer can recompute it."
+            )
+            raise SystemExit(1)
+        else:
+            write_normalization_metadata(normalization_metadata, args.output_dir)
 
         # Set up Pyro
         _setup_pyro(args)
@@ -629,6 +797,7 @@ def main():
             preprocessed_bins=preprocessed_bins,
             preprocessed_mappings=preprocessed_mappings,
             preprocessed_baf_summary=preprocessed_baf_summary,
+            normalization_metadata=normalization_metadata,
         )  # ploidy_map not needed — bins already collected
     else:
         # Validate that required args are present
@@ -693,6 +862,13 @@ def main():
         lowres_median_bin_size = float(np.median(lowres_bin_sizes))
         print(f"Low-res median bin size: {lowres_median_bin_size:,.0f} bp")
 
+        normalization_metadata = build_normalization_metadata(
+            sample_cols,
+            column_medians,
+            lowres_median_bin_size,
+        )
+        write_normalization_metadata(normalization_metadata, args.output_dir)
+
         # Normalize such that CN=2 corresponds to depth of 2.0
         df[sample_cols] = 2.0 * df[sample_cols] / column_medians[np.newaxis, :]
 
@@ -732,13 +908,14 @@ def main():
             df, gd_table, exclusion_mask, args, device=args.device,
             column_medians=column_medians,
             lowres_median_bin_size=lowres_median_bin_size,
+            normalization_metadata=normalization_metadata,
             ploidy_map=ploidy_map,
         )
 
     print("\n" + "=" * 80)
     print("ANALYSIS COMPLETE")
     print("=" * 80)
-    print("\nOutput tables written: 6")
+    print("\nOutput tables written: 7")
     print("\nNext step: run call and plot on the inference outputs.")
     print("=" * 80)
 

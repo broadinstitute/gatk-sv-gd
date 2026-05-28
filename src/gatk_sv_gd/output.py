@@ -42,7 +42,14 @@ def write_posterior_tables(
 
     def _normalize_state_tensor(array, n_bins: int, n_samples: int):
         """Return state posteriors with shape (n_bins, n_samples, n_states)."""
-        arr = np.asarray(array).squeeze()
+        arr = np.asarray(array)
+        if arr.ndim > 3:
+            arr = np.squeeze(arr)
+        if arr.ndim == 1:
+            if n_bins == 1 and n_samples == 1:
+                arr = arr.reshape(1, 1, arr.shape[0])
+            else:
+                raise ValueError(f"Expected 3D state tensor, got shape {arr.shape}")
         if arr.ndim == 2:
             arr = arr.reshape(arr.shape[0], arr.shape[1], 1)
         if arr.ndim != 3:
@@ -60,6 +67,47 @@ def write_posterior_tables(
             f"shape={arr.shape}, n_bins={n_bins}, n_samples={n_samples}"
         )
 
+    def _normalize_bin_sample_matrix(array, n_bins: int, n_samples: int):
+        """Return a per-bin, per-sample matrix with shape (n_bins, n_samples)."""
+        arr = np.asarray(array).squeeze()
+        if arr.ndim == 0:
+            return np.full((n_bins, n_samples), float(arr), dtype=np.float32)
+        if arr.ndim != 2:
+            raise ValueError(f"Expected 2D bin/sample matrix, got shape {arr.shape}")
+        if arr.shape == (n_bins, n_samples):
+            return arr
+        if arr.shape == (n_samples, n_bins):
+            return np.transpose(arr, (1, 0))
+        raise ValueError(
+            "Bin/sample matrix shape does not match bins/samples: "
+            f"shape={arr.shape}, n_bins={n_bins}, n_samples={n_samples}"
+        )
+
+    def _normalize_bin_state_matrix(array, n_bins: int):
+        """Return a per-bin, per-state matrix with shape (n_bins, n_states)."""
+        arr = np.asarray(array)
+        if arr.ndim > 2:
+            arr = np.squeeze(arr)
+        if arr.ndim == 1:
+            if n_bins == 1:
+                return arr.reshape(1, -1)
+            if arr.shape[0] == n_bins:
+                return arr.reshape(n_bins, 1)
+            raise ValueError(
+                "Bin/state matrix shape does not match bins: "
+                f"shape={arr.shape}, n_bins={n_bins}"
+            )
+        if arr.ndim != 2:
+            raise ValueError(f"Expected 2D bin/state matrix, got shape {arr.shape}")
+        if arr.shape[0] == n_bins:
+            return arr
+        if arr.shape[1] == n_bins:
+            return np.transpose(arr, (1, 0))
+        raise ValueError(
+            "Bin/state matrix shape does not match bins: "
+            f"shape={arr.shape}, n_bins={n_bins}"
+        )
+
     cn_post = _normalize_state_tensor(
         cn_posterior["cn_posterior"],
         combined_data.n_bins,
@@ -73,10 +121,27 @@ def write_posterior_tables(
             combined_data.n_bins,
             combined_data.n_samples,
         )
-    cn_map = np.asarray(map_estimates["cn"]).squeeze()  # shape: (n_bins, n_samples)
+    null_post = cn_posterior.get("null_posterior")
+    if null_post is None:
+        null_post = np.zeros((combined_data.n_bins, combined_data.n_samples), dtype=np.float32)
+    else:
+        null_post = _normalize_bin_sample_matrix(
+            null_post,
+            combined_data.n_bins,
+            combined_data.n_samples,
+        )
+    cn_map = _normalize_bin_sample_matrix(
+        map_estimates["cn"],
+        combined_data.n_bins,
+        combined_data.n_samples,
+    )
     pair_map = map_estimates.get("pair_state")
     if pair_map is not None:
-        pair_map = np.asarray(pair_map).squeeze()
+        pair_map = _normalize_bin_sample_matrix(
+            pair_map,
+            combined_data.n_bins,
+            combined_data.n_samples,
+        )
     depth = np.asarray(combined_data.depth.cpu().numpy())  # shape: (n_bins, n_samples)
     baf_median = None
     minor_baf = None
@@ -89,12 +154,8 @@ def write_posterior_tables(
         baf_n_sites = np.asarray(combined_data.baf_n_sites.cpu().numpy())
 
     # Ensure proper dimensions
-    if cn_map.ndim == 1:
-        cn_map = cn_map.reshape(-1, 1)
     if depth.ndim == 1:
         depth = depth.reshape(-1, 1)
-    if pair_map is not None and pair_map.ndim == 1:
-        pair_map = pair_map.reshape(-1, 1)
 
     cn_rows = []
     for bin_idx in range(combined_data.n_bins):
@@ -109,6 +170,7 @@ def write_posterior_tables(
                 "end": mapping.end,
                 "sample": sample_id,
                 "depth": depth[bin_idx, sample_idx].tolist() if isinstance(depth[bin_idx, sample_idx], np.ndarray) else float(depth[bin_idx, sample_idx]),
+                "prob_null": float(null_post[bin_idx, sample_idx]),
             }
 
             # Add probability for each CN state
@@ -158,6 +220,9 @@ def write_posterior_tables(
     baf_temperature = map_estimates.get("baf_temperature")
     if baf_temperature is not None:
         baf_temperature = np.asarray(baf_temperature, dtype=np.float64).squeeze()
+    length_scale_var = map_estimates.get("length_scale_var")
+    if length_scale_var is not None:
+        length_scale_var = np.asarray(length_scale_var, dtype=np.float64).squeeze()
 
     # Ensure it's at least 1D
     if sample_var.ndim == 0:
@@ -166,6 +231,10 @@ def write_posterior_tables(
         baf_temperature = np.full(combined_data.n_samples, float(baf_temperature), dtype=np.float64)
     elif baf_temperature is not None and baf_temperature.size == 1:
         baf_temperature = np.full(combined_data.n_samples, float(baf_temperature.reshape(-1)[0]), dtype=np.float64)
+    if length_scale_var is not None and length_scale_var.ndim == 0:
+        length_scale_var = np.full(combined_data.n_samples, float(length_scale_var), dtype=np.float64)
+    elif length_scale_var is not None and length_scale_var.size == 1:
+        length_scale_var = np.full(combined_data.n_samples, float(length_scale_var.reshape(-1)[0]), dtype=np.float64)
 
     for sample_idx, sample_id in enumerate(combined_data.sample_ids):
         var_val = sample_var[sample_idx]
@@ -178,6 +247,11 @@ def write_posterior_tables(
             temp_val = temp_val.tolist() if isinstance(temp_val, np.ndarray) else float(temp_val)
             row["baf_temperature_map"] = temp_val
             row["baf_variance_scale_map"] = temp_val
+        if length_scale_var is not None:
+            ls_val = length_scale_var[sample_idx]
+            row["length_scale_var_map"] = (
+                ls_val.tolist() if isinstance(ls_val, np.ndarray) else float(ls_val)
+            )
         sample_rows.append(row)
 
     sample_df = pd.DataFrame(sample_rows)
@@ -193,19 +267,26 @@ def write_posterior_tables(
     # Convert to numpy arrays and ensure proper shape
     bin_bias = np.asarray(map_estimates["bin_bias"]).squeeze()
     bin_var = np.asarray(map_estimates["bin_var"]).squeeze()
-    cn_probs = np.asarray(map_estimates["cn_probs"]).squeeze()
-    pair_state_priors = map_estimates.get("pair_state_probs")
+    cn_probs = _normalize_bin_state_matrix(map_estimates["cn_probs"], combined_data.n_bins)
+    pair_state_priors = map_estimates.get("effective_pair_state_probs")
+    if pair_state_priors is None:
+        pair_state_priors = map_estimates.get("pair_state_probs")
+    null_state_prior = map_estimates.get("null_state_prior")
     pair_state_labels = cn_posterior.get("pair_state_labels")
     if pair_state_priors is not None:
-        pair_state_priors = np.asarray(pair_state_priors).squeeze()
+        pair_state_priors = _normalize_bin_state_matrix(pair_state_priors, combined_data.n_bins)
+    if null_state_prior is None:
+        null_state_prior = np.zeros(combined_data.n_bins, dtype=np.float32)
+    else:
+        null_state_prior = np.asarray(null_state_prior, dtype=np.float32).squeeze()
 
     # Ensure we have the right number of dimensions
     if bin_bias.ndim == 0:
         bin_bias = bin_bias.reshape(1)
     if bin_var.ndim == 0:
         bin_var = bin_var.reshape(1)
-    if cn_probs.ndim == 1:
-        cn_probs = cn_probs.reshape(-1, 1)
+    if null_state_prior.ndim == 0:
+        null_state_prior = np.full(combined_data.n_bins, float(null_state_prior), dtype=np.float32)
 
     for bin_idx in range(combined_data.n_bins):
         mapping = mappings[bin_idx]
@@ -218,6 +299,7 @@ def write_posterior_tables(
             "end": mapping.end,
             "bin_bias_map": bin_bias[bin_idx].tolist() if isinstance(bin_bias[bin_idx], np.ndarray) else float(bin_bias[bin_idx]),
             "bin_var_map": bin_var[bin_idx].tolist() if isinstance(bin_var[bin_idx], np.ndarray) else float(bin_var[bin_idx]),
+            "null_prior": float(null_state_prior[bin_idx]),
         }
 
         # Add CN probability priors (per-bin learned from data)

@@ -1,3 +1,4 @@
+import logging
 from types import SimpleNamespace
 
 import numpy as np
@@ -7,10 +8,29 @@ import pytest
 from gatk_sv_gd.depth import (
     CNVModel,
     _center_state_log_likelihood_table_numpy,
+    _count_anchored_reference_variance_numpy,
+    _depth_variance_scale_numpy,
+    _lognormal_location_from_mean,
+    _select_state_log_likelihood_torch,
+    _spatial_aggregate_variance_scale_numpy,
     _safe_scaled_baf_variance_torch,
     _windowed_relative_elbo_change,
 )
 import gatk_sv_gd.depth as depth_module
+
+
+class _FakeTensor:
+    def __init__(self, values):
+        self._values = np.asarray(values, dtype=np.float32)
+
+    def detach(self):
+        return self
+
+    def cpu(self):
+        return self
+
+    def numpy(self):
+        return self._values
 
 
 def test_windowed_relative_elbo_change_uses_two_latest_windows():
@@ -73,6 +93,56 @@ def test_train_early_stopping_uses_windowed_relative_elbo_change(monkeypatch):
     )
     assert model.loss_history["epoch"] == [0, 1, 2, 3, 4]
     assert model.current_data is None
+
+
+def test_train_logs_periodic_elbo_progress(monkeypatch, caplog):
+    model = object.__new__(CNVModel)
+    model.model = object()
+    model.guide = object()
+    model.guide_type = "delta"
+    model._build_guide = lambda *args, **kwargs: model.guide
+    model.loss_history = {"epoch": [], "elbo": []}
+    model.current_data = None
+
+    losses = iter([100.0, 99.5, 99.25, 99.125])
+
+    class FakeScheduler:
+        def step(self):
+            return None
+
+    class FakeSVI:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def step(self, **kwargs):
+            return next(losses)
+
+    monkeypatch.setattr(depth_module.pyro, "clear_param_store", lambda: None)
+    monkeypatch.setattr(depth_module.pyro.optim, "LambdaLR", lambda config: FakeScheduler())
+    monkeypatch.setattr(depth_module, "TraceEnum_ELBO", lambda: object())
+    monkeypatch.setattr(depth_module, "SVI", FakeSVI)
+
+    data = SimpleNamespace(
+        depth=object(),
+        interval_sizes=object(),
+        n_bins=1,
+        n_samples=1,
+    )
+
+    caplog.set_level(logging.INFO, logger="gatk_sv_gd.training")
+
+    model.train(
+        data,
+        max_iter=4,
+        log_freq=2,
+        early_stopping=False,
+    )
+
+    messages = [record.getMessage() for record in caplog.records]
+    assert "Training started: max_iter=4 early_stopping=False" in messages
+    assert "Training progress: epoch=2 loss=99.5000" in messages
+    assert "Training progress: epoch=4 loss=99.1250" in messages
+    assert "Training completed: epochs=4 final_loss=99.1250" in messages
 
 
 def test_train_uses_conditioned_model_for_map_warmup(monkeypatch):
@@ -160,8 +230,8 @@ def test_init_omits_frozen_bin_latents_from_guide(monkeypatch):
         freeze_bin_var=True,
     )
 
-    assert model.latent_sites == ["sample_var", "baf_temperature", "pair_state_probs"]
-    assert block_calls["expose"] == ["sample_var", "baf_temperature", "pair_state_probs"]
+    assert model.latent_sites == ["sample_var", "length_scale_var", "baf_temperature", "pair_state_probs"]
+    assert block_calls["expose"] == ["sample_var", "length_scale_var", "baf_temperature", "pair_state_probs"]
 
 
 def test_init_omits_frozen_pair_state_priors_from_guide(monkeypatch):
@@ -188,8 +258,8 @@ def test_init_omits_frozen_pair_state_priors_from_guide(monkeypatch):
         freeze_pair_state_priors=True,
     )
 
-    assert model.latent_sites == ["bin_bias", "sample_var", "baf_temperature", "bin_var"]
-    assert block_calls["expose"] == ["bin_bias", "sample_var", "baf_temperature", "bin_var"]
+    assert model.latent_sites == ["bin_bias", "sample_var", "length_scale_var", "baf_temperature"]
+    assert block_calls["expose"] == ["bin_bias", "sample_var", "length_scale_var", "baf_temperature"]
 
 
 def test_init_omits_baf_temperature_when_fixed(monkeypatch):
@@ -216,8 +286,19 @@ def test_init_omits_baf_temperature_when_fixed(monkeypatch):
         learn_baf_temperature=False,
     )
 
+    assert "length_scale_var" in model.latent_sites
     assert "baf_temperature" not in model.latent_sites
     assert "baf_temperature" not in block_calls["expose"]
+
+
+def test_model_requires_count_anchored_normalization_metadata():
+    model = object.__new__(CNVModel)
+    model.debug = False
+    model._zero_t = 0.0
+    model._count_anchored_reference_variance_t = None
+
+    with pytest.raises(RuntimeError, match="sample_raw_count_medians and reference_bin_size are required"):
+        model.model(depth=None, interval_sizes=None, n_bins=1, n_samples=1)
 
 
 def test_fixed_bin_latent_values_use_centered_defaults():
@@ -262,6 +343,18 @@ def test_init_rejects_nonpositive_learned_baf_temperature():
         CNVModel(learn_baf_temperature=True, baf_temperature=0.0)
 
 
+@pytest.mark.parametrize("baf_outlier_rate", [-0.1, 1.0])
+def test_init_rejects_invalid_baf_outlier_rate(baf_outlier_rate):
+    with pytest.raises(ValueError, match=r"baf_outlier_rate must be in \[0, 1\)\."):
+        CNVModel(baf_outlier_rate=baf_outlier_rate)
+
+
+@pytest.mark.parametrize("null_state_prior", [-0.1, 1.0])
+def test_init_rejects_invalid_null_state_prior(null_state_prior):
+    with pytest.raises(ValueError, match=r"null_state_prior must be in \[0, 1\)\."):
+        CNVModel(null_state_prior=null_state_prior)
+
+
 def test_center_state_log_likelihood_table_numpy_removes_constant_offset_and_normalizes_reference():
     raw = np.array(
         [
@@ -293,6 +386,146 @@ def test_center_state_log_likelihood_table_numpy_returns_neutral_values_for_nonf
 
     assert np.all(np.isfinite(centered))
     assert np.array_equal(centered, np.zeros_like(raw))
+
+
+def test_select_state_log_likelihood_torch_matches_mask_loop():
+    torch = pytest.importorskip("torch")
+    if not hasattr(torch, "gather"):
+        pytest.skip("real torch is not available")
+
+    log_lik_table = torch.tensor(
+        [
+            [[0.1, 0.2], [0.3, 0.4]],
+            [[1.1, 1.2], [1.3, 1.4]],
+            [[2.1, 2.2], [2.3, 2.4]],
+        ],
+        dtype=torch.float32,
+    )
+    pair_state = torch.tensor([[0, 2], [1, 0]], dtype=torch.long)
+
+    selected = _select_state_log_likelihood_torch(log_lik_table, pair_state)
+
+    expected = torch.zeros_like(selected)
+    for state_idx in range(log_lik_table.shape[0]):
+        expected = expected + torch.where(
+            pair_state == state_idx,
+            log_lik_table[state_idx],
+            torch.zeros_like(selected),
+        )
+
+    assert torch.allclose(selected, expected)
+
+
+def test_select_state_log_likelihood_torch_matches_enumerated_mask_loop():
+    torch = pytest.importorskip("torch")
+    if not hasattr(torch, "gather"):
+        pytest.skip("real torch is not available")
+
+    log_lik_table = torch.tensor(
+        [
+            [[0.1, 0.2], [0.3, 0.4]],
+            [[1.1, 1.2], [1.3, 1.4]],
+            [[2.1, 2.2], [2.3, 2.4]],
+        ],
+        dtype=torch.float32,
+    )
+    pair_state = torch.tensor([[[0]], [[2]], [[1]]], dtype=torch.long)
+
+    selected = _select_state_log_likelihood_torch(log_lik_table, pair_state)
+
+    expected = torch.zeros((pair_state.shape[0],) + log_lik_table.shape[1:], dtype=log_lik_table.dtype)
+    for state_idx in range(log_lik_table.shape[0]):
+        expected = expected + torch.where(
+            pair_state == state_idx,
+            log_lik_table[state_idx],
+            torch.zeros_like(log_lik_table[state_idx]),
+        )
+
+    assert torch.allclose(selected, expected)
+
+
+def test_depth_variance_scale_numpy_tracks_expected_depth_and_stays_positive():
+    scales = _depth_variance_scale_numpy(np.asarray([0.0, 1.0, 2.0, 4.0], dtype=np.float32))
+
+    assert scales[0] == pytest.approx(1e-6)
+    assert scales[1] == pytest.approx(0.5)
+    assert scales[2] == pytest.approx(1.0)
+    assert scales[3] == pytest.approx(2.0)
+
+    powered_scales = _depth_variance_scale_numpy(
+        np.asarray([0.0, 1.0, 2.0, 4.0], dtype=np.float32),
+        power=2.0,
+    )
+
+    assert powered_scales[0] == pytest.approx(1e-6)
+    assert powered_scales[1] == pytest.approx(0.25)
+    assert powered_scales[2] == pytest.approx(1.0)
+    assert powered_scales[3] == pytest.approx(4.0)
+
+
+def test_lognormal_location_from_mean_matches_requested_natural_scale_mean():
+    location = _lognormal_location_from_mean(1.5, 0.25)
+
+    assert np.exp(location + 0.5 * 0.25 ** 2) == pytest.approx(1.5)
+
+
+def test_count_anchored_reference_variance_numpy_matches_poisson_scale():
+    variance = _count_anchored_reference_variance_numpy(
+        np.asarray([2000.0, 4000.0], dtype=np.float32),
+        reference_bin_size=10000.0,
+        bin_size_factor=10000.0,
+    )
+
+    assert variance.shape == (1, 2)
+    assert variance[0, 0] == pytest.approx(0.002)
+    assert variance[0, 1] == pytest.approx(0.001)
+
+
+def test_init_adds_length_scale_var_site_for_count_anchored_models(monkeypatch):
+    fake_torch = SimpleNamespace(
+        tensor=lambda value, **kwargs: value,
+        zeros=lambda shape, **kwargs: np.zeros(shape, dtype=np.float32),
+        ones=lambda shape, **kwargs: np.ones(shape, dtype=np.float32),
+        full=lambda shape, value, **kwargs: np.full(shape, value, dtype=np.float32),
+        float32=object(),
+    )
+    block_calls = {}
+
+    monkeypatch.setattr(depth_module, "torch", fake_torch)
+    monkeypatch.setattr(
+        depth_module.poutine,
+        "block",
+        lambda model, expose: block_calls.setdefault("expose", list(expose)),
+        raising=False,
+    )
+    monkeypatch.setattr(depth_module, "AutoDelta", lambda blocked_model: blocked_model)
+
+    model = CNVModel(
+        guide_type="delta",
+        sample_raw_count_medians=[2000.0, 2500.0],
+        reference_bin_size=10000.0,
+    )
+
+    assert "length_scale_var" in model.latent_sites
+    assert "length_scale_var" in block_calls["expose"]
+    assert "bin_var" not in model.latent_sites
+
+
+def test_spatial_aggregate_variance_scale_numpy_matches_small_bin_limit():
+    factor = _spatial_aggregate_variance_scale_numpy(
+        np.asarray([1.0], dtype=np.float64),
+        1_000_000.0,
+    )
+
+    assert factor[0] == pytest.approx(1.0, abs=1e-6)
+
+
+def test_spatial_aggregate_variance_scale_numpy_scales_as_inverse_length_for_large_bins():
+    interval_sizes = np.asarray([100_000.0, 200_000.0], dtype=np.float64)
+    factor = _spatial_aggregate_variance_scale_numpy(interval_sizes, 1_000.0)
+
+    assert factor[0] == pytest.approx((2.0 * 1_000.0) / 100_000.0, rel=1e-2)
+    assert factor[1] / factor[0] == pytest.approx(0.5, rel=1e-2)
 
 
 def test_safe_scaled_baf_variance_torch_masks_inactive_nan_gradient():
@@ -340,3 +573,250 @@ def test_fixed_pair_state_priors_use_dirichlet_mean(monkeypatch):
     tensor_values = CNVModel._fixed_pair_state_probs_tensor(model, 2)
     assert tensor_values.shape == (2, 1, 6)
     assert np.allclose(tensor_values[:, 0, :], np.vstack([expected, expected]))
+
+
+def test_run_discrete_inference_always_uses_full_pair_state_prior():
+    model = object.__new__(CNVModel)
+    model.pair_states = [(1, 1), (1, 2)]
+    model.max_total_cn = 3
+    model.bin_size_factor = 1.0
+    model.baf_temperature = 0.0
+    model.baf_outlier_rate = 0.0
+    model.null_state_prior = 0.0
+    model.var_length_scale = 1.0
+    model._count_anchored_reference_variance_np = _count_anchored_reference_variance_numpy(
+        np.asarray([4.0, 4.0], dtype=np.float32),
+        reference_bin_size=1.0,
+        bin_size_factor=1.0,
+    )
+
+    model.get_map_estimates = lambda data: {
+        "bin_bias": np.asarray([1.0, 1.0], dtype=np.float32),
+        "sample_var": np.asarray([0.0, 0.0], dtype=np.float32),
+        "bin_var": np.asarray([0.0, 0.0], dtype=np.float32),
+        "pair_state_probs": np.asarray([[0.99, 0.01], [0.99, 0.01]], dtype=np.float32),
+        "length_scale_var": np.asarray(1.0, dtype=np.float32),
+    }
+
+    data = SimpleNamespace(
+        depth=_FakeTensor([[2.9, 2.9], [2.9, 2.9]]),
+        interval_sizes=_FakeTensor([[1.0], [1.0]]),
+        n_bins=2,
+        n_samples=2,
+        has_baf=False,
+    )
+
+    posterior = CNVModel.run_discrete_inference(model, data)
+    cn_posterior = posterior["cn_posterior"]
+
+    var_cn2, var_cn3 = _depth_variance_scale_numpy(np.asarray([2.0, 3.0], dtype=np.float32))
+    log_lik_cn2 = -0.5 * np.log(2.0 * np.pi * var_cn2) - ((2.9 - 2.0) ** 2) / (2.0 * var_cn2)
+    log_lik_cn3 = -0.5 * np.log(2.0 * np.pi * var_cn3) - ((2.9 - 3.0) ** 2) / (2.0 * var_cn3)
+    odds_cn3 = np.exp(log_lik_cn3 - log_lik_cn2) * (0.01 / 0.99)
+    expected_p_cn3 = odds_cn3 / (1.0 + odds_cn3)
+
+    assert cn_posterior[0, 0, 3] == pytest.approx(expected_p_cn3, rel=1e-5)
+    assert cn_posterior[0, 0, 3] < 0.1
+
+
+def test_run_discrete_inference_assigns_extreme_outliers_to_null_state():
+    model = object.__new__(CNVModel)
+    model.pair_states = [(1, 1), (1, 2)]
+    model.max_total_cn = 3
+    model.bin_size_factor = 1.0
+    model.baf_temperature = 0.0
+    model.baf_outlier_rate = 0.0
+    model.null_state_prior = 0.2
+    model.var_length_scale = 1.0
+    model._count_anchored_reference_variance_np = _count_anchored_reference_variance_numpy(
+        np.asarray([4.0, 4.0], dtype=np.float32),
+        reference_bin_size=1.0,
+        bin_size_factor=1.0,
+    )
+
+    model.get_map_estimates = lambda data: {
+        "bin_bias": np.asarray([1.0, 1.0], dtype=np.float32),
+        "sample_var": np.asarray([0.0, 0.0], dtype=np.float32),
+        "bin_var": np.asarray([0.0, 0.0], dtype=np.float32),
+        "pair_state_probs": np.asarray([[0.99, 0.01], [0.99, 0.01]], dtype=np.float32),
+        "length_scale_var": np.asarray(1.0, dtype=np.float32),
+    }
+
+    data = SimpleNamespace(
+        depth=_FakeTensor([[100.0, 100.0], [100.0, 100.0]]),
+        interval_sizes=_FakeTensor([[1.0], [1.0]]),
+        n_bins=2,
+        n_samples=2,
+        has_baf=False,
+    )
+
+    posterior = CNVModel.run_discrete_inference(model, data)
+
+    assert posterior["null_posterior"][0, 0] > 0.999
+    assert posterior["cn_posterior"][0, 0].sum() < 1e-6
+
+
+def test_run_discrete_inference_uses_count_anchored_poisson_baseline_when_available():
+    model = object.__new__(CNVModel)
+    model.pair_states = [(1, 1), (1, 2)]
+    model.max_total_cn = 3
+    model.bin_size_factor = 1.0
+    model.baf_temperature = 0.0
+    model.baf_outlier_rate = 0.0
+    model.null_state_prior = 0.0
+    model.reference_bin_size = 1.0
+    model._count_anchored_reference_variance_np = _count_anchored_reference_variance_numpy(
+        np.asarray([2000.0, 2000.0], dtype=np.float32),
+        reference_bin_size=1.0,
+        bin_size_factor=1.0,
+    )
+
+    model.get_map_estimates = lambda data: {
+        "bin_bias": np.asarray([1.0, 1.0], dtype=np.float32),
+        "sample_var": np.asarray([0.0, 0.0], dtype=np.float32),
+        "bin_var": np.asarray([0.0, 0.0], dtype=np.float32),
+        "pair_state_probs": np.asarray([[0.99, 0.01], [0.99, 0.01]], dtype=np.float32),
+    }
+
+    data = SimpleNamespace(
+        depth=_FakeTensor([[2.1, 2.1], [2.1, 2.1]]),
+        interval_sizes=_FakeTensor([[1.0], [1.0]]),
+        n_bins=2,
+        n_samples=2,
+        has_baf=False,
+    )
+
+    posterior = CNVModel.run_discrete_inference(model, data)
+    cn_posterior = posterior["cn_posterior"]
+
+    var_cn2, var_cn3 = np.asarray([0.002, 0.003], dtype=np.float64)
+    log_lik_cn2 = -0.5 * np.log(2.0 * np.pi * var_cn2) - ((2.1 - 2.0) ** 2) / (2.0 * var_cn2)
+    log_lik_cn3 = -0.5 * np.log(2.0 * np.pi * var_cn3) - ((2.1 - 3.0) ** 2) / (2.0 * var_cn3)
+    odds_cn3 = np.exp(log_lik_cn3 - log_lik_cn2) * (0.01 / 0.99)
+    expected_p_cn3 = odds_cn3 / (1.0 + odds_cn3)
+
+    assert cn_posterior[0, 0, 3] == pytest.approx(expected_p_cn3, rel=1e-5)
+    assert cn_posterior[0, 0, 3] < 1e-20
+
+
+def test_run_discrete_inference_uses_count_anchored_length_scale_var_when_available():
+    model = object.__new__(CNVModel)
+    model.pair_states = [(1, 1), (1, 2)]
+    model.max_total_cn = 3
+    model.bin_size_factor = 1.0
+    model.baf_temperature = 0.0
+    model.baf_outlier_rate = 0.0
+    model.null_state_prior = 0.0
+    model.reference_bin_size = 1.0
+    model.var_length_scale = 5_000.0
+    model._count_anchored_reference_variance_np = _count_anchored_reference_variance_numpy(
+        np.asarray([2000.0, 2000.0], dtype=np.float32),
+        reference_bin_size=1.0,
+        bin_size_factor=1.0,
+    )
+
+    sample_var_val = 5e-4
+    length_scale_var_val = 1_000.0
+
+    model.get_map_estimates = lambda data: {
+        "bin_bias": np.asarray([1.0, 1.0], dtype=np.float32),
+        "sample_var": np.asarray([sample_var_val, sample_var_val], dtype=np.float32),
+        "bin_var": np.asarray([0.0, 0.0], dtype=np.float32),
+        "pair_state_probs": np.asarray([[0.99, 0.01], [0.99, 0.01]], dtype=np.float32),
+        "length_scale_var": np.asarray(length_scale_var_val, dtype=np.float32),
+    }
+
+    data = SimpleNamespace(
+        depth=_FakeTensor([[2.1, 2.1], [2.1, 2.1]]),
+        interval_sizes=_FakeTensor([[1.0], [1.0]]),
+        n_bins=2,
+        n_samples=2,
+        has_baf=False,
+    )
+
+    posterior = CNVModel.run_discrete_inference(model, data)
+    cn_posterior = posterior["cn_posterior"]
+
+    # Poisson variance at L=1, L_ref=1, m=2000: 4/m*(L_ref/L)*(d/2)
+    poisson_cn2 = 0.002
+    poisson_cn3 = 0.003
+    spatial_factor = _spatial_aggregate_variance_scale_numpy(
+        np.asarray([1.0], dtype=np.float64),
+        length_scale_var_val,
+    )[0]
+    excess_cn2 = (2.0 ** 2) * sample_var_val * spatial_factor
+    excess_cn3 = (3.0 ** 2) * sample_var_val * spatial_factor
+    var_cn2 = poisson_cn2 + excess_cn2
+    var_cn3 = poisson_cn3 + excess_cn3
+
+    log_lik_cn2 = -0.5 * np.log(2.0 * np.pi * var_cn2) - ((2.1 - 2.0) ** 2) / (2.0 * var_cn2)
+    log_lik_cn3 = -0.5 * np.log(2.0 * np.pi * var_cn3) - ((2.1 - 3.0) ** 2) / (2.0 * var_cn3)
+    odds_cn3 = np.exp(log_lik_cn3 - log_lik_cn2) * (0.01 / 0.99)
+    expected_p_cn3 = odds_cn3 / (1.0 + odds_cn3)
+
+    assert cn_posterior[0, 0, 3] == pytest.approx(expected_p_cn3, rel=1e-5)
+
+    # Reference: a shorter correlation length should reduce the excess
+    # variance for the same interval size and make CN=3 less likely here.
+    shorter_factor = _spatial_aggregate_variance_scale_numpy(
+        np.asarray([1.0], dtype=np.float64),
+        0.1,
+    )[0]
+    shorter_var_cn2 = poisson_cn2 + (2.0 ** 2) * sample_var_val * shorter_factor
+    shorter_var_cn3 = poisson_cn3 + (3.0 ** 2) * sample_var_val * shorter_factor
+    log_lik_cn2_ref = -0.5 * np.log(2.0 * np.pi * shorter_var_cn2) - (
+        (2.1 - 2.0) ** 2
+    ) / (2.0 * shorter_var_cn2)
+    log_lik_cn3_ref = -0.5 * np.log(2.0 * np.pi * shorter_var_cn3) - (
+        (2.1 - 3.0) ** 2
+    ) / (2.0 * shorter_var_cn3)
+    odds_cn3_ref = np.exp(log_lik_cn3_ref - log_lik_cn2_ref) * (0.01 / 0.99)
+    p_cn3_short_length_scale = odds_cn3_ref / (1.0 + odds_cn3_ref)
+    assert cn_posterior[0, 0, 3] > p_cn3_short_length_scale
+
+
+def test_run_discrete_inference_baf_outlier_rate_caps_contradictory_baf_penalty():
+    maps = {
+        "bin_bias": np.asarray([1.0, 1.0], dtype=np.float32),
+        "sample_var": np.asarray([0.05, 0.05], dtype=np.float32),
+        "bin_var": np.asarray([0.0, 0.0], dtype=np.float32),
+        "pair_state_probs": np.asarray([[0.5, 0.5], [0.5, 0.5]], dtype=np.float32),
+    }
+
+    def make_model(baf_outlier_rate: float):
+        model = object.__new__(CNVModel)
+        model.pair_states = [(1, 1), (1, 2)]
+        model.max_total_cn = 3
+        model.bin_size_factor = 1.0
+        model.baf_temperature = 1.0
+        model.baf_outlier_rate = baf_outlier_rate
+        model.var_length_scale = 1.0
+        model._count_anchored_reference_variance_np = _count_anchored_reference_variance_numpy(
+            np.asarray([4.0, 4.0], dtype=np.float32),
+            reference_bin_size=1.0,
+            bin_size_factor=1.0,
+        )
+        model._pair_state_prior_mean_np = np.asarray([0.5, 0.5], dtype=np.float64)
+        model.get_map_estimates = lambda data: {
+            **maps,
+            "length_scale_var": np.asarray(1.0, dtype=np.float32),
+        }
+        return model
+
+    data = SimpleNamespace(
+        depth=_FakeTensor([[2.9, 2.9], [2.9, 2.9]]),
+        interval_sizes=_FakeTensor([[1.0], [1.0]]),
+        minor_baf_median=_FakeTensor([[0.49, 0.49], [0.49, 0.49]]),
+        baf_variance=_FakeTensor([[1e-4, 1e-4], [1e-4, 1e-4]]),
+        baf_n_sites=_FakeTensor([[5, 5], [5, 5]]),
+        n_bins=2,
+        n_samples=2,
+        has_baf=True,
+    )
+
+    plain_posterior = CNVModel.run_discrete_inference(make_model(0.0), data)["cn_posterior"][0, 0, 3]
+    robust_posterior = CNVModel.run_discrete_inference(make_model(0.05), data)["cn_posterior"][0, 0, 3]
+
+    assert plain_posterior < 1e-10
+    assert robust_posterior > 1e-3
+    assert robust_posterior > plain_posterior * 1e6
