@@ -1052,7 +1052,7 @@ def _plot_event_marginal_panel(
 ) -> None:
     """Render per-bin event QUAL scores for one sample."""
     ax.set_xlim(0.0, xform.d_end)
-    ax.set_ylim(0.0, 99.0)
+    ax.set_ylim(-99.0, 99.0)
     ax.grid(True, alpha=0.3, axis="y", zorder=0)
 
     if event_probabilities is None or svtype is None:
@@ -1084,13 +1084,13 @@ def _plot_event_marginal_panel(
     color = "#C23B22" if svtype == "DEL" else "#2A6FBB"
 
     if np.any(valid):
-        clipped = posterior_called_state_to_qual(
+        qual_values = posterior_called_state_to_qual(
             event_probabilities[valid],
             called_event_mask[valid],
         )
         ax.bar(
             x_positions[valid],
-            clipped,
+            qual_values,
             width=np.asarray(bar_widths, dtype=float)[valid] * 0.85,
             color=color,
             alpha=0.25,
@@ -1101,7 +1101,7 @@ def _plot_event_marginal_panel(
         if show_trace:
             ax.plot(
                 x_positions[valid],
-                clipped,
+                qual_values,
                 color=color,
                 linewidth=1.2,
                 alpha=0.9,
@@ -2447,6 +2447,11 @@ def parse_args():
         help="Plot individual sample plots for all samples (not just carriers)",
     )
     parser.add_argument(
+        "--skip-locus-plots",
+        action="store_true",
+        help="Skip per-locus overview plot generation.",
+    )
+    parser.add_argument(
         "--sample",
         type=str,
         help="Plot only this specific sample",
@@ -2752,28 +2757,31 @@ def main():
     plot_confidence_distribution(plot_calls_df, args.output_dir)
 
     # Create locus overview plots
-    print("\nCreating locus overview plots...")
-    depth_by_cluster = {k: v for k, v in depth_df.groupby("Cluster")}
-    skipped_locus_plots = 0
-    for cluster, locus in loci_to_plot.items():
-        cluster_depth = depth_by_cluster.get(cluster)
-        if cluster_depth is None:
-            skipped_locus_plots += 1
-            continue
-        plot_locus_overview(
-            locus, calls_df, cluster_depth, gtf, segdup,
-            args.output_dir, padding=args.padding,
-            ploidy_lookup=ploidy_lookup,
-            min_gene_label_spacing=args.min_gene_label_spacing,
-            raw_counts_df=raw_counts_df,
-            raw_sample_medians=raw_sample_medians if raw_sample_medians else None,
-            gaps=gaps,
-            flank_scale=args.flank_scale,
-            lowres_median_bin_size=lowres_median_bin_size,
-            highres_path=highres_path,
-        )
-    if skipped_locus_plots:
-        print(f"  Skipped {skipped_locus_plots} locus overview plot(s) with no depth data")
+    if args.skip_locus_plots:
+        print("\nSkipping locus overview plots (--skip-locus-plots)")
+    else:
+        print("\nCreating locus overview plots...")
+        depth_by_cluster = {k: v for k, v in depth_df.groupby("Cluster")}
+        skipped_locus_plots = 0
+        for cluster, locus in loci_to_plot.items():
+            cluster_depth = depth_by_cluster.get(cluster)
+            if cluster_depth is None:
+                skipped_locus_plots += 1
+                continue
+            plot_locus_overview(
+                locus, calls_df, cluster_depth, gtf, segdup,
+                args.output_dir, padding=args.padding,
+                ploidy_lookup=ploidy_lookup,
+                min_gene_label_spacing=args.min_gene_label_spacing,
+                raw_counts_df=raw_counts_df,
+                raw_sample_medians=raw_sample_medians if raw_sample_medians else None,
+                gaps=gaps,
+                flank_scale=args.flank_scale,
+                lowres_median_bin_size=lowres_median_bin_size,
+                highres_path=highres_path,
+            )
+        if skipped_locus_plots:
+            print(f"  Skipped {skipped_locus_plots} locus overview plot(s) with no depth data")
 
     # Create individual sample plots
     if args.plot_all_samples or args.sample:

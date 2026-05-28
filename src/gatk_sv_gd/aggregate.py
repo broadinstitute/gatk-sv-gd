@@ -17,7 +17,10 @@ import pandas as pd
 from matplotlib.backends.backend_pdf import PdfPages
 from matplotlib.lines import Line2D
 
+from gatk_sv_gd.annotations import FlankCompressor
 from gatk_sv_gd._util import get_logger, setup_logging
+from gatk_sv_gd.models import GDTable
+from gatk_sv_gd.plot import ViterbiOverlayData, _render_pdf_sample_page
 
 _CONFIDENCE_COLUMNS = ("qual_score", "confidence_score", "log_prob_score")
 _REQUIRED_CALL_COLUMNS = {
@@ -105,6 +108,8 @@ _CASE_COLUMNS = [
     "min_interval_confidence",
     "left_flank_non_event_median",
     "right_flank_non_event_median",
+    "left_flank_status",
+    "right_flank_status",
     "min_flank_non_event_confidence",
     "confidence_column",
     "confidence_value",
@@ -153,6 +158,8 @@ _RULE = "#808080"
 _BAND = "#ECECEC"
 _STRIPE = "#F5F5F5"
 _REPORT_TITLE = "GATK-SV GD Aggregate Report"
+_PLOT_MIN_GENE_LABEL_SPACING = 0.05
+_PLOT_FLANK_SCALE = 0.20
 
 _CASE_SECTIONS = (
     ("high_confidence_carrier", "Confident GD Calls"),
@@ -184,6 +191,19 @@ class TocLinkSpec:
     y1: float
 
 
+@dataclass
+class PlotRunContext:
+    loci_by_cluster: Dict[str, Any]
+    depth_by_cluster: Dict[str, pd.DataFrame]
+    minor_baf_by_cluster: Dict[str, pd.DataFrame]
+    baf_sites_by_cluster: Dict[str, pd.DataFrame]
+    event_del_by_cluster: Dict[str, pd.DataFrame]
+    event_dup_by_cluster: Dict[str, pd.DataFrame]
+    viterbi_data: Optional[ViterbiOverlayData]
+    baf_temperature_by_sample: Dict[str, float]
+    unavailable_reason: Optional[str] = None
+
+
 def parse_args() -> argparse.Namespace:
     """Parse command-line arguments for the aggregate subcommand."""
     parser = argparse.ArgumentParser(
@@ -207,6 +227,12 @@ def parse_args() -> argparse.Namespace:
         help="Filename for the aggregate PDF report",
     )
     parser.add_argument(
+        "--min-confidence",
+        type=float,
+        default=50.0,
+        help="Lower bound for including non-confident best-match calls in aggregate outputs",
+    )
+    parser.add_argument(
         "--batch-label",
         action="append",
         default=None,
@@ -220,6 +246,8 @@ def _validate_args(args: argparse.Namespace) -> None:
     output_name = Path(args.output_name)
     if output_name.name != args.output_name or output_name.suffix.lower() != ".pdf":
         raise ValueError("--output-name must be a PDF filename, not a path")
+    if args.min_confidence < 0:
+        raise ValueError("--min-confidence must be non-negative")
     if args.batch_label is not None and len(args.batch_label) != len(args.work_dirs):
         raise ValueError("--batch-label must be provided once per work directory")
 
@@ -410,11 +438,154 @@ def _load_runs(args: argparse.Namespace) -> List[RunData]:
     ]
 
 
-def _reportable_carrier_mask(calls_df: pd.DataFrame) -> pd.Series:
-    return calls_df["is_best_match"].map(_to_bool_value)
+def _group_plot_frames_by_cluster(frame: Optional[pd.DataFrame]) -> Dict[str, pd.DataFrame]:
+    if frame is None or frame.empty or "Cluster" not in frame.columns:
+        return {}
+    return {
+        str(cluster): group.sort_values("Start").reset_index(drop=True)
+        for cluster, group in frame.groupby("Cluster", sort=False)
+    }
 
 
-def _build_calls_table(runs: List[RunData]) -> pd.DataFrame:
+def _pivot_plot_matrix(cn_posteriors_df: pd.DataFrame, value_column: str) -> Optional[pd.DataFrame]:
+    if value_column not in cn_posteriors_df.columns:
+        return None
+    frame = cn_posteriors_df.pivot(
+        index=["cluster", "chr", "start", "end"],
+        columns="sample",
+        values=value_column,
+    ).reset_index()
+    return frame.rename(columns={
+        "cluster": "Cluster",
+        "chr": "Chr",
+        "start": "Start",
+        "end": "End",
+    })
+
+
+def _load_plot_run_context(run: RunData) -> PlotRunContext:
+    def _unavailable(reason: str) -> PlotRunContext:
+        return PlotRunContext(
+            loci_by_cluster={},
+            depth_by_cluster={},
+            minor_baf_by_cluster={},
+            baf_sites_by_cluster={},
+            event_del_by_cluster={},
+            event_dup_by_cluster={},
+            viterbi_data=None,
+            baf_temperature_by_sample={},
+            unavailable_reason=reason,
+        )
+
+    cn_posteriors_path = run.work_dir / "infer" / "cn_posteriors.tsv.gz"
+    if not cn_posteriors_path.exists():
+        return _unavailable("missing infer/cn_posteriors.tsv.gz")
+
+    try:
+        cn_posteriors_df = _read_tsv(cn_posteriors_path)
+    except ValueError as exc:
+        return _unavailable(str(exc))
+    if cn_posteriors_df.empty:
+        return _unavailable("infer/cn_posteriors.tsv.gz is empty")
+
+    cn_posteriors_df = cn_posteriors_df.drop_duplicates(
+        subset=["cluster", "chr", "start", "end", "sample"],
+    )
+    depth_df = _pivot_plot_matrix(cn_posteriors_df, "depth")
+    if depth_df is None:
+        return _unavailable("infer/cn_posteriors.tsv.gz is missing depth values")
+
+    baf_temperature_by_sample: Dict[str, float] = {}
+    sample_posteriors_path = run.work_dir / "infer" / "sample_posteriors.tsv.gz"
+    if sample_posteriors_path.exists():
+        try:
+            sample_posteriors_df = _read_tsv(sample_posteriors_path)
+        except ValueError:
+            sample_posteriors_df = pd.DataFrame()
+        baf_temperature_column = None
+        if "baf_variance_scale_map" in sample_posteriors_df.columns:
+            baf_temperature_column = "baf_variance_scale_map"
+        elif "baf_temperature_map" in sample_posteriors_df.columns:
+            baf_temperature_column = "baf_temperature_map"
+        if "sample" in sample_posteriors_df.columns and baf_temperature_column is not None:
+            valid_rows = sample_posteriors_df[["sample", baf_temperature_column]].dropna()
+            baf_temperature_by_sample = {
+                str(row["sample"]): float(row[baf_temperature_column])
+                for _, row in valid_rows.iterrows()
+            }
+
+    minor_baf_df = _pivot_plot_matrix(cn_posteriors_df, "minor_baf_median")
+    baf_sites_df = _pivot_plot_matrix(cn_posteriors_df, "baf_n_sites")
+
+    event_del_by_cluster: Dict[str, pd.DataFrame] = {}
+    event_dup_by_cluster: Dict[str, pd.DataFrame] = {}
+    event_marginals_path = run.work_dir / "call" / "event_marginals.tsv.gz"
+    if event_marginals_path.exists():
+        try:
+            event_marginals_df = _read_tsv(event_marginals_path)
+        except ValueError:
+            event_marginals_df = pd.DataFrame()
+        if not event_marginals_df.empty:
+            event_marginals_df = event_marginals_df.rename(columns={
+                "cluster": "Cluster",
+                "chrom": "Chr",
+                "start": "Start",
+                "end": "End",
+            })
+            if "prob_del_event" in event_marginals_df.columns:
+                event_del_by_cluster = _group_plot_frames_by_cluster(
+                    event_marginals_df.pivot(
+                        index=["Cluster", "Chr", "Start", "End"],
+                        columns="sample",
+                        values="prob_del_event",
+                    ).reset_index()
+                )
+            if "prob_dup_event" in event_marginals_df.columns:
+                event_dup_by_cluster = _group_plot_frames_by_cluster(
+                    event_marginals_df.pivot(
+                        index=["Cluster", "Chr", "Start", "End"],
+                        columns="sample",
+                        values="prob_dup_event",
+                    ).reset_index()
+                )
+
+    viterbi_data = None
+    viterbi_paths_path = run.work_dir / "call" / "viterbi_paths.tsv.gz"
+    if viterbi_paths_path.exists():
+        try:
+            viterbi_data = ViterbiOverlayData(_read_tsv(viterbi_paths_path))
+        except ValueError:
+            viterbi_data = None
+
+    try:
+        gd_table = GDTable(str(run.work_dir / "preprocess" / "gd_table_filtered.tsv"))
+    except Exception as exc:
+        return _unavailable("could not load GD table for plot rendering: {}".format(exc))
+
+    return PlotRunContext(
+        loci_by_cluster=gd_table.loci,
+        depth_by_cluster=_group_plot_frames_by_cluster(depth_df),
+        minor_baf_by_cluster=_group_plot_frames_by_cluster(minor_baf_df),
+        baf_sites_by_cluster=_group_plot_frames_by_cluster(baf_sites_df),
+        event_del_by_cluster=event_del_by_cluster,
+        event_dup_by_cluster=event_dup_by_cluster,
+        viterbi_data=viterbi_data,
+        baf_temperature_by_sample=baf_temperature_by_sample,
+    )
+
+
+def _low_confidence_carrier_mask(
+    calls_df: pd.DataFrame,
+    *,
+    min_confidence: float,
+) -> pd.Series:
+    best_match_mask = calls_df["is_best_match"].map(_to_bool_value)
+    confident_mask = calls_df["is_carrier"].map(_to_bool_value)
+    confidence_mask = calls_df["confidence_value"].ge(float(min_confidence)).fillna(False)
+    return best_match_mask & (~confident_mask) & confidence_mask
+
+
+def _build_calls_table(runs: List[RunData], *, min_confidence: float) -> pd.DataFrame:
     frames: List[pd.DataFrame] = []
     for run in runs:
         confidence_column = _get_confidence_column(run.calls_df)
@@ -424,10 +595,9 @@ def _build_calls_table(runs: List[RunData]) -> pd.DataFrame:
             calls[confidence_column],
             errors="coerce",
         )
-        reportable_mask = _reportable_carrier_mask(calls)
-        high_mask = reportable_mask & calls["is_carrier"].map(_to_bool_value)
-        low_mask = reportable_mask & (~calls["is_carrier"].map(_to_bool_value))
-        calls["is_reportable_call"] = reportable_mask
+        high_mask = calls["is_carrier"].map(_to_bool_value)
+        low_mask = _low_confidence_carrier_mask(calls, min_confidence=min_confidence)
+        calls["is_reportable_call"] = high_mask | low_mask
         calls["is_high_confidence_carrier"] = high_mask
         calls["is_low_confidence_carrier"] = low_mask
         calls["is_visible_carrier"] = high_mask | low_mask
@@ -451,6 +621,28 @@ def _build_cases_table(calls_df: pd.DataFrame) -> pd.DataFrame:
         return pd.DataFrame(columns=_CASE_COLUMNS)
     visible_categories = {category for category, _title in _CASE_SECTIONS}
     cases = calls_df[calls_df["carrier_category"].isin(visible_categories)].copy()
+    flank_threshold = pd.to_numeric(
+        cases.get("call_criteria_flank_non_event_confidence"),
+        errors="coerce",
+    )
+    left_flank_median = pd.to_numeric(
+        cases.get("left_flank_non_event_median"),
+        errors="coerce",
+    )
+    right_flank_median = pd.to_numeric(
+        cases.get("right_flank_non_event_median"),
+        errors="coerce",
+    )
+    cases["left_flank_status"] = np.where(
+        left_flank_median.isna() | flank_threshold.isna() | left_flank_median.ge(flank_threshold),
+        "PASS",
+        "FAIL",
+    )
+    cases["right_flank_status"] = np.where(
+        right_flank_median.isna() | flank_threshold.isna() | right_flank_median.ge(flank_threshold),
+        "PASS",
+        "FAIL",
+    )
     for column in _CASE_COLUMNS:
         if column not in cases.columns:
             cases[column] = ""
@@ -594,6 +786,8 @@ def _build_summary_table(
     locus_summary_df: pd.DataFrame,
     eval_df: pd.DataFrame,
     runs: List[RunData],
+    *,
+    min_confidence: float,
 ) -> pd.DataFrame:
     rows: List[Dict[str, Any]] = [
         {"metric": "n_batches", "value": int(len(runs))},
@@ -613,6 +807,7 @@ def _build_summary_table(
         {"metric": "n_batches_with_eval_report", "value": int(sum(run.eval_df is not None for run in runs))},
         {"metric": "n_eval_rows", "value": int(len(eval_df))},
         {"metric": "n_locus_summary_rows", "value": int(len(locus_summary_df))},
+        {"metric": "aggregate_min_confidence", "value": float(min_confidence)},
     ]
 
     if "svtype" in cases_df.columns:
@@ -658,8 +853,10 @@ def _build_summary_table(
 
 def _build_report_tables(
     runs: List[RunData],
+    *,
+    min_confidence: float,
 ) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
-    calls_df = _build_calls_table(runs)
+    calls_df = _build_calls_table(runs, min_confidence=min_confidence)
     cases_df = _build_cases_table(calls_df)
     locus_summary_df = _build_locus_summary_table(calls_df)
     eval_df = _build_eval_table(runs)
@@ -673,6 +870,7 @@ def _build_report_tables(
         locus_summary_df,
         eval_df,
         runs,
+        min_confidence=min_confidence,
     )
     return (
         summary_df,
@@ -742,6 +940,7 @@ def _humanize_metric(name: str) -> str:
         "n_batches_with_eval_report": "Batches with eval report",
         "n_eval_rows": "Evaluation rows",
         "n_locus_summary_rows": "Locus burden rows",
+        "aggregate_min_confidence": "Aggregate non-confident min confidence",
         "aggregate_TP": "Aggregate TP",
         "aggregate_FP": "Aggregate FP",
         "aggregate_FN": "Aggregate FN",
@@ -1086,6 +1285,7 @@ def _add_cover_page(
         ("Batches analysed", str(len(runs))),
     ]
     for metric in (
+        "aggregate_min_confidence",
         "calling_modes",
         "call_mean_coverage_threshold",
         "call_interval_confidence_threshold",
@@ -1236,13 +1436,13 @@ def _add_summary_pages(
         case_display,
         [
             "carrier_category", "batch_label", "sample", "GD_ID", "cluster",
-            "svtype", "confidence_value",
+            "svtype", "left_flank_status", "right_flank_status", "confidence_value",
         ],
         header="Section 2 - Case Index",
         title="Case Index",
         eyebrow="Section 2",
         max_rows=16,
-        col_widths=[0.20, 0.16, 0.13, 0.20, 0.18, 0.08, 0.05],
+        col_widths=[0.18, 0.12, 0.11, 0.18, 0.15, 0.06, 0.08, 0.08, 0.04],
         column_labels={
             "carrier_category": "Category",
             "batch_label": "Batch",
@@ -1250,6 +1450,8 @@ def _add_summary_pages(
             "GD_ID": "GD ID",
             "cluster": "Locus",
             "svtype": "Type",
+            "left_flank_status": "Left flank",
+            "right_flank_status": "Right flank",
             "confidence_value": "Confidence",
         },
         row_height=0.045,
@@ -1291,7 +1493,7 @@ def _case_section_start_pages(cases_df: pd.DataFrame, first_case_page: int) -> L
         if section_cases.empty:
             continue
         entries.append((title, page))
-        page += 1 + len(section_cases)
+        page += 1 + (2 * len(section_cases))
     return entries
 
 
@@ -1349,6 +1551,134 @@ def _draw_case_evidence_plot(fig: plt.Figure, case: pd.Series, *, left: float, b
     ax2.grid(axis="x", color="#DDDDDD", linewidth=0.5)
     for spine in ax2.spines.values():
         spine.set_visible(False)
+
+
+def _add_case_plot_unavailable_page(
+    pdf: PdfPages,
+    pdf_state: Dict[str, Any],
+    case: pd.Series,
+    *,
+    section_number: int,
+    section_title: str,
+    reason: str,
+) -> None:
+    fig = _new_page(pdf_state, header="Section {} - {}".format(section_number, section_title))
+    y = _section_band(fig, _BODY_TOP, "Per-sample Plot", eyebrow="Diagnostic")
+    y = _draw_paragraph(
+        fig,
+        "The plot-style per-sample review page could not be rendered for this case.",
+        start_y=y,
+        fontsize=9,
+    )
+    _draw_kv_block(
+        fig,
+        [
+            ("Sample", _format_pdf_value(case.get("sample"))),
+            ("Batch", _format_pdf_value(case.get("batch_label"))),
+            ("GD ID", _format_pdf_value(case.get("GD_ID"))),
+            ("Locus", _format_pdf_value(case.get("cluster"))),
+            ("Reason", reason),
+        ],
+        start_y=y - 0.010,
+        columns=1,
+        line_height=0.022,
+        label_fraction=0.18,
+    )
+    _save_page(pdf, fig)
+
+
+def _add_case_plot_page(
+    pdf: PdfPages,
+    pdf_state: Dict[str, Any],
+    case: pd.Series,
+    run: RunData,
+    plot_context: PlotRunContext,
+    *,
+    section_number: int,
+    section_title: str,
+) -> None:
+    if plot_context.unavailable_reason:
+        _add_case_plot_unavailable_page(
+            pdf,
+            pdf_state,
+            case,
+            section_number=section_number,
+            section_title=section_title,
+            reason=plot_context.unavailable_reason,
+        )
+        return
+
+    cluster = str(case.get("cluster"))
+    sample_id = str(case.get("sample"))
+    locus = plot_context.loci_by_cluster.get(cluster)
+    region_df = plot_context.depth_by_cluster.get(cluster)
+    if locus is None or region_df is None or region_df.empty:
+        _add_case_plot_unavailable_page(
+            pdf,
+            pdf_state,
+            case,
+            section_number=section_number,
+            section_title=section_title,
+            reason="no locus-specific depth data were available for this cluster",
+        )
+        return
+    if sample_id not in region_df.columns:
+        _add_case_plot_unavailable_page(
+            pdf,
+            pdf_state,
+            case,
+            section_number=section_number,
+            section_title=section_title,
+            reason="the sample is not present in the inferred depth matrix for this locus",
+        )
+        return
+
+    region_start = int(region_df["Start"].min())
+    region_end = int(region_df["End"].max())
+    xform = FlankCompressor(
+        region_start,
+        region_end,
+        locus.start,
+        locus.end,
+        flank_scale=_PLOT_FLANK_SCALE,
+    )
+    cluster_calls_df = run.calls_df[run.calls_df["cluster"].astype(str) == cluster]
+    confidence_column = _get_confidence_column(run.calls_df)
+
+    pdf_state["page"] += 1
+    rendered = _render_pdf_sample_page(
+        pdf,
+        sample_id,
+        cluster,
+        locus,
+        region_df,
+        cluster_calls_df,
+        confidence_column,
+        None,
+        None,
+        _PLOT_MIN_GENE_LABEL_SPACING,
+        xform,
+        None,
+        plot_context.minor_baf_by_cluster.get(cluster),
+        plot_context.baf_sites_by_cluster.get(cluster),
+        plot_context.event_del_by_cluster.get(cluster),
+        plot_context.event_dup_by_cluster.get(cluster),
+        None,
+        plot_context.viterbi_data,
+        baf_temperature_by_sample=plot_context.baf_temperature_by_sample,
+        target_gd_id=str(case.get("GD_ID")),
+        title_suffix="Aggregate case report",
+    )
+    if not rendered:
+        pdf_state["page"] -= 1
+        _add_case_plot_unavailable_page(
+            pdf,
+            pdf_state,
+            case,
+            section_number=section_number,
+            section_title=section_title,
+            reason="the plot renderer could not produce a page for this sample/locus combination",
+        )
 
 
 def _add_section_divider(
@@ -1412,8 +1742,9 @@ def _add_case_page(
             ("Breakpoints", "{}-{}".format(_format_pdf_value(case.get("BP1")), _format_pdf_value(case.get("BP2")))),
         ],
         start_y=y,
-        columns=2,
-        line_height=0.024,
+        columns=1,
+        line_height=0.020,
+        label_fraction=0.28,
     )
 
     y = _section_band(fig, y - 0.010, "Call Metrics", eyebrow="Findings")
@@ -1430,8 +1761,9 @@ def _add_case_page(
             ("Reciprocal overlap", _format_pdf_value(case.get("reciprocal_overlap"))),
         ],
         start_y=y,
-        columns=2,
-        line_height=0.024,
+        columns=1,
+        line_height=0.020,
+        label_fraction=0.28,
     )
 
     evidence_df = pd.DataFrame([
@@ -1461,7 +1793,7 @@ def _add_case_page(
         },
     ])
     y = _section_band(fig, y - 0.010, "Breakpoint Evidence", eyebrow="Evidence")
-    _draw_table(
+    y = _draw_table(
         fig,
         evidence_df,
         ["metric", "value"],
@@ -1469,16 +1801,21 @@ def _add_case_page(
         max_rows=8,
         col_widths=[0.48, 0.52],
         column_labels={"metric": "Metric", "value": "Value"},
-        font_size=8,
+        font_size=7,
+        row_height=0.024,
     )
 
-    y_plot = 0.37
-    y_plot = _section_band(fig, y_plot, "Evidence Plot", eyebrow="Diagnostic")
-    _draw_case_evidence_plot(fig, case, left=_MARGIN_L, bottom=_BODY_BOTTOM + 0.02, width=_MARGIN_R - _MARGIN_L, height=y_plot - (_BODY_BOTTOM + 0.03))
     _save_page(pdf, fig)
 
 
-def _add_case_pages(pdf: PdfPages, pdf_state: Dict[str, Any], cases_df: pd.DataFrame) -> None:
+def _add_case_pages(
+    pdf: PdfPages,
+    pdf_state: Dict[str, Any],
+    cases_df: pd.DataFrame,
+    runs: List[RunData],
+) -> None:
+    runs_by_batch_id = {run.batch_id: run for run in runs}
+    plot_context_by_batch_id: Dict[int, PlotRunContext] = {}
     section_number = 4
     for category, title in _CASE_SECTIONS:
         section_cases = cases_df[cases_df["carrier_category"] == category] if not cases_df.empty else pd.DataFrame()
@@ -1487,6 +1824,29 @@ def _add_case_pages(pdf: PdfPages, pdf_state: Dict[str, Any], cases_df: pd.DataF
         _add_section_divider(pdf, pdf_state, section_number, title, len(section_cases))
         for _, case in section_cases.sort_values(["batch_label", "cluster", "GD_ID", "sample"]).iterrows():
             _add_case_page(pdf, pdf_state, case, section_number=section_number, section_title=title)
+            batch_id = int(case.get("batch_id"))
+            run = runs_by_batch_id.get(batch_id)
+            if run is None:
+                _add_case_plot_unavailable_page(
+                    pdf,
+                    pdf_state,
+                    case,
+                    section_number=section_number,
+                    section_title=title,
+                    reason="the aggregate run metadata for this batch were unavailable",
+                )
+                continue
+            if batch_id not in plot_context_by_batch_id:
+                plot_context_by_batch_id[batch_id] = _load_plot_run_context(run)
+            _add_case_plot_page(
+                pdf,
+                pdf_state,
+                case,
+                run,
+                plot_context_by_batch_id[batch_id],
+                section_number=section_number,
+                section_title=title,
+            )
         section_number += 1
 
 
@@ -1495,12 +1855,12 @@ def _add_eval_pages(pdf: PdfPages, pdf_state: Dict[str, Any], eval_df: pd.DataFr
         pdf,
         pdf_state,
         eval_df,
-        ["batch_label", "GD_ID", "TP", "FP", "FN", "sensitivity", "precision", "TP_samples", "FP_samples", "FN_samples"],
+        ["batch_label", "GD_ID", "TP", "FP", "FN", "sensitivity", "precision"],
         header="Evaluation Summary",
         title="Evaluation Summary",
         eyebrow="Evaluation",
         max_rows=18,
-        col_widths=[0.12, 0.15, 0.06, 0.06, 0.06, 0.10, 0.10, 0.12, 0.12, 0.11],
+        col_widths=[0.14, 0.28, 0.08, 0.08, 0.08, 0.17, 0.17],
         column_labels={"batch_label": "Batch", "GD_ID": "GD ID"},
     )
 
@@ -1524,17 +1884,30 @@ def _field_guide_table() -> pd.DataFrame:
     rows = [
         ("Cover page", "Summary", "Front-matter summary of cohort size, modeled loci, carrier events, and evaluation availability."),
         ("Cover page", "Calling mode(s)", "Calling mode and call-stage selection criteria read from the call outputs for the aggregated runs."),
+        ("Cover page", "Aggregate non-confident min confidence", "Lower score bound for showing non-confident best-match calls in the aggregate outputs; confident calls are unaffected."),
         ("Batch Inventory", "Samples", "Number of distinct samples in each input work directory ploidy table."),
         ("Cohort Summary", "Metric", "Cohort-wide aggregate count or scalar metric."),
-        ("Case Index", "Category", "Confident when emitted by the call step as a carrier; non-confident when selected as the best-match candidate but not emitted as a carrier."),
+        ("Case Index", "Category", "Confident when emitted by the call step as a carrier; non-confident when selected as the best-match candidate but not emitted as a carrier and meeting the aggregate non-confident minimum confidence."),
+        ("Case Index", "Left flank / Right flank", "PASS when the flank non-event median meets the call-time flank threshold, or when no flank value was available; otherwise FAIL."),
         ("Locus Burden", "Carrier samples", "Number of unique carrier samples for one batch/GD_ID/locus/type group."),
         ("Case detail", "Call Metrics", "Per-call identifiers, confidence, method, ploidy, depth, interval coverage, and reciprocal overlap."),
         ("Case detail", "Breakpoint Evidence", "Detailed evidence fields emitted by the call step for the selected GD breakpoint match."),
-        ("Case detail", "Evidence Plot", "Compact visualization of confidence, flank support, interval coverage, and reciprocal overlap."),
+        ("Case detail", "Per-sample plot", "Full review page reused from the plot tool, showing the sample's locus annotations, depth profile, BAF panel, and event-marginal panel for the selected call."),
         ("Evaluation Summary", "TP/FP/FN", "Optional truth-set comparison fields computed by eval from the confident carriers emitted by the call step."),
-        ("Missing Optional Artifacts", "Reason", "Why an optional input artifact was not incorporated into the aggregate inventory."),
     ]
     return pd.DataFrame(rows, columns=["display_element", "displayed_label", "definition"])
+
+
+def _case_section_page_count(cases_df: pd.DataFrame) -> int:
+    if cases_df.empty:
+        return 0
+    total = 0
+    for category, _title in _CASE_SECTIONS:
+        section_cases = cases_df[cases_df["carrier_category"] == category]
+        if section_cases.empty:
+            continue
+        total += 1 + (2 * len(section_cases))
+    return total
 
 
 def _add_field_guide_pages(pdf: PdfPages, pdf_state: Dict[str, Any]) -> None:
@@ -1584,13 +1957,11 @@ def _build_toc_entries(
     ]
     case_entries = _case_section_start_pages(cases_df, locus_start + locus_pages)
     entries.extend(case_entries)
-    page = locus_start + locus_pages + sum(1 + len(cases_df[cases_df["carrier_category"] == category]) for category, _ in _CASE_SECTIONS if not cases_df.empty)
+    page = locus_start + locus_pages + _case_section_page_count(cases_df)
     eval_pages = _page_count(len(eval_df), 18)
-    missing_pages = _page_count(len(missing_df), 18)
     entries.extend([
         ("Evaluation Summary", page),
-        ("Missing Optional Artifacts", page + eval_pages),
-        ("Report Field Guide", page + eval_pages + missing_pages),
+        ("Report Field Guide", page + eval_pages),
     ])
     return entries
 
@@ -1641,9 +2012,8 @@ def _write_pdf_report(
         )
         _add_inventory_pages(pdf, pdf_state, inventory_df)
         _add_summary_pages(pdf, pdf_state, summary_df, cases_df, locus_summary_df)
-        _add_case_pages(pdf, pdf_state, cases_df)
+        _add_case_pages(pdf, pdf_state, cases_df, runs)
         _add_eval_pages(pdf, pdf_state, eval_df)
-        _add_missing_pages(pdf, pdf_state, missing_df)
         _add_field_guide_pages(pdf, pdf_state)
         _add_pdf_internal_links(pdf, 1, link_specs)
 
@@ -1664,7 +2034,7 @@ def _run_aggregate(args: argparse.Namespace) -> None:
         locus_summary_df,
         eval_df,
         missing_df,
-    ) = _build_report_tables(runs)
+    ) = _build_report_tables(runs, min_confidence=args.min_confidence)
     sidecar_paths = _write_sidecars(
         output_dir,
         summary_df,

@@ -1327,9 +1327,43 @@ def write_preprocessed_baf(
     return output_path
 
 
+def build_normalization_metadata(
+    sample_ids: List[str],
+    raw_count_medians: np.ndarray,
+    reference_bin_size: float,
+) -> pd.DataFrame:
+    """Build per-sample normalization metadata for count-anchored variance."""
+    raw_count_medians = np.asarray(raw_count_medians, dtype=np.float64).reshape(-1)
+    if len(sample_ids) != raw_count_medians.size:
+        raise ValueError("sample_ids and raw_count_medians must have the same length.")
+    if reference_bin_size <= 0:
+        raise ValueError("reference_bin_size must be positive.")
+    if np.any(raw_count_medians <= 0):
+        raise ValueError("raw_count_medians must all be positive.")
+    return pd.DataFrame(
+        {
+            "sample": [str(sample_id) for sample_id in sample_ids],
+            "raw_count_median": raw_count_medians,
+            "reference_bin_size": float(reference_bin_size),
+        }
+    )
+
+
+def write_normalization_metadata(
+    metadata_df: pd.DataFrame,
+    output_dir: str,
+) -> str:
+    """Persist normalization metadata used for count-anchored variance."""
+    output_path = os.path.join(output_dir, "normalization_metadata.tsv")
+    metadata_df.to_csv(output_path, sep="\t", index=False)
+    print("  Saved normalization metadata table")
+    print(f"  Rows: {len(metadata_df):,}")
+    return output_path
+
+
 def load_preprocessed_data(
     preprocessed_dir: str,
-) -> Tuple[pd.DataFrame, List[LocusBinMapping], Optional[pd.DataFrame]]:
+) -> Tuple[pd.DataFrame, List[LocusBinMapping], Optional[pd.DataFrame], Optional[pd.DataFrame]]:
     """Load preprocessed bins and bin-to-interval mappings from disk.
 
     This is the complement of :func:`write_preprocessed_bins` +
@@ -1341,12 +1375,14 @@ def load_preprocessed_data(
         preprocessed_dir: Directory written by the ``preprocess`` subcommand.
 
     Returns:
-        Tuple of ``(combined_df, mappings, baf_summary_df)`` where
-        ``baf_summary_df`` is ``None`` when no BAF summary file exists.
+        Tuple of ``(combined_df, mappings, baf_summary_df,
+        normalization_metadata_df)`` where each optional DataFrame is
+        ``None`` when the corresponding file does not exist.
     """
     bins_path = os.path.join(preprocessed_dir, "preprocessed_bins.tsv.gz")
     mappings_path = os.path.join(preprocessed_dir, "bin_mappings.tsv.gz")
     baf_summary_path = os.path.join(preprocessed_dir, "preprocessed_baf_summary.tsv.gz")
+    normalization_metadata_path = os.path.join(preprocessed_dir, "normalization_metadata.tsv")
 
     print("  Loading preprocessed bins")
     combined_df = pd.read_csv(bins_path, sep="\t", compression="infer")
@@ -1374,7 +1410,13 @@ def load_preprocessed_data(
         baf_summary_df = pd.read_csv(baf_summary_path, sep="\t", compression="infer")
         print(f"    {len(baf_summary_df)} BAF summary rows")
 
-    return combined_df, mappings, baf_summary_df
+    normalization_metadata_df: Optional[pd.DataFrame] = None
+    if os.path.exists(normalization_metadata_path):
+        print("  Loading normalization metadata")
+        normalization_metadata_df = pd.read_csv(normalization_metadata_path, sep="\t")
+        print(f"    {len(normalization_metadata_df)} normalization metadata rows")
+
+    return combined_df, mappings, baf_summary_df, normalization_metadata_df
 
 
 # =============================================================================
@@ -1431,7 +1473,7 @@ def parse_args():
                         help="Padding around locus boundaries (bp)")
     parser.add_argument("--exclusion-threshold", type=float, default=0.1,
                         help="Min overlap fraction with exclusion regions to mask a bin")
-    parser.add_argument("--exclusion-bypass-threshold", type=float, default=0.8,
+    parser.add_argument("--exclusion-bypass-threshold", type=float, default=1.0,
                         help="Body-interval overlap fraction above which masking is skipped")
     parser.add_argument("--min-bins-per-interval", type=int, default=10,
                         help="Hard-failure minimum bins per body interval")
@@ -1620,7 +1662,13 @@ def main():
     print("\n" + "=" * 80)
     print("WRITING PREPROCESSED DATA")
     print("=" * 80)
+    normalization_metadata_df = build_normalization_metadata(
+        sample_cols,
+        column_medians,
+        lowres_median_bin_size,
+    )
     write_preprocessed_bins(combined_df, args.output_dir)
+    write_normalization_metadata(normalization_metadata_df, args.output_dir)
     write_locus_metadata(included_loci, mappings, args.output_dir)
     if args.baf_table:
         print("\nFiltering BAF table to retained GD regions...")
@@ -1656,7 +1704,7 @@ def main():
     print("\n" + "=" * 80)
     print("PREPROCESSING COMPLETE")
     print("=" * 80)
-    output_count = 6 + (2 if args.baf_table else 0)
+    output_count = 7 + (2 if args.baf_table else 0)
     print(f"\nOutput tables written: {output_count}")
     if args.baf_table:
         print("  BAF outputs included")

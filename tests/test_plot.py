@@ -1,3 +1,5 @@
+import sys
+
 import pandas as pd
 import matplotlib.pyplot as plt
 import pytest
@@ -15,6 +17,7 @@ from gatk_sv_gd.plot import (
     _plot_baf_signal_panel,
     _plot_event_marginal_panel,
     _rebin_aligned_region_dfs_for_display,
+    parse_args,
 )
 
 
@@ -41,6 +44,29 @@ def _make_eval_locus() -> GDLocus:
         }
     ]
     return locus
+
+
+def test_parse_args_allows_skipping_locus_plots(monkeypatch):
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "gatk-sv-gd plot",
+            "--calls",
+            "calls.tsv.gz",
+            "--cn-posteriors",
+            "cn.tsv.gz",
+            "--gd-table",
+            "gd.tsv",
+            "--output-dir",
+            "out",
+            "--skip-locus-plots",
+        ],
+    )
+
+    args = parse_args()
+
+    assert args.skip_locus_plots is True
 
 
 def test_build_eval_pdf_specs_rejects_missing_eval_sample_columns():
@@ -372,7 +398,7 @@ def test_plot_event_marginal_panel_uses_called_state_qual_scale():
             called_event_mask=called_event_mask,
         )
 
-        assert ax.get_ylim() == (0.0, 99.0)
+        assert ax.get_ylim() == (-99.0, 99.0)
         assert ax.get_ylabel() == "QUAL(DEL site state)"
         assert len(ax.lines) == 1
         assert list(ax.lines[0].get_ydata()) == pytest.approx(

@@ -289,10 +289,11 @@ def posterior_probability_to_qual(
     probability: Any,
     max_qual: float = 99.0,
 ) -> Any:
-    """Convert posterior event probabilities into capped phred-scale QUAL.
+    """Convert posterior event probabilities into signed phred-scale QUAL.
 
     The returned QUAL is based on posterior event-vs-non-event log odds,
-    computed as ``10 * log10(p / (1 - p))`` and clipped to ``[0, max_qual]``.
+    computed as ``10 * log10(p / (1 - p))`` and clipped to
+    ``[-max_qual, max_qual]``.
     Scalar inputs return a float; array-like inputs return a NumPy array.
     """
     probabilities = np.clip(np.asarray(probability, dtype=float), 0.0, 1.0)
@@ -301,7 +302,7 @@ def posterior_probability_to_qual(
     non_event_probabilities = np.clip(1.0 - probabilities, min_probability, 1.0)
     qual = np.clip(
         10.0 * np.log10(event_probabilities / non_event_probabilities),
-        0.0,
+        -float(max_qual),
         float(max_qual),
     )
     if qual.ndim == 0:
@@ -314,7 +315,7 @@ def posterior_called_state_to_qual(
     called_event: Any,
     max_qual: float = 99.0,
 ) -> Any:
-    """Convert posterior support for an expected state into capped QUAL.
+    """Convert posterior support for an expected state into signed QUAL.
 
     When ``called_event`` is truthy, the expected state is DEL/DUP on at least
     one haplotype and QUAL is based on ``p / (1 - p)``. When ``called_event`` is
@@ -335,7 +336,7 @@ def posterior_called_state_to_qual(
     )
     qual = np.clip(
         10.0 * np.log10(expected_probabilities / alternative_probabilities),
-        0.0,
+        -float(max_qual),
         float(max_qual),
     )
     if qual.ndim == 0:

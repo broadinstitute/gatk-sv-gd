@@ -17,6 +17,8 @@ def _call_row(
     is_best_match=True,
     qual_score=20.0,
     calling_method="posterior-marginal",
+    left_flank_non_event_median=2.0,
+    right_flank_non_event_median=2.0,
     call_criteria_mean_coverage=float("nan"),
     call_criteria_interval_confidence=60.0,
     call_criteria_flank_non_event_confidence=60.0,
@@ -44,8 +46,8 @@ def _call_row(
         "interval_coverage": 1.0,
         "reciprocal_overlap": 1.0,
         "min_interval_confidence": qual_score,
-        "left_flank_non_event_median": 2.0,
-        "right_flank_non_event_median": 2.0,
+        "left_flank_non_event_median": left_flank_non_event_median,
+        "right_flank_non_event_median": right_flank_non_event_median,
         "min_flank_non_event_confidence": qual_score,
         "is_carrier": is_carrier,
         "is_best_match": is_best_match,
@@ -133,6 +135,7 @@ def test_validate_args_rejects_bad_output_name_and_label_count():
         work_dirs=["run_a", "run_b"],
         output_dir="out",
         output_name="nested/report.pdf",
+        min_confidence=0.5,
         batch_label=None,
     )
 
@@ -140,6 +143,11 @@ def test_validate_args_rejects_bad_output_name_and_label_count():
         aggregate._validate_args(args)
 
     args.output_name = "report.pdf"
+    args.min_confidence = -0.1
+    with pytest.raises(ValueError, match="non-negative"):
+        aggregate._validate_args(args)
+
+    args.min_confidence = 0.5
     args.batch_label = ["only_one"]
     with pytest.raises(ValueError, match="once per work directory"):
         aggregate._validate_args(args)
@@ -176,7 +184,10 @@ def test_build_report_tables_classifies_carriers_and_eval(tmp_path):
         aggregate._load_run_data(str(run_b), batch_id=2, batch_label="run_b"),
     ]
 
-    summary_df, inventory_df, calls_df, cases_df, locus_summary_df, eval_df, missing_df = aggregate._build_report_tables(runs)
+    summary_df, inventory_df, calls_df, cases_df, locus_summary_df, eval_df, missing_df = aggregate._build_report_tables(
+        runs,
+        min_confidence=0.5,
+    )
 
     summary = summary_df.set_index("metric")["value"].to_dict()
     assert summary["n_batches"] == 2
@@ -186,6 +197,7 @@ def test_build_report_tables_classifies_carriers_and_eval(tmp_path):
     assert summary["n_low_confidence_carrier_events"] == 1
     assert summary["aggregate_TP"] == 1
     assert summary["aggregate_FN"] == 1
+    assert summary["aggregate_min_confidence"] == 0.5
     assert summary["call_interval_confidence_threshold"] == 60.0
     assert summary["call_flank_non_event_confidence_threshold"] == 60.0
     assert bool(inventory_df.set_index("batch_label").loc["run_a", "eval_report_present"])
@@ -202,17 +214,60 @@ def test_best_match_non_carriers_appear_as_non_confident_cases(tmp_path):
     _write_run(
         run_dir,
         [
-            _call_row("S1", is_carrier=True, qual_score=80.0),
-            _call_row("S2", is_carrier=False, is_best_match=True, qual_score=20.0),
+            _call_row(
+                "S1",
+                is_carrier=True,
+                qual_score=80.0,
+                left_flank_non_event_median=95.0,
+                right_flank_non_event_median=10.0,
+            ),
+            _call_row(
+                "S2",
+                is_carrier=False,
+                is_best_match=True,
+                qual_score=20.0,
+                left_flank_non_event_median=95.0,
+                right_flank_non_event_median=95.0,
+            ),
             _call_row("S3", is_carrier=False, is_best_match=False, qual_score=0.6),
         ],
     )
     run = aggregate._load_run_data(str(run_dir), batch_id=1, batch_label="run")
 
-    _, _, calls_df, cases_df, locus_summary_df, _, _ = aggregate._build_report_tables([run])
+    _, _, calls_df, cases_df, locus_summary_df, _, _ = aggregate._build_report_tables(
+        [run],
+        min_confidence=0.5,
+    )
 
     assert set(cases_df["sample"]) == {"S1", "S2"}
     assert calls_df.set_index("sample").loc["S3", "carrier_category"] == "non_carrier"
+    assert locus_summary_df.iloc[0]["low_confidence_carrier_record_count"] == 1
+    assert cases_df.set_index("sample").loc["S1", "left_flank_status"] == "PASS"
+    assert cases_df.set_index("sample").loc["S1", "right_flank_status"] == "FAIL"
+    assert cases_df.set_index("sample").loc["S2", "left_flank_status"] == "PASS"
+    assert cases_df.set_index("sample").loc["S2", "right_flank_status"] == "PASS"
+
+
+def test_non_confident_calls_below_min_confidence_are_hidden(tmp_path):
+    run_dir = tmp_path / "run"
+    _write_run(
+        run_dir,
+        [
+            _call_row("S1", is_carrier=True, qual_score=80.0),
+            _call_row("S2", is_carrier=False, is_best_match=True, qual_score=0.4),
+            _call_row("S3", is_carrier=False, is_best_match=True, qual_score=0.6),
+        ],
+    )
+    run = aggregate._load_run_data(str(run_dir), batch_id=1, batch_label="run")
+
+    _, _, calls_df, cases_df, locus_summary_df, _, _ = aggregate._build_report_tables(
+        [run],
+        min_confidence=0.5,
+    )
+
+    assert set(cases_df["sample"]) == {"S1", "S3"}
+    assert not bool(calls_df.set_index("sample").loc["S2", "is_low_confidence_carrier"])
+    assert calls_df.set_index("sample").loc["S2", "carrier_category"] == "non_carrier"
     assert locus_summary_df.iloc[0]["low_confidence_carrier_record_count"] == 1
 
 
@@ -226,7 +281,10 @@ def test_pdf_structure_includes_case_sections_and_evidence_plot(tmp_path):
         ],
     )
     run = aggregate._load_run_data(str(run_dir), batch_id=1, batch_label="run")
-    summary_df, inventory_df, _, cases_df, locus_summary_df, eval_df, missing_df = aggregate._build_report_tables([run])
+    summary_df, inventory_df, _, cases_df, locus_summary_df, eval_df, missing_df = aggregate._build_report_tables(
+        [run],
+        min_confidence=0.5,
+    )
 
     toc_entries = dict(
         aggregate._build_toc_entries(
@@ -241,7 +299,9 @@ def test_pdf_structure_includes_case_sections_and_evidence_plot(tmp_path):
     field_guide = aggregate._field_guide_table()
 
     assert toc_entries["Confident GD Calls"] < toc_entries["Non-confident GD Calls"]
-    assert "Evidence Plot" in set(field_guide["displayed_label"])
+    assert "Missing Optional Artifacts" not in toc_entries
+    assert "Per-sample plot" in set(field_guide["displayed_label"])
+    assert "Missing Optional Artifacts" not in set(field_guide["display_element"])
 
 
 def test_run_aggregate_writes_sidecars_and_pdf(tmp_path):
@@ -258,6 +318,7 @@ def test_run_aggregate_writes_sidecars_and_pdf(tmp_path):
         work_dirs=[str(run_dir)],
         output_dir=str(output_dir),
         output_name="aggregate_report.pdf",
+        min_confidence=0.5,
         batch_label=["batch"],
     )
 

@@ -21,12 +21,39 @@ from gatk_sv_gd.viterbi import (
     load_transition_matrix,
     viterbi_call_gd_cnv,
 )
-DEFAULT_MIN_POSTERIOR_INTERVAL_CONFIDENCE = float(
-    _util.posterior_probability_to_qual(0.80)
-)
-DEFAULT_MIN_FLANK_NON_EVENT_CONFIDENCE = float(
-    _util.posterior_probability_to_qual(0.90)
-)
+DEFAULT_MIN_POSTERIOR_INTERVAL_CONFIDENCE = 10.
+DEFAULT_MIN_FLANK_NON_EVENT_CONFIDENCE = 10.
+DEFAULT_POSTERIOR_INTERVAL_BIN_CORRELATION = 0.5
+_EMPTY_INT_ARRAY = np.array([], dtype=int)
+
+
+def _effective_independent_bin_count(
+    n_bins: int,
+    neighbor_bin_correlation: float,
+) -> float:
+    """Return the effective independent bin count for correlated interval bins."""
+    if n_bins < 0:
+        raise ValueError("n_bins must be non-negative.")
+    if not 0.0 <= neighbor_bin_correlation <= 1.0:
+        raise ValueError("neighbor_bin_correlation must be in [0, 1].")
+    if n_bins == 0:
+        return 0.0
+    return float(n_bins) / (1.0 + float(n_bins - 1) * neighbor_bin_correlation)
+
+
+def _aggregate_interval_qual(
+    interval_quals: np.ndarray,
+    neighbor_bin_correlation: float,
+) -> float:
+    """Aggregate per-bin QUAL with a conservative effective-bin penalty."""
+    interval_quals = np.asarray(interval_quals, dtype=float)
+    if interval_quals.size == 0:
+        return 0.0
+    n_eff = _effective_independent_bin_count(
+        interval_quals.size,
+        neighbor_bin_correlation,
+    )
+    return float(interval_quals.mean() * n_eff)
 
 
 def get_locus_interval_bins(
@@ -101,9 +128,10 @@ def determine_posterior_carrier_breakpoints(
 ) -> Dict[str, Optional[str]]:
     """Pick at most one qualifying posterior-marginal GD_ID per SV type.
 
-    A call qualifies only when each covered interval's mean called-state QUAL
-    meets the minimum threshold and each available flank's median non-event QUAL
-    meets the minimum threshold. Among qualifying calls, choose the largest one.
+    A call qualifies only when each covered interval's correlation-adjusted
+    called-state QUAL meets the minimum threshold and each available flank's
+    median non-event QUAL meets the minimum threshold. Among qualifying calls,
+    choose the largest one.
     """
     selected_by_svtype: Dict[str, Optional[str]] = {}
     for svtype in ["DEL", "DUP"]:
@@ -234,99 +262,149 @@ def compute_event_marginal_probabilities(
     pair_prob_matrix: np.ndarray,
     pair_states: List[Tuple[int, int]],
     sample_ploidy: int,
+    null_probability: Optional[np.ndarray] = None,
 ) -> Dict[str, np.ndarray]:
     """Return per-bin event marginal probabilities for DEL and DUP."""
+    pair_prob_matrix = np.asarray(pair_prob_matrix, dtype=float)
+    if pair_prob_matrix.ndim == 1:
+        pair_prob_matrix = pair_prob_matrix.reshape(1, -1)
+    n_bins = pair_prob_matrix.shape[0]
+    if null_probability is None:
+        neutral_null_probability = np.zeros(n_bins, dtype=float)
+    else:
+        neutral_null_probability = np.asarray(null_probability, dtype=float).squeeze()
+        if neutral_null_probability.ndim == 0:
+            neutral_null_probability = np.full(n_bins, float(neutral_null_probability), dtype=float)
+        if neutral_null_probability.shape != (n_bins,):
+            raise ValueError(
+                "null_probability must have shape (n_bins,) or be scalar, "
+                f"got {neutral_null_probability.shape}"
+            )
+        neutral_null_probability = 0.5 * np.clip(neutral_null_probability, 0.0, 1.0)
     event_probs: Dict[str, np.ndarray] = {}
     for svtype in ("DEL", "DUP"):
         event_mask = build_event_pair_mask(pair_states, svtype, sample_ploidy)
         if pair_prob_matrix.size == 0 or not np.any(event_mask):
-            event_probs[svtype] = np.zeros(pair_prob_matrix.shape[0], dtype=float)
-            continue
+            pair_event_probability = np.zeros(n_bins, dtype=float)
+        else:
+            pair_event_probability = pair_prob_matrix[:, event_mask].sum(axis=1)
         event_probs[svtype] = np.clip(
-            pair_prob_matrix[:, event_mask].sum(axis=1),
+            pair_event_probability + neutral_null_probability,
             0.0,
             1.0,
         )
     return event_probs
 
 
-def score_call_from_posterior_marginals(
+def _build_posterior_entry_spec(
     locus,
     entry: dict,
-    sample_pair_probs: np.ndarray,
-    pair_states: List[Tuple[int, int]],
     interval_bin_arrays: Dict[str, np.ndarray],
-    sample_ploidy: int,
 ) -> dict:
-    """Score one GD entry directly from pair-state posterior marginals."""
-    svtype = str(entry["svtype"])
+    """Precompute interval coverage metadata for one posterior-scored GD entry."""
     bp1 = str(entry["BP1"])
     bp2 = str(entry["BP2"])
     covered_tuples = locus.get_intervals_between(bp1, bp2)
     covered_intervals = [name for _, _, name in covered_tuples]
-
-    covered_bin_indices: List[int] = []
-    for _, _, interval_name in covered_tuples:
-        covered_bin_indices.extend(interval_bin_arrays.get(interval_name, np.array([], dtype=int)).tolist())
-
-    event_mask = build_event_pair_mask(pair_states, svtype, sample_ploidy)
-    interval_confidences: List[float] = []
-    if np.any(event_mask):
-        for interval_name in covered_intervals:
-            interval_bin_indices = interval_bin_arrays.get(
-                interval_name,
-                np.array([], dtype=int),
-            )
-            if len(interval_bin_indices) == 0:
-                interval_confidences.append(0.0)
-                continue
-            interval_probs = np.clip(
-                sample_pair_probs[interval_bin_indices][:, event_mask].sum(axis=1),
-                0.0,
-                1.0,
-            )
-            interval_quals = _util.posterior_called_state_to_qual(
-                interval_probs,
-                True,
-            )
-            interval_confidences.append(float(np.mean(interval_quals)))
-
-    if covered_bin_indices and np.any(event_mask):
-        per_bin_event_probs = np.clip(
-            sample_pair_probs[covered_bin_indices][:, event_mask].sum(axis=1),
-            0.0,
-            1.0,
-        )
-        log_prob_score = float(np.mean(per_bin_event_probs))
+    covered_index_arrays = [
+        interval_bin_arrays.get(interval_name, _EMPTY_INT_ARRAY)
+        for interval_name in covered_intervals
+    ]
+    non_empty_index_arrays = [
+        interval_indices
+        for interval_indices in covered_index_arrays
+        if interval_indices.size > 0
+    ]
+    if non_empty_index_arrays:
+        covered_bin_indices = np.concatenate(non_empty_index_arrays)
     else:
-        log_prob_score = 0.0
+        covered_bin_indices = _EMPTY_INT_ARRAY
 
     covered_bp_total = int(
         sum(max(0, int(end) - int(start)) for start, end, _ in covered_tuples)
     )
 
+    return {
+        "entry": entry,
+        "GD_ID": entry["GD_ID"],
+        "start": int(entry["start_GRCh38"]),
+        "end": int(entry["end_GRCh38"]),
+        "svtype": str(entry["svtype"]),
+        "BP1": bp1,
+        "BP2": bp2,
+        "is_terminal": locus.is_terminal,
+        "covered_intervals": covered_intervals,
+        "covered_bin_indices": covered_bin_indices,
+        "covered_bp_total": covered_bp_total,
+    }
+
+
+def _compute_interval_confidence_lookup(
+    interval_names: List[str],
+    interval_bin_arrays: Dict[str, np.ndarray],
+    event_probabilities: np.ndarray,
+    neighbor_bin_correlation: float = DEFAULT_POSTERIOR_INTERVAL_BIN_CORRELATION,
+) -> Dict[str, float]:
+    """Return correlation-adjusted called-state QUAL per interval for one event class."""
+    interval_confidences: Dict[str, float] = {}
+    for interval_name in interval_names:
+        interval_bin_indices = interval_bin_arrays.get(interval_name, _EMPTY_INT_ARRAY)
+        if interval_bin_indices.size == 0:
+            interval_confidences[interval_name] = 0.0
+            continue
+        interval_quals = _util.posterior_called_state_to_qual(
+            event_probabilities[interval_bin_indices],
+            True,
+        )
+        interval_confidences[interval_name] = _aggregate_interval_qual(
+            interval_quals,
+            neighbor_bin_correlation,
+        )
+    return interval_confidences
+
+
+def _compute_flank_confidence_stats(
+    interval_bin_arrays: Dict[str, np.ndarray],
+    event_probabilities: np.ndarray,
+) -> Tuple[Dict[str, float], Dict[str, float]]:
+    """Return flank non-event median and mean QUAL for one event class."""
     flank_non_event_medians: Dict[str, float] = {}
     flank_confidences: Dict[str, float] = {}
     for flank_name in ("left_flank", "right_flank"):
-        flank_bin_indices = interval_bin_arrays.get(flank_name, np.array([], dtype=int))
-        if len(flank_bin_indices) == 0:
+        flank_bin_indices = interval_bin_arrays.get(flank_name, _EMPTY_INT_ARRAY)
+        if flank_bin_indices.size == 0:
             flank_non_event_medians[flank_name] = np.nan
             flank_confidences[flank_name] = np.nan
             continue
-        if np.any(event_mask):
-            flank_event_probs = np.clip(
-                sample_pair_probs[flank_bin_indices][:, event_mask].sum(axis=1),
-                0.0,
-                1.0,
-            )
-        else:
-            flank_event_probs = np.zeros(len(flank_bin_indices), dtype=float)
         flank_quals = _util.posterior_called_state_to_qual(
-            flank_event_probs,
+            event_probabilities[flank_bin_indices],
             False,
         )
         flank_non_event_medians[flank_name] = float(np.median(flank_quals))
         flank_confidences[flank_name] = float(np.mean(flank_quals))
+    return flank_non_event_medians, flank_confidences
+
+
+def _score_posterior_call_from_event_probabilities(
+    locus,
+    entry_spec: dict,
+    event_probabilities: np.ndarray,
+    interval_confidence_lookup: Dict[str, float],
+    flank_non_event_medians: Dict[str, float],
+    flank_confidences: Dict[str, float],
+    sample_ploidy: int,
+    cluster_depth: Optional[np.ndarray] = None,
+) -> dict:
+    """Score one GD entry from precomputed event probabilities for its locus."""
+    interval_confidences = [
+        float(interval_confidence_lookup.get(interval_name, 0.0))
+        for interval_name in entry_spec["covered_intervals"]
+    ]
+    covered_bin_indices = entry_spec["covered_bin_indices"]
+    if covered_bin_indices.size > 0:
+        log_prob_score = float(np.mean(event_probabilities[covered_bin_indices]))
+    else:
+        log_prob_score = 0.0
 
     valid_flank_medians = [
         value for value in flank_non_event_medians.values()
@@ -342,28 +420,32 @@ def score_call_from_posterior_marginals(
         float(min(confidence_components))
         if confidence_components else 0.0
     )
-    qual_score = confidence
+
+    if cluster_depth is not None and covered_bin_indices.size > 0:
+        mean_depth = float(np.mean(cluster_depth[covered_bin_indices]))
+    else:
+        mean_depth = np.nan
 
     return {
-        "GD_ID": entry["GD_ID"],
+        "GD_ID": entry_spec["GD_ID"],
         "chrom": locus.chrom,
-        "start": int(entry["start_GRCh38"]),
-        "end": int(entry["end_GRCh38"]),
-        "svtype": svtype,
-        "BP1": bp1,
-        "BP2": bp2,
-        "is_terminal": locus.is_terminal,
-        "n_bins": len(covered_bin_indices),
+        "start": entry_spec["start"],
+        "end": entry_spec["end"],
+        "svtype": entry_spec["svtype"],
+        "BP1": entry_spec["BP1"],
+        "BP2": entry_spec["BP2"],
+        "is_terminal": entry_spec["is_terminal"],
+        "n_bins": int(covered_bin_indices.size),
         "sample_ploidy": sample_ploidy,
         "haplotype": np.nan,
         "hap_cn_state": np.nan,
         "matched_seg_start": np.nan,
         "matched_seg_end": np.nan,
         "matched_seg_n_bins": 0,
-        "matched_interval_bp": covered_bp_total,
+        "matched_interval_bp": entry_spec["covered_bp_total"],
         "interval_coverage": log_prob_score,
         "reciprocal_overlap": log_prob_score,
-        "intervals": covered_intervals,
+        "intervals": list(entry_spec["covered_intervals"]),
         "interval_confidences": interval_confidences,
         "min_interval_confidence": (
             float(min(interval_confidences)) if interval_confidences else 0.0
@@ -375,9 +457,141 @@ def score_call_from_posterior_marginals(
         ),
         "log_prob_score": log_prob_score,
         "confidence_score": confidence,
-        "qual_score": qual_score,
+        "qual_score": confidence,
+        "mean_depth": mean_depth,
         "is_carrier": False,
     }
+
+
+def _build_locus_call_cache(
+    cluster_rows: pd.DataFrame,
+    locus,
+) -> dict:
+    """Precompute per-locus structures used repeatedly across samples."""
+    cluster_bin_rows = (
+        cluster_rows.drop_duplicates(subset=["array_idx"])
+        .sort_values("array_idx")
+    )
+    cluster_bin_indices = cluster_bin_rows["array_idx"].astype(int).to_numpy()
+    local_idx_by_global = {
+        int(array_idx): local_idx
+        for local_idx, array_idx in enumerate(cluster_bin_indices)
+    }
+
+    interval_bin_arrays_global: Dict[str, np.ndarray] = {}
+    for interval_name, group in cluster_rows.groupby("interval", sort=False):
+        interval_bin_arrays_global[interval_name] = group["array_idx"].astype(int).to_numpy()
+    breakpoint_masked_bins = interval_bin_arrays_global.pop(
+        "breakpoint_ranges",
+        _EMPTY_INT_ARRAY,
+    )
+
+    interval_bin_arrays_local = {
+        interval_name: np.array(
+            [local_idx_by_global[int(bin_idx)] for bin_idx in bin_indices],
+            dtype=int,
+        )
+        for interval_name, bin_indices in interval_bin_arrays_global.items()
+    }
+
+    all_cluster_bins = sorted(
+        set(cluster_rows["array_idx"].astype(int))
+        - set(int(bin_idx) for bin_idx in breakpoint_masked_bins)
+    )
+
+    posterior_entry_specs = [
+        _build_posterior_entry_spec(locus, entry, interval_bin_arrays_local)
+        for entry in locus.gd_entries
+    ]
+    interval_names_for_entries = list(dict.fromkeys(
+        interval_name
+        for entry_spec in posterior_entry_specs
+        for interval_name in entry_spec["covered_intervals"]
+    ))
+
+    return {
+        "cluster_bin_rows": cluster_bin_rows,
+        "cluster_bin_indices": cluster_bin_indices,
+        "cluster_starts": cluster_bin_rows["start"].astype(int).to_numpy(),
+        "cluster_ends": cluster_bin_rows["end"].astype(int).to_numpy(),
+        "interval_bin_arrays_global": interval_bin_arrays_global,
+        "interval_bin_arrays_local": interval_bin_arrays_local,
+        "breakpoint_masked_bins": breakpoint_masked_bins,
+        "all_cluster_bins": all_cluster_bins,
+        "posterior_entry_specs": posterior_entry_specs,
+        "interval_names_for_entries": interval_names_for_entries,
+    }
+
+
+def _get_mean_depth_for_call(
+    call: dict,
+    interval_bin_arrays: Dict[str, np.ndarray],
+    cluster_depth: np.ndarray,
+) -> float:
+    """Return mean depth across the bins covered by a call."""
+    covered_index_arrays = [
+        interval_bin_arrays.get(interval_name, _EMPTY_INT_ARRAY)
+        for interval_name in call.get("intervals", [])
+    ]
+    non_empty_index_arrays = [
+        interval_indices
+        for interval_indices in covered_index_arrays
+        if interval_indices.size > 0
+    ]
+    if not non_empty_index_arrays:
+        return np.nan
+    covered_bin_indices = np.concatenate(non_empty_index_arrays)
+    return float(np.mean(cluster_depth[covered_bin_indices]))
+
+
+def score_call_from_posterior_marginals(
+    locus,
+    entry: dict,
+    sample_pair_probs: np.ndarray,
+    pair_states: List[Tuple[int, int]],
+    interval_bin_arrays: Dict[str, np.ndarray],
+    sample_ploidy: int,
+    posterior_interval_bin_correlation: float = DEFAULT_POSTERIOR_INTERVAL_BIN_CORRELATION,
+    null_probability: Optional[np.ndarray] = None,
+    event_probabilities: Optional[np.ndarray] = None,
+    entry_spec: Optional[dict] = None,
+    interval_confidence_lookup: Optional[Dict[str, float]] = None,
+    flank_non_event_medians: Optional[Dict[str, float]] = None,
+    flank_confidences: Optional[Dict[str, float]] = None,
+    cluster_depth: Optional[np.ndarray] = None,
+) -> dict:
+    """Score one GD entry directly from pair-state posterior marginals."""
+    if entry_spec is None:
+        entry_spec = _build_posterior_entry_spec(locus, entry, interval_bin_arrays)
+    if event_probabilities is None:
+        event_probabilities = compute_event_marginal_probabilities(
+            sample_pair_probs,
+            pair_states,
+            sample_ploidy,
+            null_probability=null_probability,
+        )[entry_spec["svtype"]]
+    if interval_confidence_lookup is None:
+        interval_confidence_lookup = _compute_interval_confidence_lookup(
+            entry_spec["covered_intervals"],
+            interval_bin_arrays,
+            event_probabilities,
+            neighbor_bin_correlation=posterior_interval_bin_correlation,
+        )
+    if flank_non_event_medians is None or flank_confidences is None:
+        flank_non_event_medians, flank_confidences = _compute_flank_confidence_stats(
+            interval_bin_arrays,
+            event_probabilities,
+        )
+    return _score_posterior_call_from_event_probabilities(
+        locus=locus,
+        entry_spec=entry_spec,
+        event_probabilities=event_probabilities,
+        interval_confidence_lookup=interval_confidence_lookup,
+        flank_non_event_medians=flank_non_event_medians,
+        flank_confidences=flank_confidences,
+        sample_ploidy=sample_ploidy,
+        cluster_depth=cluster_depth,
+    )
 
 
 def call_cnvs_from_posteriors(
@@ -392,6 +606,7 @@ def call_cnvs_from_posteriors(
     calling_mode: str = "viterbi",
     min_posterior_interval_confidence: float = DEFAULT_MIN_POSTERIOR_INTERVAL_CONFIDENCE,
     min_flank_non_event_confidence: float = DEFAULT_MIN_FLANK_NON_EVENT_CONFIDENCE,
+    posterior_interval_bin_correlation: float = DEFAULT_POSTERIOR_INTERVAL_BIN_CORRELATION,
 ) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     """Call GD CNVs from posterior probabilities."""
     if calling_mode not in {"viterbi", "posterior-marginal"}:
@@ -399,6 +614,8 @@ def call_cnvs_from_posteriors(
             f"Unsupported calling_mode: {calling_mode}. "
             "Expected 'viterbi' or 'posterior-marginal'."
         )
+    if not 0.0 <= posterior_interval_bin_correlation <= 1.0:
+        raise ValueError("posterior_interval_bin_correlation must be in [0, 1].")
     if calling_mode == "viterbi" and transition_matrix is None:
         raise ValueError("transition_matrix is required for calling_mode='viterbi'")
 
@@ -415,6 +632,8 @@ def call_cnvs_from_posteriors(
             "  Calling mode: posterior-marginal scoring  "
             "(minimum per-interval QUAL="
             f"{min_posterior_interval_confidence:.2f}, "
+            "interval bin correlation="
+            f"{posterior_interval_bin_correlation:.2f}, "
             "minimum flank non-event QUAL="
             f"{min_flank_non_event_confidence:.2f})"
         )
@@ -438,9 +657,10 @@ def call_cnvs_from_posteriors(
     if duplicate_ploidy.any():
         raise ValueError("Ploidy table contains duplicate sample/contig rows")
 
-    ploidy_lookup: Dict[Tuple[str, str], int] = {}
-    for _, row in ploidy_df.iterrows():
-        ploidy_lookup[(str(row["sample"]), str(row["contig"]))] = int(row["ploidy"])
+    ploidy_lookup: Dict[Tuple[str, str], int] = {
+        (str(row.sample), str(row.contig)): int(row.ploidy)
+        for row in ploidy_df.itertuples(index=False)
+    }
 
     required_ploidy_pairs = {
         (str(sample_id), str(locus.chrom))
@@ -467,28 +687,25 @@ def call_cnvs_from_posteriors(
     if bin_mappings_df["array_idx"].duplicated().any():
         raise ValueError("bin_mappings contains duplicate array_idx values")
 
-    map_coords = list(
-        zip(
-            bin_mappings_df["chr"].values,
-            bin_mappings_df["start"].values,
-            bin_mappings_df["end"].values,
-        )
-    )
+    map_chroms = bin_mappings_df["chr"].to_numpy()
+    map_starts = bin_mappings_df["start"].to_numpy()
+    map_ends = bin_mappings_df["end"].to_numpy()
+    sample_row_indices = cn_posteriors_df.groupby("sample", sort=False).indices
+    post_chroms = cn_posteriors_df["chr"].to_numpy()
+    post_starts = cn_posteriors_df["start"].to_numpy()
+    post_ends = cn_posteriors_df["end"].to_numpy()
     for sample_id in sample_ids:
-        sample_rows = cn_posteriors_df[cn_posteriors_df["sample"] == sample_id]
-        if len(sample_rows) != n_bins:
+        sample_indices = np.asarray(sample_row_indices[str(sample_id)], dtype=int)
+        if sample_indices.size != n_bins:
             raise ValueError(
-                f"cn_posteriors has {len(sample_rows)} rows for sample {sample_id}, "
+                f"cn_posteriors has {sample_indices.size} rows for sample {sample_id}, "
                 f"expected {n_bins}"
             )
-        post_coords = list(
-            zip(
-                sample_rows["chr"].values,
-                sample_rows["start"].values,
-                sample_rows["end"].values,
-            )
-        )
-        if post_coords != map_coords:
+        if not (
+            np.array_equal(post_chroms[sample_indices], map_chroms)
+            and np.array_equal(post_starts[sample_indices], map_starts)
+            and np.array_equal(post_ends[sample_indices], map_ends)
+        ):
             raise ValueError(
                 "Bin coordinates in cn_posteriors do not match bin_mappings. "
                 "Please re-run infer to regenerate both files."
@@ -500,11 +717,18 @@ def call_cnvs_from_posteriors(
     n_pair_states = len(pair_prob_cols)
     pair_prob_3d = np.empty((n_samples, n_bins, n_pair_states))
     depth_2d = np.empty((n_samples, n_bins))
+    null_prob_2d = np.zeros((n_samples, n_bins), dtype=float)
+    pair_prob_values = cn_posteriors_df[pair_prob_cols].to_numpy()
+    depth_values = cn_posteriors_df["depth"].to_numpy()
+    null_prob_values = None
+    if "prob_null" in cn_posteriors_df.columns:
+        null_prob_values = cn_posteriors_df["prob_null"].to_numpy(dtype=float)
     for s_idx, sample_id in enumerate(sample_ids):
-        mask = cn_posteriors_df["sample"] == sample_id
-        sample_rows = cn_posteriors_df.loc[mask]
-        pair_prob_3d[s_idx] = sample_rows[pair_prob_cols].values
-        depth_2d[s_idx] = sample_rows["depth"].values
+        sample_indices = np.asarray(sample_row_indices[str(sample_id)], dtype=int)
+        pair_prob_3d[s_idx] = pair_prob_values[sample_indices]
+        depth_2d[s_idx] = depth_values[sample_indices]
+        if null_prob_values is not None:
+            null_prob_2d[s_idx] = null_prob_values[sample_indices]
     print(
         f"    Extracted {n_samples} x {n_bins} x {n_pair_states} "
         "pair-state probability array"
@@ -519,6 +743,18 @@ def call_cnvs_from_posteriors(
             ),
         )
     )
+    cluster_rows_by_cluster = {
+        str(cluster): group
+        for cluster, group in bin_mappings_df.groupby("cluster", sort=False)
+    }
+    empty_cluster_rows = bin_mappings_df.iloc[0:0]
+    locus_call_caches = {
+        cluster: _build_locus_call_cache(
+            cluster_rows_by_cluster.get(cluster, empty_cluster_rows),
+            locus,
+        )
+        for cluster, locus in gd_table.loci.items()
+    }
 
     processed_loci = 0
     skipped_loci = 0
@@ -527,69 +763,60 @@ def call_cnvs_from_posteriors(
     interval_sets = 0
     for cluster, locus in gd_table.loci.items():
         processed_loci += 1
+        locus_cache = locus_call_caches[cluster]
+        cluster_bin_indices = locus_cache["cluster_bin_indices"]
+        interval_bin_arrays = locus_cache["interval_bin_arrays_global"]
+        interval_bin_arrays_local = locus_cache["interval_bin_arrays_local"]
+        breakpoint_masked_bins += int(locus_cache["breakpoint_masked_bins"].size)
 
-        cluster_bin_rows = (
-            bin_mappings_df[bin_mappings_df["cluster"] == cluster]
-            .drop_duplicates(subset=["array_idx"])
-            .sort_values("array_idx")
-        )
-        cluster_bin_indices = cluster_bin_rows["array_idx"].astype(int).to_numpy()
-
-        interval_bins = get_locus_interval_bins(bin_mappings_df, cluster)
-        bp_masked = interval_bins.pop("breakpoint_ranges", [])
-        if bp_masked:
-            breakpoint_masked_bins += len(bp_masked)
-
-        if not interval_bins:
+        if not interval_bin_arrays:
             skipped_loci += 1
             continue
 
-        interval_sets += len(interval_bins)
+        interval_sets += len(interval_bin_arrays)
 
         for flank_name in ("left_flank", "right_flank"):
-            if flank_name not in interval_bins or len(interval_bins[flank_name]) == 0:
+            flank_bin_indices = interval_bin_arrays_local.get(flank_name, _EMPTY_INT_ARRAY)
+            if flank_bin_indices.size == 0:
                 missing_flank_sets += 1
-
-        interval_bin_arrays = {
-            name: np.array(bins, dtype=int)
-            for name, bins in interval_bins.items()
-        }
-
-        all_cluster_idxs = set(
-            bin_mappings_df[
-                bin_mappings_df["cluster"] == cluster
-            ]["array_idx"].astype(int)
-        )
-        bp_set = set(int(b) for b in bp_masked)
-        all_cluster_bins = sorted(all_cluster_idxs - bp_set)
 
         for s_idx, sample_id in enumerate(sample_ids):
             sample_ploidy = ploidy_lookup[(str(sample_id), locus.chrom)]
 
             cluster_pair_probs = pair_prob_3d[s_idx, cluster_bin_indices, :]
+            cluster_null_probs = null_prob_2d[s_idx, cluster_bin_indices]
+            cluster_depth = depth_2d[s_idx, cluster_bin_indices]
             cluster_event_probs = compute_event_marginal_probabilities(
                 cluster_pair_probs,
                 pair_state_labels,
                 sample_ploidy,
+                null_probability=cluster_null_probs,
             )
-            for (_, bin_row), del_prob, dup_prob in zip(
-                cluster_bin_rows.iterrows(),
-                cluster_event_probs["DEL"],
-                cluster_event_probs["DUP"],
-            ):
-                all_event_records.append(
-                    {
-                        "sample": sample_id,
-                        "cluster": cluster,
-                        "chrom": locus.chrom,
-                        "start": int(bin_row["start"]),
-                        "end": int(bin_row["end"]),
-                        "prob_del_event": float(del_prob),
-                        "prob_dup_event": float(dup_prob),
-                        "qual_del_event": float(_util.posterior_probability_to_qual(del_prob)),
-                        "qual_dup_event": float(_util.posterior_probability_to_qual(dup_prob)),
-                    }
+            qual_del_event = _util.posterior_probability_to_qual(cluster_event_probs["DEL"])
+            qual_dup_event = _util.posterior_probability_to_qual(cluster_event_probs["DUP"])
+            all_event_records.extend(
+                {
+                    "sample": sample_id,
+                    "cluster": cluster,
+                    "chrom": locus.chrom,
+                    "start": int(start),
+                    "end": int(end),
+                    "prob_null": float(null_prob),
+                    "prob_del_event": float(del_prob),
+                    "prob_dup_event": float(dup_prob),
+                    "qual_del_event": float(del_qual),
+                    "qual_dup_event": float(dup_qual),
+                }
+                for start, end, null_prob, del_prob, dup_prob, del_qual, dup_qual in zip(
+                    locus_cache["cluster_starts"],
+                    locus_cache["cluster_ends"],
+                    cluster_null_probs,
+                    cluster_event_probs["DEL"],
+                    cluster_event_probs["DUP"],
+                    qual_del_event,
+                    qual_dup_event,
                 )
+            )
 
             if calling_mode == "viterbi":
                 calls, path_records = viterbi_call_gd_cnv(
@@ -604,7 +831,7 @@ def call_cnvs_from_posteriors(
                     sample_id=str(sample_id),
                     breakpoint_transition_matrix=breakpoint_transition_matrix,
                     bin_coords=bin_coords_by_idx,
-                    all_cluster_bins=all_cluster_bins,
+                    all_cluster_bins=locus_cache["all_cluster_bins"],
                 )
                 for start, end, cn_state, category, haplotype in path_records:
                     all_path_records.append(
@@ -634,16 +861,41 @@ def call_cnvs_from_posteriors(
                     confident_by_svtype=confident_by_svtype,
                 )
             else:
+                interval_confidence_lookup_by_svtype = {
+                    svtype: _compute_interval_confidence_lookup(
+                        locus_cache["interval_names_for_entries"],
+                        interval_bin_arrays_local,
+                        cluster_event_probs[svtype],
+                        neighbor_bin_correlation=posterior_interval_bin_correlation,
+                    )
+                    for svtype in ("DEL", "DUP")
+                }
+                flank_stats_by_svtype = {
+                    svtype: _compute_flank_confidence_stats(
+                        interval_bin_arrays_local,
+                        cluster_event_probs[svtype],
+                    )
+                    for svtype in ("DEL", "DUP")
+                }
                 calls = [
                     score_call_from_posterior_marginals(
                         locus=locus,
-                        entry=entry,
+                        entry=entry_spec["entry"],
                         sample_pair_probs=pair_prob_3d[s_idx],
                         pair_states=pair_state_labels,
-                        interval_bin_arrays=interval_bin_arrays,
+                        interval_bin_arrays=interval_bin_arrays_local,
                         sample_ploidy=sample_ploidy,
+                        posterior_interval_bin_correlation=posterior_interval_bin_correlation,
+                        event_probabilities=cluster_event_probs[entry_spec["svtype"]],
+                        entry_spec=entry_spec,
+                        interval_confidence_lookup=interval_confidence_lookup_by_svtype[
+                            entry_spec["svtype"]
+                        ],
+                        flank_non_event_medians=flank_stats_by_svtype[entry_spec["svtype"]][0],
+                        flank_confidences=flank_stats_by_svtype[entry_spec["svtype"]][1],
+                        cluster_depth=cluster_depth,
                     )
-                    for entry in locus.gd_entries
+                    for entry_spec in locus_cache["posterior_entry_specs"]
                 ]
                 confident_by_svtype = determine_posterior_carrier_breakpoints(
                     calls,
@@ -662,16 +914,13 @@ def call_cnvs_from_posteriors(
                 )
 
             for call in calls:
-                covered_bin_indices: List[int] = []
-                for interval_name in call["intervals"]:
-                    if interval_name in interval_bin_arrays:
-                        covered_bin_indices.extend(interval_bin_arrays[interval_name].tolist())
-
-                if covered_bin_indices:
-                    mean_depth = float(depth_2d[s_idx, covered_bin_indices].mean())
-                else:
-                    mean_depth = np.nan
-
+                mean_depth = call.get("mean_depth", np.nan)
+                if pd.isna(mean_depth):
+                    mean_depth = _get_mean_depth_for_call(
+                        call,
+                        interval_bin_arrays_local,
+                        cluster_depth,
+                    )
                 confidence_score = get_call_confidence(call)
                 result = {
                     "sample": sample_id,
@@ -798,6 +1047,7 @@ def call_cnvs_from_posteriors(
             "chrom",
             "start",
             "end",
+            "prob_null",
             "prob_del_event",
             "prob_dup_event",
             "qual_del_event",
@@ -869,8 +1119,17 @@ def parse_args():
         type=float,
            default=DEFAULT_MIN_POSTERIOR_INTERVAL_CONFIDENCE,
            help="In posterior-marginal mode, mark a breakpoint combination as a "
-               "carrier only when each covered interval's mean called-state QUAL "
-               "meets or exceeds this threshold on the 0-99 scale.",
+               "carrier only when each covered interval's correlation-adjusted "
+               "called-state QUAL meets or exceeds this threshold.",
+    )
+    parser.add_argument(
+        "--posterior-interval-bin-correlation",
+        type=float,
+        default=DEFAULT_POSTERIOR_INTERVAL_BIN_CORRELATION,
+        help="In posterior-marginal mode, aggregate per-bin interval QUAL using "
+             "N_eff = N / (1 + (N - 1) * rho), where rho is this neighboring-bin "
+             "correlation coefficient. 0 treats bins as independent; 1 reduces to "
+             "the per-bin mean.",
     )
     parser.add_argument(
         "--min-flank-non-event-confidence",
@@ -885,7 +1144,10 @@ def parse_args():
         action="store_true",
         help="Print detailed per-sample scores for all GD entries at every locus.",
     )
-    return parser.parse_args()
+    args = parser.parse_args()
+    if not 0.0 <= args.posterior_interval_bin_correlation <= 1.0:
+        parser.error("--posterior-interval-bin-correlation must be in [0, 1].")
+    return args
 
 
 def main():
@@ -948,6 +1210,7 @@ def main():
         calling_mode=args.calling_mode,
         min_posterior_interval_confidence=args.min_posterior_interval_confidence,
         min_flank_non_event_confidence=args.min_flank_non_event_confidence,
+        posterior_interval_bin_correlation=args.posterior_interval_bin_correlation,
     )
 
     output_file = os.path.join(args.output_dir, "gd_cnv_calls.tsv.gz")

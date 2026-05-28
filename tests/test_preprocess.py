@@ -216,6 +216,51 @@ def test_write_preprocessed_baf_excludes_constant_samples(tmp_path, monkeypatch)
     assert summary_df["minor_baf_median"].tolist() == pytest.approx([0.25])
 
 
+def test_write_and_load_normalization_metadata_round_trip(tmp_path):
+    pd.DataFrame(
+        [{"Chr": "chr1", "Start": 100, "End": 200, "sample1": 2.0}]
+    ).to_csv(
+        tmp_path / "preprocessed_bins.tsv.gz",
+        sep="\t",
+        index=False,
+        compression="gzip",
+    )
+    pd.DataFrame(
+        [{
+            "cluster": "cluster1",
+            "interval": "A-C",
+            "array_idx": 0,
+            "chr": "chr1",
+            "start": 100,
+            "end": 200,
+        }]
+    ).to_csv(
+        tmp_path / "bin_mappings.tsv.gz",
+        sep="\t",
+        index=False,
+        compression="gzip",
+    )
+
+    metadata_df = preprocess_module.build_normalization_metadata(
+        ["sample1", "sample2"],
+        np.asarray([2000.0, 2500.0], dtype=np.float64),
+        10000.0,
+    )
+    preprocess_module.write_normalization_metadata(metadata_df, str(tmp_path))
+
+    combined_df, mappings, baf_summary_df, loaded_metadata_df = preprocess_module.load_preprocessed_data(
+        str(tmp_path)
+    )
+
+    assert combined_df.shape == (1, 4)
+    assert len(mappings) == 1
+    assert baf_summary_df is None
+    assert loaded_metadata_df is not None
+    assert loaded_metadata_df["sample"].tolist() == ["sample1", "sample2"]
+    assert loaded_metadata_df["raw_count_median"].tolist() == pytest.approx([2000.0, 2500.0])
+    assert loaded_metadata_df["reference_bin_size"].tolist() == pytest.approx([10000.0, 10000.0])
+
+
 def test_select_highres_interval_replacements_returns_only_improved_intervals():
     undercovered = [("A-C", 5), ("C-D", 8), ("D-E", 3)]
     hr_interval_bins = {
