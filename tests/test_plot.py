@@ -423,6 +423,44 @@ def test_plot_event_marginal_panel_uses_called_state_qual_scale():
         plt.close(fig)
 
 
+def test_plot_event_marginal_panel_accepts_precomputed_event_qual_values():
+    locus = _make_locus()
+    x_positions = pd.Series([46050000, 48190000, 49800000], dtype=float).to_numpy()
+    bar_widths = pd.Series([0.001, 0.001, 0.001], dtype=float).to_numpy()
+    event_quals = pd.Series(
+        [10.0 * np.log10(9.0), -10.0 * np.log10(9.0), 99.0],
+        dtype=float,
+    ).to_numpy()
+    called_event_mask = np.array([True, False, True], dtype=bool)
+    xform = FlankCompressor(46005406, 49845537, locus.start, locus.end, flank_scale=0.2)
+
+    fig, ax = plt.subplots()
+    try:
+        _plot_event_marginal_panel(
+            ax,
+            x_positions,
+            bar_widths,
+            event_quals,
+            xform,
+            locus,
+            locus.chrom,
+            "DEL",
+            called_event_mask=called_event_mask,
+            values_are_qual=True,
+        )
+
+        assert ax.get_ylim() == (-99.0, 99.0)
+        assert ax.get_ylabel() == "QUAL(DEL site state)"
+        assert len(ax.lines) == 1
+        assert list(ax.lines[0].get_ydata()) == pytest.approx([
+            10.0 * np.log10(9.0),
+            10.0 * np.log10(9.0),
+            99.0,
+        ])
+    finally:
+        plt.close(fig)
+
+
 def test_rebin_aligned_region_dfs_for_display_caps_total_bins_and_preserves_alignment():
     locus = GDLocus(
         cluster="1q21",

@@ -13,6 +13,7 @@ from gatk_sv_gd.call import (
     _compute_flank_confidence_stats,
     _compute_interval_confidence_lookup,
     call_cnvs_from_posteriors,
+    compute_informative_event_support_probabilities,
     compute_event_marginal_probabilities,
     parse_args,
     score_call_from_posterior_marginals,
@@ -175,6 +176,27 @@ def test_compute_event_marginal_probabilities_treats_null_mass_as_neutral():
     assert observed["DUP"] == pytest.approx([0.5, 0.1])
 
 
+def test_compute_informative_event_support_probabilities_ignores_null_mass():
+    pair_states = [(0, 0), (0, 1), (1, 1)]
+    pair_prob_matrix = np.array(
+        [
+            [0.09, 0.01, 0.0],
+            [0.01, 0.09, 0.0],
+            [0.0, 0.0, 0.0],
+        ],
+        dtype=float,
+    )
+
+    observed = compute_informative_event_support_probabilities(
+        pair_prob_matrix,
+        pair_states,
+        sample_ploidy=1,
+    )
+
+    assert observed["DEL"] == pytest.approx([0.9, 0.1, 0.5])
+    assert observed["DUP"] == pytest.approx([0.0, 0.0, 0.5])
+
+
 def test_compute_interval_confidence_lookup_uses_effective_bin_count():
     event_probabilities = np.array([0.90, 0.90, 0.10], dtype=float)
     interval_bin_arrays = {
@@ -241,6 +263,58 @@ def test_score_call_from_posterior_marginals_accumulates_multi_bin_interval_qual
 
     assert call["interval_confidences"] == pytest.approx([expected_interval_confidence])
     assert call["min_interval_confidence"] == pytest.approx(expected_interval_confidence)
+
+
+def test_score_call_from_posterior_marginals_uses_non_null_support_for_haploid_qual():
+    locus = GDLocus(
+        cluster="test_cluster",
+        chrom="chrX",
+        breakpoints=[(100, 100), (200, 200), (300, 300)],
+        breakpoint_names=["A", "B", "C"],
+        gd_entries=[],
+        is_nahr=True,
+        is_terminal=False,
+    )
+    entry = {
+        "GD_ID": "gd_del",
+        "start_GRCh38": 100,
+        "end_GRCh38": 300,
+        "svtype": "DEL",
+        "BP1": "A",
+        "BP2": "C",
+    }
+    pair_states = [(0, 0), (0, 1), (1, 1)]
+    sample_pair_probs = np.array([
+        [0.09, 0.01, 0.00],
+        [0.09, 0.01, 0.00],
+        [0.01, 0.09, 0.00],
+        [0.01, 0.09, 0.00],
+    ])
+    null_probability = np.array([0.90, 0.90, 0.90, 0.90], dtype=float)
+    interval_bin_arrays = {
+        "A-B": np.array([0], dtype=int),
+        "B-C": np.array([1], dtype=int),
+        "left_flank": np.array([2], dtype=int),
+        "right_flank": np.array([3], dtype=int),
+    }
+
+    call = score_call_from_posterior_marginals(
+        locus=locus,
+        entry=entry,
+        sample_pair_probs=sample_pair_probs,
+        pair_states=pair_states,
+        interval_bin_arrays=interval_bin_arrays,
+        sample_ploidy=1,
+        null_probability=null_probability,
+    )
+
+    body_qual = posterior_probability_to_qual(0.90)
+
+    assert call["log_prob_score"] == pytest.approx(0.54)
+    assert call["min_interval_confidence"] == pytest.approx(body_qual)
+    assert call["min_flank_non_event_confidence"] == pytest.approx(body_qual)
+    assert call["confidence_score"] == pytest.approx(body_qual)
+    assert call["qual_score"] == pytest.approx(body_qual)
 
 
 def test_parse_args_accepts_posterior_interval_bin_correlation(monkeypatch):
@@ -467,6 +541,64 @@ def test_call_cnvs_from_posteriors_uses_null_mass_as_neutral_event_evidence():
     assert event_row["prob_dup_event"] == pytest.approx(0.5)
     assert event_row["qual_del_event"] == pytest.approx(0.0)
     assert event_row["qual_dup_event"] == pytest.approx(0.0)
+
+
+def test_call_cnvs_from_posteriors_event_qual_uses_informative_support():
+    cn_posteriors_df = pd.DataFrame(
+        {
+            "sample": ["S1"],
+            "cluster": ["test_cluster"],
+            "chr": ["chrX"],
+            "start": [100],
+            "end": [200],
+            "depth": [0.25],
+            "prob_null": [0.90],
+            "prob_pair_0_0": [0.09],
+            "prob_pair_0_1": [0.01],
+            "prob_pair_1_1": [0.0],
+        }
+    )
+    bin_mappings_df = pd.DataFrame(
+        {
+            "array_idx": [0],
+            "cluster": ["test_cluster"],
+            "interval": ["A-B"],
+            "chr": ["chrX"],
+            "start": [100],
+            "end": [200],
+        }
+    )
+    gd_table = type("GDTableStub", (), {})()
+    gd_table.loci = {
+        "test_cluster": GDLocus(
+            cluster="test_cluster",
+            chrom="chrX",
+            breakpoints=[(100, 100), (200, 200)],
+            breakpoint_names=["A", "B"],
+            gd_entries=[],
+            is_nahr=True,
+            is_terminal=False,
+        )
+    }
+    ploidy_df = pd.DataFrame(
+        {"sample": ["S1"], "contig": ["chrX"], "ploidy": [1]}
+    )
+
+    _, _, event_marginals_df = call_cnvs_from_posteriors(
+        cn_posteriors_df,
+        bin_mappings_df,
+        gd_table,
+        ploidy_df=ploidy_df,
+        calling_mode="posterior-marginal",
+    )
+
+    event_row = event_marginals_df.iloc[0]
+    assert event_row["prob_del_event"] == pytest.approx(0.54)
+    assert event_row["prob_dup_event"] == pytest.approx(0.45)
+    assert event_row["qual_del_event"] == pytest.approx(
+        posterior_probability_to_qual(0.90)
+    )
+    assert event_row["qual_dup_event"] == pytest.approx(-99.0)
 
 
 def test_call_cnvs_marks_best_match_without_confident_carrier(monkeypatch):

@@ -378,6 +378,7 @@ def _render_pdf_sample_page(
     gaps: Optional[GapsAnnotation],
     viterbi_data: Optional[ViterbiOverlayData],
     baf_temperature_by_sample: Optional[Dict[str, float]] = None,
+    event_values_are_qual: bool = False,
     target_gd_id: Optional[str] = None,
     title_suffix: Optional[str] = None,
 ) -> bool:
@@ -614,6 +615,7 @@ def _render_pdf_sample_page(
         event_svtype,
         show_trace=False,
         called_event_mask=plot_called_event_mask,
+        values_are_qual=event_values_are_qual,
     )
     _print_timing(f"{cluster} {sample_id} pdf event panel", stage_start)
 
@@ -1049,6 +1051,7 @@ def _plot_event_marginal_panel(
     show_trace: bool = True,
     rasterized: bool = False,
     called_event_mask: Optional[np.ndarray] = None,
+    values_are_qual: bool = False,
 ) -> None:
     """Render per-bin event QUAL scores for one sample."""
     ax.set_xlim(0.0, xform.d_end)
@@ -1084,10 +1087,18 @@ def _plot_event_marginal_panel(
     color = "#C23B22" if svtype == "DEL" else "#2A6FBB"
 
     if np.any(valid):
-        qual_values = posterior_called_state_to_qual(
-            event_probabilities[valid],
-            called_event_mask[valid],
-        )
+        if values_are_qual:
+            qual_values = np.asarray(event_probabilities[valid], dtype=float)
+            qual_values = np.where(
+                called_event_mask[valid],
+                qual_values,
+                -qual_values,
+            )
+        else:
+            qual_values = posterior_called_state_to_qual(
+                event_probabilities[valid],
+                called_event_mask[valid],
+            )
         ax.bar(
             x_positions[valid],
             qual_values,
@@ -1245,7 +1256,7 @@ def _build_raw_region_df(
         if len(raw_sub) > 0:
             usable = [s for s in common_samples if s in raw_sub.columns]
             if usable:
-                meds = np.array([raw_sample_medians[s] for s in usable])
+                meds = np.array([raw_sample_medians[s] for s in usable], dtype=float)
                 normed_vals = 2.0 * raw_sub[usable].values.astype(float) / meds
                 base_df = pd.concat(
                     [
@@ -2037,6 +2048,7 @@ def create_carrier_pdf(
     event_marginals_df: Optional[pd.DataFrame] = None,
     event_del_df: Optional[pd.DataFrame] = None,
     event_dup_df: Optional[pd.DataFrame] = None,
+    event_values_are_qual: bool = False,
     minor_baf_df: Optional[pd.DataFrame] = None,
     baf_sites_df: Optional[pd.DataFrame] = None,
     padding: int = 50000,
@@ -2170,6 +2182,7 @@ def create_carrier_pdf(
                     gaps,
                     viterbi_data,
                     baf_temperature_by_sample=baf_temperature_by_sample,
+                    event_values_are_qual=event_values_are_qual,
                 )
                 if not rendered:
                     continue
@@ -2195,6 +2208,7 @@ def create_eval_category_pdfs(
     event_marginals_df: Optional[pd.DataFrame] = None,
     event_del_df: Optional[pd.DataFrame] = None,
     event_dup_df: Optional[pd.DataFrame] = None,
+    event_values_are_qual: bool = False,
     minor_baf_df: Optional[pd.DataFrame] = None,
     baf_sites_df: Optional[pd.DataFrame] = None,
     padding: int = 50000,
@@ -2345,6 +2359,7 @@ def create_eval_category_pdfs(
                         gaps,
                         viterbi_data,
                         baf_temperature_by_sample=baf_temperature_by_sample,
+                        event_values_are_qual=event_values_are_qual,
                         target_gd_id=spec.get("gd_id"),
                         title_suffix=spec.get("title_suffix"),
                     )
@@ -2707,6 +2722,7 @@ def main():
     event_marginals_df: Optional[pd.DataFrame] = None
     event_del_df: Optional[pd.DataFrame] = None
     event_dup_df: Optional[pd.DataFrame] = None
+    event_values_are_qual = False
     event_marginals_path = args.event_marginals
     if event_marginals_path is None:
         sibling_event_marginals = os.path.join(
@@ -2729,17 +2745,23 @@ def main():
             "start": "Start",
             "end": "End",
         })
-        if "prob_del_event" in event_marginals_df.columns:
+        event_values_are_qual = {
+            "qual_del_event",
+            "qual_dup_event",
+        }.issubset(event_marginals_df.columns)
+        del_value_column = "qual_del_event" if event_values_are_qual else "prob_del_event"
+        dup_value_column = "qual_dup_event" if event_values_are_qual else "prob_dup_event"
+        if del_value_column in event_marginals_df.columns:
             event_del_df = event_marginals_df.pivot(
                 index=["Cluster", "Chr", "Start", "End"],
                 columns="sample",
-                values="prob_del_event",
+                values=del_value_column,
             ).reset_index()
-        if "prob_dup_event" in event_marginals_df.columns:
+        if dup_value_column in event_marginals_df.columns:
             event_dup_df = event_marginals_df.pivot(
                 index=["Cluster", "Chr", "Start", "End"],
                 columns="sample",
-                values="prob_dup_event",
+                values=dup_value_column,
             ).reset_index()
         print(f"  {len(event_marginals_df)} event-marginal records loaded")
     else:
@@ -2819,6 +2841,7 @@ def main():
             event_marginals_df=event_marginals_df,
             event_del_df=event_del_df,
             event_dup_df=event_dup_df,
+            event_values_are_qual=event_values_are_qual,
             minor_baf_df=minor_baf_df,
             baf_sites_df=baf_sites_df,
             padding=args.padding,
@@ -2839,6 +2862,7 @@ def main():
             event_marginals_df=event_marginals_df,
             event_del_df=event_del_df,
             event_dup_df=event_dup_df,
+            event_values_are_qual=event_values_are_qual,
             minor_baf_df=minor_baf_df,
             baf_sites_df=baf_sites_df,
             padding=args.padding,

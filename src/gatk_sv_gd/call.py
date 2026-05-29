@@ -296,6 +296,40 @@ def compute_event_marginal_probabilities(
     return event_probs
 
 
+def compute_informative_event_support_probabilities(
+    pair_prob_matrix: np.ndarray,
+    pair_states: List[Tuple[int, int]],
+    sample_ploidy: int,
+) -> Dict[str, np.ndarray]:
+    """Return per-bin event support conditional on informative pair-state mass.
+
+    This keeps null posterior mass neutral for called-state QUAL while still
+    allowing the informative pair-state posterior to express DEL/DUP support.
+    """
+    pair_prob_matrix = np.asarray(pair_prob_matrix, dtype=float)
+    if pair_prob_matrix.ndim == 1:
+        pair_prob_matrix = pair_prob_matrix.reshape(1, -1)
+    n_bins = pair_prob_matrix.shape[0]
+    informative_mass = np.clip(pair_prob_matrix.sum(axis=1), 0.0, None)
+    event_support_probs: Dict[str, np.ndarray] = {}
+    for svtype in ("DEL", "DUP"):
+        event_mask = build_event_pair_mask(pair_states, svtype, sample_ploidy)
+        if pair_prob_matrix.size == 0 or not np.any(event_mask):
+            pair_event_probability = np.zeros(n_bins, dtype=float)
+        else:
+            pair_event_probability = pair_prob_matrix[:, event_mask].sum(axis=1)
+        support_probabilities = np.full(n_bins, 0.5, dtype=float)
+        informative = informative_mass > 0.0
+        if np.any(informative):
+            support_probabilities[informative] = np.clip(
+                pair_event_probability[informative] / informative_mass[informative],
+                0.0,
+                1.0,
+            )
+        event_support_probs[svtype] = support_probabilities
+    return event_support_probs
+
+
 def _build_posterior_entry_spec(
     locus,
     entry: dict,
@@ -563,6 +597,17 @@ def score_call_from_posterior_marginals(
     """Score one GD entry directly from pair-state posterior marginals."""
     if entry_spec is None:
         entry_spec = _build_posterior_entry_spec(locus, entry, interval_bin_arrays)
+    confidence_event_probabilities = None
+    if (
+        interval_confidence_lookup is None
+        or flank_non_event_medians is None
+        or flank_confidences is None
+    ):
+        confidence_event_probabilities = compute_informative_event_support_probabilities(
+            sample_pair_probs,
+            pair_states,
+            sample_ploidy,
+        )[entry_spec["svtype"]]
     if event_probabilities is None:
         event_probabilities = compute_event_marginal_probabilities(
             sample_pair_probs,
@@ -574,13 +619,13 @@ def score_call_from_posterior_marginals(
         interval_confidence_lookup = _compute_interval_confidence_lookup(
             entry_spec["covered_intervals"],
             interval_bin_arrays,
-            event_probabilities,
+            confidence_event_probabilities,
             neighbor_bin_correlation=posterior_interval_bin_correlation,
         )
     if flank_non_event_medians is None or flank_confidences is None:
         flank_non_event_medians, flank_confidences = _compute_flank_confidence_stats(
             interval_bin_arrays,
-            event_probabilities,
+            confidence_event_probabilities,
         )
     return _score_posterior_call_from_event_probabilities(
         locus=locus,
@@ -792,8 +837,17 @@ def call_cnvs_from_posteriors(
                 sample_ploidy,
                 null_probability=cluster_null_probs,
             )
-            qual_del_event = _util.posterior_probability_to_qual(cluster_event_probs["DEL"])
-            qual_dup_event = _util.posterior_probability_to_qual(cluster_event_probs["DUP"])
+            cluster_event_support_probs = compute_informative_event_support_probabilities(
+                cluster_pair_probs,
+                pair_state_labels,
+                sample_ploidy,
+            )
+            qual_del_event = _util.posterior_probability_to_qual(
+                cluster_event_support_probs["DEL"]
+            )
+            qual_dup_event = _util.posterior_probability_to_qual(
+                cluster_event_support_probs["DUP"]
+            )
             all_event_records.extend(
                 {
                     "sample": sample_id,
@@ -865,7 +919,7 @@ def call_cnvs_from_posteriors(
                     svtype: _compute_interval_confidence_lookup(
                         locus_cache["interval_names_for_entries"],
                         interval_bin_arrays_local,
-                        cluster_event_probs[svtype],
+                        cluster_event_support_probs[svtype],
                         neighbor_bin_correlation=posterior_interval_bin_correlation,
                     )
                     for svtype in ("DEL", "DUP")
@@ -873,7 +927,7 @@ def call_cnvs_from_posteriors(
                 flank_stats_by_svtype = {
                     svtype: _compute_flank_confidence_stats(
                         interval_bin_arrays_local,
-                        cluster_event_probs[svtype],
+                        cluster_event_support_probs[svtype],
                     )
                     for svtype in ("DEL", "DUP")
                 }
