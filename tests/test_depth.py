@@ -775,6 +775,107 @@ def test_run_discrete_inference_uses_count_anchored_length_scale_var_when_availa
     assert cn_posterior[0, 0, 3] > p_cn3_short_length_scale
 
 
+def test_run_discrete_inference_reweights_reference_prior_for_haploid_ploidy():
+    model = object.__new__(CNVModel)
+    model.pair_states = [(0, 0), (0, 1), (0, 2), (1, 1), (1, 2), (2, 2)]
+    model.n_states = len(model.pair_states)
+    model.max_total_cn = 4
+    model.bin_size_factor = 1.0
+    model.baf_temperature = 0.0
+    model.baf_outlier_rate = 0.0
+    model.null_state_prior = 0.0
+    model.var_length_scale = 1_000.0
+    model.alpha_ref = 50.0
+    model.alpha_non_ref = 1.0
+    model.ref_state_idx = model.pair_states.index((1, 1))
+    model.min_variance_expected_depth = 0.1
+    model._count_anchored_reference_variance_np = _count_anchored_reference_variance_numpy(
+        np.asarray([200.0, 200.0], dtype=np.float32),
+        reference_bin_size=1.0,
+        bin_size_factor=1.0,
+    )
+
+    pair_priors = np.asarray(
+        [[1.0 / 55.0, 1.0 / 55.0, 1.0 / 55.0, 50.0 / 55.0, 1.0 / 55.0, 1.0 / 55.0]] * 2,
+        dtype=np.float32,
+    )
+    model.get_map_estimates = lambda data: {
+        "bin_bias": np.asarray([1.0, 1.0], dtype=np.float32),
+        "sample_var": np.asarray([0.2, 0.2], dtype=np.float32),
+        "pair_state_probs": pair_priors,
+        "length_scale_var": np.asarray(1_000.0, dtype=np.float32),
+    }
+
+    base_data = {
+        "depth": _FakeTensor([[1.5, 1.5], [1.5, 1.5]]),
+        "interval_sizes": _FakeTensor([[1.0], [1.0]]),
+        "n_bins": 2,
+        "n_samples": 2,
+        "has_baf": False,
+    }
+
+    diploid_posterior = CNVModel.run_discrete_inference(
+        model,
+        SimpleNamespace(**base_data),
+    )["pair_state_posterior"][0, 0]
+    haploid_posterior = CNVModel.run_discrete_inference(
+        model,
+        SimpleNamespace(
+            sample_ploidy=_FakeTensor([[1, 1], [1, 1]]),
+            **base_data,
+        ),
+    )["pair_state_posterior"][0, 0]
+
+    assert diploid_posterior[3] > diploid_posterior[1]
+    assert haploid_posterior[1] > haploid_posterior[3]
+    assert haploid_posterior[1] > 0.9
+
+
+def test_run_discrete_inference_min_variance_expected_depth_prevents_copy0_null_collapse():
+    def make_model(min_variance_expected_depth: float):
+        model = object.__new__(CNVModel)
+        model.pair_states = [(0, 0), (0, 1)]
+        model.n_states = len(model.pair_states)
+        model.max_total_cn = 1
+        model.bin_size_factor = 1.0
+        model.baf_temperature = 0.0
+        model.baf_outlier_rate = 0.0
+        model.null_state_prior = 0.2
+        model.var_length_scale = 1_000.0
+        model.min_variance_expected_depth = min_variance_expected_depth
+        model._count_anchored_reference_variance_np = _count_anchored_reference_variance_numpy(
+            np.asarray([200.0, 200.0], dtype=np.float32),
+            reference_bin_size=1.0,
+            bin_size_factor=1.0,
+        )
+        model.get_map_estimates = lambda data: {
+            "bin_bias": np.asarray([1.0, 1.0], dtype=np.float32),
+            "sample_var": np.asarray([0.2, 0.2], dtype=np.float32),
+            "pair_state_probs": np.asarray([[0.4, 0.4], [0.4, 0.4]], dtype=np.float32),
+            "length_scale_var": np.asarray(1_000.0, dtype=np.float32),
+        }
+        return model
+
+    data = SimpleNamespace(
+        depth=_FakeTensor([[0.1, 0.1], [0.1, 0.1]]),
+        interval_sizes=_FakeTensor([[1.0], [1.0]]),
+        n_bins=2,
+        n_samples=2,
+        has_baf=False,
+    )
+
+    baseline = CNVModel.run_discrete_inference(make_model(0.0), data)
+    floored = CNVModel.run_discrete_inference(make_model(0.1), data)
+
+    baseline_pair = baseline["pair_state_posterior"][0, 0]
+    floored_pair = floored["pair_state_posterior"][0, 0]
+
+    assert baseline["null_posterior"][0, 0] > 0.75
+    assert baseline_pair[0] == pytest.approx(0.0)
+    assert floored_pair[0] > 0.65
+    assert floored["null_posterior"][0, 0] < 0.3
+
+
 def test_run_discrete_inference_baf_outlier_rate_caps_contradictory_baf_penalty():
     maps = {
         "bin_bias": np.asarray([1.0, 1.0], dtype=np.float32),

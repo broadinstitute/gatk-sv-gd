@@ -265,7 +265,7 @@ def test_score_call_from_posterior_marginals_accumulates_multi_bin_interval_qual
     assert call["min_interval_confidence"] == pytest.approx(expected_interval_confidence)
 
 
-def test_score_call_from_posterior_marginals_uses_non_null_support_for_haploid_qual():
+def test_score_call_from_posterior_marginals_uses_pignistic_qual_and_exposes_raw_qual():
     locus = GDLocus(
         cluster="test_cluster",
         chrom="chrX",
@@ -308,13 +308,18 @@ def test_score_call_from_posterior_marginals_uses_non_null_support_for_haploid_q
         null_probability=null_probability,
     )
 
-    body_qual = posterior_probability_to_qual(0.90)
+    pignistic_body_qual = posterior_probability_to_qual(0.54)
+    raw_body_qual = posterior_probability_to_qual(0.90)
 
     assert call["log_prob_score"] == pytest.approx(0.54)
-    assert call["min_interval_confidence"] == pytest.approx(body_qual)
-    assert call["min_flank_non_event_confidence"] == pytest.approx(body_qual)
-    assert call["confidence_score"] == pytest.approx(body_qual)
-    assert call["qual_score"] == pytest.approx(body_qual)
+    assert call["min_interval_confidence"] == pytest.approx(pignistic_body_qual)
+    assert call["raw_min_interval_confidence"] == pytest.approx(raw_body_qual)
+    assert call["min_flank_non_event_confidence"] == pytest.approx(pignistic_body_qual)
+    assert call["raw_min_flank_non_event_confidence"] == pytest.approx(raw_body_qual)
+    assert call["confidence_score"] == pytest.approx(pignistic_body_qual)
+    assert call["raw_confidence_score"] == pytest.approx(raw_body_qual)
+    assert call["qual_score"] == pytest.approx(pignistic_body_qual)
+    assert call["raw_qual_score"] == pytest.approx(raw_body_qual)
 
 
 def test_parse_args_accepts_posterior_interval_bin_correlation(monkeypatch):
@@ -423,12 +428,18 @@ def test_score_call_from_posterior_marginals_fast_path_matches_default():
         "interval_coverage",
         "reciprocal_overlap",
         "min_interval_confidence",
+        "raw_min_interval_confidence",
         "left_flank_non_event_median",
+        "raw_left_flank_non_event_median",
         "right_flank_non_event_median",
+        "raw_right_flank_non_event_median",
         "min_flank_non_event_confidence",
+        "raw_min_flank_non_event_confidence",
         "log_prob_score",
         "confidence_score",
+        "raw_confidence_score",
         "qual_score",
+        "raw_qual_score",
     ]:
         assert observed_call[field] == pytest.approx(expected_call[field], nan_ok=True)
 
@@ -541,9 +552,11 @@ def test_call_cnvs_from_posteriors_uses_null_mass_as_neutral_event_evidence():
     assert event_row["prob_dup_event"] == pytest.approx(0.5)
     assert event_row["qual_del_event"] == pytest.approx(0.0)
     assert event_row["qual_dup_event"] == pytest.approx(0.0)
+    assert event_row["raw_qual_del_event"] == pytest.approx(0.0)
+    assert event_row["raw_qual_dup_event"] == pytest.approx(0.0)
 
 
-def test_call_cnvs_from_posteriors_event_qual_uses_informative_support():
+def test_call_cnvs_from_posteriors_event_qual_is_pignistic_and_raw_qual_is_informative():
     cn_posteriors_df = pd.DataFrame(
         {
             "sample": ["S1"],
@@ -596,9 +609,15 @@ def test_call_cnvs_from_posteriors_event_qual_uses_informative_support():
     assert event_row["prob_del_event"] == pytest.approx(0.54)
     assert event_row["prob_dup_event"] == pytest.approx(0.45)
     assert event_row["qual_del_event"] == pytest.approx(
+        posterior_probability_to_qual(0.54)
+    )
+    assert event_row["qual_dup_event"] == pytest.approx(
+        posterior_probability_to_qual(0.45)
+    )
+    assert event_row["raw_qual_del_event"] == pytest.approx(
         posterior_probability_to_qual(0.90)
     )
-    assert event_row["qual_dup_event"] == pytest.approx(-99.0)
+    assert event_row["raw_qual_dup_event"] == pytest.approx(-99.0)
 
 
 def test_call_cnvs_marks_best_match_without_confident_carrier(monkeypatch):

@@ -33,6 +33,7 @@ _NORMALIZED_DIPLOID_DEPTH = 2.0
 _MIN_DEPTH_VARIANCE_SCALE = 1e-6
 _MIN_SPATIAL_AGGREGATE_RATIO = 1e-8
 _SPATIAL_AGGREGATE_TAYLOR_THRESHOLD = 1e-2
+_DEFAULT_MIN_VARIANCE_EXPECTED_DEPTH = 0.10
 
 
 def _lognormal_location_from_mean(mean: float, scale: float) -> float:
@@ -69,6 +70,27 @@ def _depth_variance_scale_numpy(
         np.power(scaled_depth, power),
         _MIN_DEPTH_VARIANCE_SCALE,
     )
+
+
+def _variance_expected_depth_torch(
+    expected_depth: torch.Tensor,
+    min_expected_depth: float,
+) -> torch.Tensor:
+    """Lower-bound expected depth when assembling variance terms."""
+    if float(min_expected_depth) <= 0.0:
+        return expected_depth
+    return torch.clamp(expected_depth, min=float(min_expected_depth))
+
+
+def _variance_expected_depth_numpy(
+    expected_depth: np.ndarray,
+    min_expected_depth: float,
+) -> np.ndarray:
+    """NumPy counterpart of :func:`_variance_expected_depth_torch`."""
+    expected_depth = np.asarray(expected_depth, dtype=np.float64)
+    if float(min_expected_depth) <= 0.0:
+        return expected_depth
+    return np.maximum(expected_depth, float(min_expected_depth))
 
 
 def _count_anchored_reference_variance_torch(
@@ -639,6 +661,7 @@ class DepthData:
         self.baf_variance = None
         self.baf_n_sites = None
         self.has_baf = False
+        self.sample_ploidy = None
 
     def attach_baf_summary(self, baf_summary_df: pd.DataFrame, mappings) -> None:
         """Attach per-bin, per-sample BAF summaries to this data object.
@@ -699,6 +722,40 @@ class DepthData:
 
         print(f"Attached BAF summaries: {n_attached:,} matched bin × sample rows")
 
+    def attach_sample_ploidy(self, ploidy_map: Dict[Tuple[str, str], int]) -> None:
+        """Attach per-bin, per-sample contig ploidy for exact inference."""
+        if not ploidy_map:
+            return
+
+        ploidy_matrix = np.zeros((self.n_bins, self.n_samples), dtype=np.int16)
+        missing_pairs = []
+        for bin_idx, chrom in enumerate(self.chr):
+            chrom_key = str(chrom)
+            for sample_idx, sample_id in enumerate(self.sample_ids):
+                key = (str(sample_id), chrom_key)
+                ploidy_value = ploidy_map.get(key)
+                if ploidy_value is None:
+                    if len(missing_pairs) < 5:
+                        missing_pairs.append(f"{sample_id}/{chrom_key}")
+                    continue
+                ploidy_matrix[bin_idx, sample_idx] = int(ploidy_value)
+
+        if missing_pairs:
+            raise ValueError(
+                "Ploidy map is missing sample/contig pairs required for exact inference: "
+                + ", ".join(missing_pairs)
+            )
+
+        self.sample_ploidy = torch.tensor(
+            ploidy_matrix,
+            dtype=torch.int16,
+            device=self.depth.device,
+        )
+        print(
+            "Attached sample ploidy for exact inference: "
+            f"{self.n_bins:,} bins x {self.n_samples:,} samples"
+        )
+
 
 class CNVModel:
     """
@@ -729,6 +786,7 @@ class CNVModel:
         freeze_bin_var: bool = False,
         freeze_pair_state_priors: bool = False,
         bin_size_factor: float = 10000.0,
+        min_variance_expected_depth: float = _DEFAULT_MIN_VARIANCE_EXPECTED_DEPTH,
         sample_raw_count_medians: Optional[Sequence[float]] = None,
         reference_bin_size: Optional[float] = None,
         var_length_scale: float = 20000.0,
@@ -780,6 +838,10 @@ class CNVModel:
                 so that smaller bins and higher expected normalized depth
                 both increase variance relative to a diploid depth baseline
                 of 2.0.
+            min_variance_expected_depth: Lower bound applied to expected
+                depth only when assembling variance terms. This keeps copy-0
+                states from collapsing to near-zero variance while leaving
+                the state mean unchanged.
             sample_raw_count_medians: Optional per-sample autosomal median raw
                 counts at the reference low-resolution bin size. Training and
                 exact inference require these values together with
@@ -815,6 +877,7 @@ class CNVModel:
         self.freeze_bin_var = freeze_bin_var
         self.freeze_pair_state_priors = freeze_pair_state_priors
         self.bin_size_factor = bin_size_factor
+        self.min_variance_expected_depth = float(min_variance_expected_depth)
         self.sample_raw_count_medians = None
         self.reference_bin_size = None
         self.var_length_scale = float(var_length_scale)
@@ -831,6 +894,8 @@ class CNVModel:
             raise ValueError("baf_outlier_rate must be in [0, 1).")
         if not 0.0 <= self.null_state_prior < 1.0:
             raise ValueError("null_state_prior must be in [0, 1).")
+        if self.min_variance_expected_depth < 0.0:
+            raise ValueError("min_variance_expected_depth must be non-negative.")
         if self.var_length_scale <= 0:
             raise ValueError("var_length_scale must be positive.")
         if self.learn_baf_temperature and self.baf_temperature <= 0:
@@ -1142,6 +1207,33 @@ class CNVModel:
         alpha = self._pair_state_alpha_values()
         return alpha / float(alpha.sum())
 
+    def _reference_state_idx_for_ploidy(self, sample_ploidy: int) -> Optional[int]:
+        candidate_indices = [
+            idx
+            for idx, (h1, h2) in enumerate(self.pair_states)
+            if (h1 + h2) == int(sample_ploidy)
+        ]
+        if not candidate_indices:
+            return None
+        return min(
+            candidate_indices,
+            key=lambda idx: (
+                abs(self.pair_states[idx][1] - self.pair_states[idx][0]),
+                -min(self.pair_states[idx]),
+                self.pair_states[idx][0],
+                self.pair_states[idx][1],
+            ),
+        )
+
+    def _pair_state_prior_mean_values_for_ploidy(self, sample_ploidy: int) -> np.ndarray:
+        reference_state_idx = self._reference_state_idx_for_ploidy(int(sample_ploidy))
+        if reference_state_idx is None:
+            return np.asarray(self._pair_state_prior_mean_values(), dtype=np.float64)
+        state_count = len(self.pair_states)
+        alpha = np.full(state_count, self.alpha_non_ref, dtype=np.float64)
+        alpha[reference_state_idx] = self.alpha_ref
+        return alpha / float(alpha.sum())
+
     def _fixed_pair_state_probs_values(self, n_bins: int) -> np.ndarray:
         base_probs = self._pair_state_prior_mean_values()
         return np.broadcast_to(base_probs, (n_bins, self.n_states)).copy()
@@ -1169,6 +1261,70 @@ class CNVModel:
         )
         return normalized * (1.0 - self._null_state_prior_value())
 
+    def _sample_ploidy_matrix_numpy(self, data) -> Optional[np.ndarray]:
+        sample_ploidy = getattr(data, "sample_ploidy", None)
+        if sample_ploidy is None:
+            return None
+        if hasattr(sample_ploidy, "detach"):
+            sample_ploidy = sample_ploidy.detach().cpu().numpy()
+        sample_ploidy = np.asarray(sample_ploidy, dtype=np.int64)
+        if sample_ploidy.ndim == 0:
+            sample_ploidy = np.full(
+                (data.n_bins, data.n_samples),
+                int(sample_ploidy),
+                dtype=np.int64,
+            )
+        elif sample_ploidy.shape == (data.n_samples,):
+            sample_ploidy = np.broadcast_to(
+                sample_ploidy.reshape(1, -1),
+                (data.n_bins, data.n_samples),
+            ).copy()
+        elif sample_ploidy.shape != (data.n_bins, data.n_samples):
+            raise ValueError(
+                "sample_ploidy must have shape (n_bins, n_samples), (n_samples,), "
+                f"or be scalar; got {sample_ploidy.shape}"
+            )
+        return sample_ploidy
+
+    def _effective_pair_state_priors_by_ploidy_numpy(
+        self,
+        pair_state_probs: np.ndarray,
+        sample_ploidy: Optional[np.ndarray],
+        n_samples: int,
+    ) -> np.ndarray:
+        base_probs = np.asarray(pair_state_probs, dtype=np.float64)
+        if base_probs.ndim == 1:
+            base_probs = base_probs.reshape(1, -1)
+        state_count = base_probs.shape[1]
+        expanded = np.broadcast_to(
+            base_probs[:, np.newaxis, :],
+            (base_probs.shape[0], n_samples, state_count),
+        ).copy()
+        if sample_ploidy is None:
+            return expanded
+
+        default_prior_mean = np.asarray(self._pair_state_prior_mean_values(), dtype=np.float64)
+        for ploidy_value in np.unique(sample_ploidy):
+            target_prior_mean = self._pair_state_prior_mean_values_for_ploidy(int(ploidy_value))
+            ratio = np.divide(
+                target_prior_mean,
+                np.maximum(default_prior_mean, 1e-30),
+                out=np.ones_like(target_prior_mean, dtype=np.float64),
+                where=default_prior_mean > 0,
+            )
+            mask = sample_ploidy == int(ploidy_value)
+            if np.any(mask):
+                expanded[mask] *= ratio
+
+        target_mass = base_probs.sum(axis=1)[:, np.newaxis, np.newaxis]
+        expanded_sums = expanded.sum(axis=2, keepdims=True)
+        return np.divide(
+            expanded,
+            np.maximum(expanded_sums, 1e-30),
+            out=np.zeros_like(expanded),
+            where=expanded_sums > 0,
+        ) * target_mass
+
     def _baf_scale_numpy(self, maps: dict, n_samples: int = 0) -> float:
         if "baf_temperature" in maps:
             values = np.asarray(maps["baf_temperature"]).squeeze()
@@ -1184,8 +1340,26 @@ class CNVModel:
     def _baf_reference_probs_tensor(self) -> torch.Tensor:
         return self._pair_state_prior_mean_t
 
-    def _baf_reference_probs_numpy(self) -> np.ndarray:
-        return self._pair_state_prior_mean_np
+    def _baf_reference_probs_numpy(
+        self,
+        sample_ploidy: Optional[np.ndarray] = None,
+        n_bins: Optional[int] = None,
+        n_samples: Optional[int] = None,
+    ) -> np.ndarray:
+        state_count = len(self.pair_states)
+        if sample_ploidy is None:
+            return self._pair_state_prior_mean_np
+        if n_bins is None or n_samples is None:
+            raise ValueError("n_bins and n_samples are required when sample_ploidy is provided.")
+        reference_probs = np.broadcast_to(
+            np.asarray(self._pair_state_prior_mean_values(), dtype=np.float64).reshape(1, 1, state_count),
+            (n_bins, n_samples, state_count),
+        ).copy()
+        for ploidy_value in np.unique(sample_ploidy):
+            reference_probs[sample_ploidy == int(ploidy_value)] = self._pair_state_prior_mean_values_for_ploidy(
+                int(ploidy_value)
+            )
+        return np.transpose(reference_probs, (2, 0, 1))
 
     @config_enumerate(default="parallel")
     def model(self, depth: torch.Tensor, interval_sizes: torch.Tensor, n_bins: int = None, n_samples: int = None):
@@ -1272,6 +1446,7 @@ class CNVModel:
                 print(f"bin_bias.shape: {bin_bias.shape}")
             expected_total_cn = Vindex(self.total_cn_by_state)[pair_state]
             expected_depth = expected_total_cn * bin_bias
+            min_variance_expected_depth = getattr(self, "min_variance_expected_depth", 0.0)
             if self.debug:
                 print(f"expected_depth.shape: {expected_depth.shape}")
 
@@ -1280,7 +1455,11 @@ class CNVModel:
             if self.debug:
                 print(f"bin_var).shape: {bin_var.shape}")
             size_modifier = _size_modifier_torch(interval_sizes, self.bin_size_factor)
-            linear_depth_modifier = _depth_variance_scale_torch(expected_depth)
+            variance_expected_depth = _variance_expected_depth_torch(
+                expected_depth,
+                min_variance_expected_depth,
+            )
+            linear_depth_modifier = _depth_variance_scale_torch(variance_expected_depth)
             if self._count_anchored_reference_variance_t.shape[-1] != n_samples:
                 raise ValueError(
                     "sample_raw_count_medians length does not match the modeled sample count."
@@ -1294,7 +1473,7 @@ class CNVModel:
                 interval_sizes,
                 length_scale_var,
             )
-            excess_variance = (expected_depth ** 2) * sample_var * spatial_factor
+            excess_variance = (variance_expected_depth ** 2) * sample_var * spatial_factor
             variance = poisson_variance + excess_variance
             if self.debug:
                 print(f"variance.shape: {variance.shape}")
@@ -1620,19 +1799,30 @@ class CNVModel:
         # 2. Prepare data matrices
         obs = data.depth.detach().cpu().numpy()  # (n_bins, n_samples)
         interval_sizes = data.interval_sizes.detach().cpu().numpy().squeeze()  # (n_bins,)
+        sample_ploidy = self._sample_ploidy_matrix_numpy(data)
         pair_total_cn = pair_state_total_cn(self.pair_states)
         pair_minor_baf = pair_state_minor_baf(self.pair_states)
+        min_variance_expected_depth = getattr(self, "min_variance_expected_depth", 0.0)
         if np.asarray(null_state_prior).ndim == 0:
             null_state_prior = np.full(pair_state_probs.shape[0], float(null_state_prior), dtype=np.float64)
         else:
             null_state_prior = np.asarray(null_state_prior, dtype=np.float64).reshape(-1)
+        effective_pair_state_priors = self._effective_pair_state_priors_by_ploidy_numpy(
+            pair_state_probs,
+            sample_ploidy,
+            data.n_samples,
+        )
 
         # 3. Compute state-specific expected depth and depth-aware variance.
         # states: (n_states, 1, 1);  bin_bias: (1, n_bins, 1)
         states_total_cn = pair_total_cn.reshape(-1, 1, 1)
         expected_depth = states_total_cn * bin_bias[np.newaxis, :, np.newaxis]
         size_modifier = _size_modifier_numpy(interval_sizes[:, np.newaxis], self.bin_size_factor)
-        linear_depth_modifier = _depth_variance_scale_numpy(expected_depth)
+        variance_expected_depth = _variance_expected_depth_numpy(
+            expected_depth,
+            min_variance_expected_depth,
+        )
+        linear_depth_modifier = _depth_variance_scale_numpy(variance_expected_depth)
         count_anchored_reference_variance = getattr(self, "_count_anchored_reference_variance_np", None)
         if count_anchored_reference_variance is None:
             raise RuntimeError(
@@ -1654,7 +1844,7 @@ class CNVModel:
             length_scale_var,
         )
         excess_variance = (
-            (expected_depth ** 2)
+            (variance_expected_depth ** 2)
             * sample_var[np.newaxis, :]
             * spatial_factor[np.newaxis, :, :]
         )
@@ -1671,7 +1861,9 @@ class CNVModel:
         ) / (2 * std_b ** 2)
 
         # 4. Add log-prior over pair states.
-        log_prior = np.log(np.maximum(pair_state_probs.T[:, :, np.newaxis], 1e-10))
+        log_prior = np.log(
+            np.maximum(np.transpose(effective_pair_state_priors, (2, 0, 1)), 1e-10)
+        )
         log_unnormalized = log_lik + log_prior
 
         # 4b. Optional BAF log-likelihood contribution.
@@ -1701,7 +1893,11 @@ class CNVModel:
                 robust_baf_log_lik = np.where(valid[np.newaxis, :, :], robust_baf_log_lik, 0.0)
                 centered_baf_log_lik = _center_state_log_likelihood_table_numpy(
                     robust_baf_log_lik,
-                    self._baf_reference_probs_numpy(),
+                    self._baf_reference_probs_numpy(
+                        sample_ploidy=sample_ploidy,
+                        n_bins=pair_state_probs.shape[0],
+                        n_samples=data.n_samples,
+                    ) if sample_ploidy is not None else self._baf_reference_probs_numpy(),
                 )
                 log_unnormalized += centered_baf_log_lik
 

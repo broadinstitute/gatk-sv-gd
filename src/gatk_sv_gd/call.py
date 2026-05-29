@@ -427,6 +427,9 @@ def _score_posterior_call_from_event_probabilities(
     flank_non_event_medians: Dict[str, float],
     flank_confidences: Dict[str, float],
     sample_ploidy: int,
+    raw_interval_confidence_lookup: Optional[Dict[str, float]] = None,
+    raw_flank_non_event_medians: Optional[Dict[str, float]] = None,
+    raw_flank_confidences: Optional[Dict[str, float]] = None,
     cluster_depth: Optional[np.ndarray] = None,
 ) -> dict:
     """Score one GD entry from precomputed event probabilities for its locus."""
@@ -434,6 +437,10 @@ def _score_posterior_call_from_event_probabilities(
         float(interval_confidence_lookup.get(interval_name, 0.0))
         for interval_name in entry_spec["covered_intervals"]
     ]
+    raw_interval_confidences = [
+        float(raw_interval_confidence_lookup.get(interval_name, 0.0))
+        for interval_name in entry_spec["covered_intervals"]
+    ] if raw_interval_confidence_lookup is not None else list(interval_confidences)
     covered_bin_indices = entry_spec["covered_bin_indices"]
     if covered_bin_indices.size > 0:
         log_prob_score = float(np.mean(event_probabilities[covered_bin_indices]))
@@ -442,6 +449,18 @@ def _score_posterior_call_from_event_probabilities(
 
     valid_flank_medians = [
         value for value in flank_non_event_medians.values()
+        if pd.notna(value)
+    ]
+    raw_left_flank_non_event_median = (
+        raw_flank_non_event_medians.get("left_flank", np.nan)
+        if raw_flank_non_event_medians is not None else flank_non_event_medians.get("left_flank", np.nan)
+    )
+    raw_right_flank_non_event_median = (
+        raw_flank_non_event_medians.get("right_flank", np.nan)
+        if raw_flank_non_event_medians is not None else flank_non_event_medians.get("right_flank", np.nan)
+    )
+    raw_valid_flank_medians = [
+        value for value in [raw_left_flank_non_event_median, raw_right_flank_non_event_median]
         if pd.notna(value)
     ]
 
@@ -453,6 +472,17 @@ def _score_posterior_call_from_event_probabilities(
     confidence = (
         float(min(confidence_components))
         if confidence_components else 0.0
+    )
+    raw_confidence_components: List[float] = list(raw_interval_confidences)
+    if raw_flank_confidences is None:
+        raw_flank_confidences = flank_confidences
+    for flank_name in ("left_flank", "right_flank"):
+        flank_confidence = raw_flank_confidences.get(flank_name, np.nan)
+        if pd.notna(flank_confidence):
+            raw_confidence_components.append(float(flank_confidence))
+    raw_confidence = (
+        float(min(raw_confidence_components))
+        if raw_confidence_components else 0.0
     )
 
     if cluster_depth is not None and covered_bin_indices.size > 0:
@@ -481,17 +511,28 @@ def _score_posterior_call_from_event_probabilities(
         "reciprocal_overlap": log_prob_score,
         "intervals": list(entry_spec["covered_intervals"]),
         "interval_confidences": interval_confidences,
+        "raw_interval_confidences": raw_interval_confidences,
         "min_interval_confidence": (
             float(min(interval_confidences)) if interval_confidences else 0.0
         ),
+        "raw_min_interval_confidence": (
+            float(min(raw_interval_confidences)) if raw_interval_confidences else 0.0
+        ),
         "left_flank_non_event_median": flank_non_event_medians.get("left_flank", np.nan),
         "right_flank_non_event_median": flank_non_event_medians.get("right_flank", np.nan),
+        "raw_left_flank_non_event_median": raw_left_flank_non_event_median,
+        "raw_right_flank_non_event_median": raw_right_flank_non_event_median,
         "min_flank_non_event_confidence": (
             float(min(valid_flank_medians)) if valid_flank_medians else np.nan
         ),
+        "raw_min_flank_non_event_confidence": (
+            float(min(raw_valid_flank_medians)) if raw_valid_flank_medians else np.nan
+        ),
         "log_prob_score": log_prob_score,
         "confidence_score": confidence,
+        "raw_confidence_score": raw_confidence,
         "qual_score": confidence,
+        "raw_qual_score": raw_confidence,
         "mean_depth": mean_depth,
         "is_carrier": False,
     }
@@ -592,22 +633,33 @@ def score_call_from_posterior_marginals(
     interval_confidence_lookup: Optional[Dict[str, float]] = None,
     flank_non_event_medians: Optional[Dict[str, float]] = None,
     flank_confidences: Optional[Dict[str, float]] = None,
+    raw_event_probabilities: Optional[np.ndarray] = None,
+    raw_interval_confidence_lookup: Optional[Dict[str, float]] = None,
+    raw_flank_non_event_medians: Optional[Dict[str, float]] = None,
+    raw_flank_confidences: Optional[Dict[str, float]] = None,
     cluster_depth: Optional[np.ndarray] = None,
 ) -> dict:
     """Score one GD entry directly from pair-state posterior marginals."""
     if entry_spec is None:
         entry_spec = _build_posterior_entry_spec(locus, entry, interval_bin_arrays)
-    confidence_event_probabilities = None
+    if raw_event_probabilities is None:
+        raw_event_probabilities = compute_informative_event_support_probabilities(
+            sample_pair_probs,
+            pair_states,
+            sample_ploidy,
+        )[entry_spec["svtype"]]
     if (
         interval_confidence_lookup is None
         or flank_non_event_medians is None
         or flank_confidences is None
     ):
-        confidence_event_probabilities = compute_informative_event_support_probabilities(
-            sample_pair_probs,
-            pair_states,
-            sample_ploidy,
-        )[entry_spec["svtype"]]
+        if event_probabilities is None:
+            event_probabilities = compute_event_marginal_probabilities(
+                sample_pair_probs,
+                pair_states,
+                sample_ploidy,
+                null_probability=null_probability,
+            )[entry_spec["svtype"]]
     if event_probabilities is None:
         event_probabilities = compute_event_marginal_probabilities(
             sample_pair_probs,
@@ -619,13 +671,25 @@ def score_call_from_posterior_marginals(
         interval_confidence_lookup = _compute_interval_confidence_lookup(
             entry_spec["covered_intervals"],
             interval_bin_arrays,
-            confidence_event_probabilities,
+            event_probabilities,
             neighbor_bin_correlation=posterior_interval_bin_correlation,
         )
     if flank_non_event_medians is None or flank_confidences is None:
         flank_non_event_medians, flank_confidences = _compute_flank_confidence_stats(
             interval_bin_arrays,
-            confidence_event_probabilities,
+            event_probabilities,
+        )
+    if raw_interval_confidence_lookup is None:
+        raw_interval_confidence_lookup = _compute_interval_confidence_lookup(
+            entry_spec["covered_intervals"],
+            interval_bin_arrays,
+            raw_event_probabilities,
+            neighbor_bin_correlation=posterior_interval_bin_correlation,
+        )
+    if raw_flank_non_event_medians is None or raw_flank_confidences is None:
+        raw_flank_non_event_medians, raw_flank_confidences = _compute_flank_confidence_stats(
+            interval_bin_arrays,
+            raw_event_probabilities,
         )
     return _score_posterior_call_from_event_probabilities(
         locus=locus,
@@ -635,6 +699,9 @@ def score_call_from_posterior_marginals(
         flank_non_event_medians=flank_non_event_medians,
         flank_confidences=flank_confidences,
         sample_ploidy=sample_ploidy,
+        raw_interval_confidence_lookup=raw_interval_confidence_lookup,
+        raw_flank_non_event_medians=raw_flank_non_event_medians,
+        raw_flank_confidences=raw_flank_confidences,
         cluster_depth=cluster_depth,
     )
 
@@ -843,9 +910,15 @@ def call_cnvs_from_posteriors(
                 sample_ploidy,
             )
             qual_del_event = _util.posterior_probability_to_qual(
-                cluster_event_support_probs["DEL"]
+                cluster_event_probs["DEL"]
             )
             qual_dup_event = _util.posterior_probability_to_qual(
+                cluster_event_probs["DUP"]
+            )
+            raw_qual_del_event = _util.posterior_probability_to_qual(
+                cluster_event_support_probs["DEL"]
+            )
+            raw_qual_dup_event = _util.posterior_probability_to_qual(
                 cluster_event_support_probs["DUP"]
             )
             all_event_records.extend(
@@ -860,8 +933,10 @@ def call_cnvs_from_posteriors(
                     "prob_dup_event": float(dup_prob),
                     "qual_del_event": float(del_qual),
                     "qual_dup_event": float(dup_qual),
+                    "raw_qual_del_event": float(raw_del_qual),
+                    "raw_qual_dup_event": float(raw_dup_qual),
                 }
-                for start, end, null_prob, del_prob, dup_prob, del_qual, dup_qual in zip(
+                for start, end, null_prob, del_prob, dup_prob, del_qual, dup_qual, raw_del_qual, raw_dup_qual in zip(
                     locus_cache["cluster_starts"],
                     locus_cache["cluster_ends"],
                     cluster_null_probs,
@@ -869,6 +944,8 @@ def call_cnvs_from_posteriors(
                     cluster_event_probs["DUP"],
                     qual_del_event,
                     qual_dup_event,
+                    raw_qual_del_event,
+                    raw_qual_dup_event,
                 )
             )
 
@@ -919,12 +996,28 @@ def call_cnvs_from_posteriors(
                     svtype: _compute_interval_confidence_lookup(
                         locus_cache["interval_names_for_entries"],
                         interval_bin_arrays_local,
-                        cluster_event_support_probs[svtype],
+                        cluster_event_probs[svtype],
                         neighbor_bin_correlation=posterior_interval_bin_correlation,
                     )
                     for svtype in ("DEL", "DUP")
                 }
                 flank_stats_by_svtype = {
+                    svtype: _compute_flank_confidence_stats(
+                        interval_bin_arrays_local,
+                        cluster_event_probs[svtype],
+                    )
+                    for svtype in ("DEL", "DUP")
+                }
+                raw_interval_confidence_lookup_by_svtype = {
+                    svtype: _compute_interval_confidence_lookup(
+                        locus_cache["interval_names_for_entries"],
+                        interval_bin_arrays_local,
+                        cluster_event_support_probs[svtype],
+                        neighbor_bin_correlation=posterior_interval_bin_correlation,
+                    )
+                    for svtype in ("DEL", "DUP")
+                }
+                raw_flank_stats_by_svtype = {
                     svtype: _compute_flank_confidence_stats(
                         interval_bin_arrays_local,
                         cluster_event_support_probs[svtype],
@@ -941,12 +1034,18 @@ def call_cnvs_from_posteriors(
                         sample_ploidy=sample_ploidy,
                         posterior_interval_bin_correlation=posterior_interval_bin_correlation,
                         event_probabilities=cluster_event_probs[entry_spec["svtype"]],
+                        raw_event_probabilities=cluster_event_support_probs[entry_spec["svtype"]],
                         entry_spec=entry_spec,
                         interval_confidence_lookup=interval_confidence_lookup_by_svtype[
                             entry_spec["svtype"]
                         ],
                         flank_non_event_medians=flank_stats_by_svtype[entry_spec["svtype"]][0],
                         flank_confidences=flank_stats_by_svtype[entry_spec["svtype"]][1],
+                        raw_interval_confidence_lookup=raw_interval_confidence_lookup_by_svtype[
+                            entry_spec["svtype"]
+                        ],
+                        raw_flank_non_event_medians=raw_flank_stats_by_svtype[entry_spec["svtype"]][0],
+                        raw_flank_confidences=raw_flank_stats_by_svtype[entry_spec["svtype"]][1],
                         cluster_depth=cluster_depth,
                     )
                     for entry_spec in locus_cache["posterior_entry_specs"]
@@ -999,23 +1098,38 @@ def call_cnvs_from_posteriors(
                     "interval_coverage": call.get("interval_coverage", np.nan),
                     "reciprocal_overlap": call.get("reciprocal_overlap", np.nan),
                     "min_interval_confidence": call.get("min_interval_confidence", np.nan),
+                    "raw_min_interval_confidence": call.get("raw_min_interval_confidence", np.nan),
                     "left_flank_non_event_median": call.get(
                         "left_flank_non_event_median",
+                        np.nan,
+                    ),
+                    "raw_left_flank_non_event_median": call.get(
+                        "raw_left_flank_non_event_median",
                         np.nan,
                     ),
                     "right_flank_non_event_median": call.get(
                         "right_flank_non_event_median",
                         np.nan,
                     ),
+                    "raw_right_flank_non_event_median": call.get(
+                        "raw_right_flank_non_event_median",
+                        np.nan,
+                    ),
                     "min_flank_non_event_confidence": call.get(
                         "min_flank_non_event_confidence",
+                        np.nan,
+                    ),
+                    "raw_min_flank_non_event_confidence": call.get(
+                        "raw_min_flank_non_event_confidence",
                         np.nan,
                     ),
                     "is_carrier": bool(call.get("is_carrier", False)),
                     "is_best_match": bool(call.get("is_best_match", False)),
                     "log_prob_score": call.get("log_prob_score", confidence_score),
                     "confidence_score": confidence_score,
+                    "raw_confidence_score": call.get("raw_confidence_score", np.nan),
                     "qual_score": call.get("qual_score", np.nan),
+                    "raw_qual_score": call.get("raw_qual_score", np.nan),
                     "calling_method": calling_mode,
                     "call_criteria_mean_coverage": (
                         float(min_mean_coverage)
@@ -1067,14 +1181,20 @@ def call_cnvs_from_posteriors(
             "interval_coverage",
             "reciprocal_overlap",
             "min_interval_confidence",
+            "raw_min_interval_confidence",
             "left_flank_non_event_median",
+            "raw_left_flank_non_event_median",
             "right_flank_non_event_median",
+            "raw_right_flank_non_event_median",
             "min_flank_non_event_confidence",
+            "raw_min_flank_non_event_confidence",
             "is_carrier",
             "is_best_match",
             "log_prob_score",
             "confidence_score",
+            "raw_confidence_score",
             "qual_score",
+            "raw_qual_score",
             "calling_method",
             "call_criteria_mean_coverage",
             "call_criteria_interval_confidence",
@@ -1106,6 +1226,8 @@ def call_cnvs_from_posteriors(
             "prob_dup_event",
             "qual_del_event",
             "qual_dup_event",
+            "raw_qual_del_event",
+            "raw_qual_dup_event",
         ],
     )
     return calls_df, paths_df, event_marginals_df

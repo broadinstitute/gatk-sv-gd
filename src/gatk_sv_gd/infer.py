@@ -231,6 +231,8 @@ def run_gd_analysis(
         dtype=torch.float32,
         clamp_threshold=args.clamp_threshold,
     )
+    if ploidy_map is not None:
+        combined_data.attach_sample_ploidy(ploidy_map)
     if preprocessed_baf_summary is not None:
         combined_data.attach_baf_summary(preprocessed_baf_summary, mappings)
 
