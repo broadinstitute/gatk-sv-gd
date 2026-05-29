@@ -22,6 +22,9 @@ def _call_row(
     call_criteria_mean_coverage=float("nan"),
     call_criteria_interval_confidence=60.0,
     call_criteria_flank_non_event_confidence=60.0,
+    null_anomaly_score=0.0,
+    is_null_anomalous=False,
+    call_criteria_null_anomaly_score=0.2,
 ):
     return {
         "sample": sample,
@@ -54,10 +57,13 @@ def _call_row(
         "log_prob_score": 0.95,
         "confidence_score": qual_score,
         "qual_score": qual_score,
+        "null_anomaly_score": null_anomaly_score,
+        "is_null_anomalous": is_null_anomalous,
         "calling_method": calling_method,
         "call_criteria_mean_coverage": call_criteria_mean_coverage,
         "call_criteria_interval_confidence": call_criteria_interval_confidence,
         "call_criteria_flank_non_event_confidence": call_criteria_flank_non_event_confidence,
+        "call_criteria_null_anomaly_score": call_criteria_null_anomaly_score,
     }
 
 
@@ -113,6 +119,7 @@ def _write_run(
                 "TP_samples": ["S1"],
                 "FP_samples": [""],
                 "FN_samples": ["S2"],
+                "anomalous_discrepancy_samples": ["S2"],
             }
         ).to_csv(root / "eval" / "truth_evaluation_report.tsv", sep="\t", index=False)
     if touch_optional:
@@ -163,6 +170,13 @@ def test_load_run_rejects_missing_confidence_column(tmp_path):
 
     with pytest.raises(ValueError, match="qual_score"):
         aggregate._load_run_data(run_dir, batch_id=1, batch_label="batch")
+
+
+def test_optional_artifacts_include_anomalous_discrepancy_pdf():
+    assert (
+        "anomalous_discrepancies_pdf",
+        ("plot", "anomalous_discrepancies.pdf"),
+    ) in aggregate._OPTIONAL_ARTIFACTS
 
 
 def test_build_report_tables_classifies_carriers_and_eval(tmp_path):
@@ -307,6 +321,7 @@ def test_pdf_structure_includes_case_sections_and_evidence_plot(tmp_path):
 def test_run_aggregate_writes_sidecars_and_pdf(tmp_path):
     run_dir = tmp_path / "run"
     output_dir = tmp_path / "aggregate"
+    work_dir_arg = "{}/".format(run_dir)
     _write_run(
         run_dir,
         [
@@ -315,7 +330,7 @@ def test_run_aggregate_writes_sidecars_and_pdf(tmp_path):
         ],
     )
     args = argparse.Namespace(
-        work_dirs=[str(run_dir)],
+        work_dirs=[work_dir_arg],
         output_dir=str(output_dir),
         output_name="aggregate_report.pdf",
         min_confidence=0.5,
@@ -341,3 +356,28 @@ def test_run_aggregate_writes_sidecars_and_pdf(tmp_path):
 
     cases_df = pd.read_csv(output_dir / "aggregate_cases.tsv", sep="\t")
     assert cases_df["sample"].tolist() == ["S1"]
+    assert cases_df["work_dir"].tolist() == [work_dir_arg]
+    assert "batch_id" not in cases_df.columns
+    assert "batch_label" not in cases_df.columns
+
+    inventory_df = pd.read_csv(output_dir / "aggregate_inventory.tsv", sep="\t")
+    assert inventory_df["work_dir"].tolist() == [work_dir_arg]
+    assert "batch_id" not in inventory_df.columns
+    assert "batch_label" not in inventory_df.columns
+
+    calls_df = pd.read_csv(output_dir / "aggregate_calls.tsv", sep="\t")
+    assert set(calls_df["work_dir"]) == {work_dir_arg}
+    assert "batch_id" not in calls_df.columns
+    assert "batch_label" not in calls_df.columns
+
+    locus_summary_df = pd.read_csv(output_dir / "aggregate_locus_summary.tsv", sep="\t")
+    assert locus_summary_df["work_dir"].tolist() == [work_dir_arg]
+    assert "batch_id" not in locus_summary_df.columns
+    assert "batch_label" not in locus_summary_df.columns
+
+    eval_df = pd.read_csv(output_dir / "aggregate_eval.tsv", sep="\t")
+    assert list(eval_df.columns) == ["work_dir", "GD_ID"]
+
+    missing_df = pd.read_csv(output_dir / "aggregate_missing_artifacts.tsv", sep="\t")
+    assert set(missing_df["work_dir"]) == {work_dir_arg}
+    assert "batch_label" not in missing_df.columns

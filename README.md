@@ -528,7 +528,7 @@ Routine per-sample, per-bin, and progress-style messages are suppressed.
 
 | File | Description |
 | --- | --- |
-| `gd_cnv_calls.tsv.gz` | Sample/GD_ID call table with coordinates, event type, breakpoint labels, interval evidence, carrier flag, best-match flag, calling method, and confidence/QUAL scores. |
+| `gd_cnv_calls.tsv.gz` | Sample/GD_ID call table with coordinates, event type, breakpoint labels, interval evidence, carrier flag, best-match flag, null anomaly annotations, calling method, and confidence/QUAL scores. |
 | `viterbi_paths.tsv.gz` | Per-sample, per-cluster CN path segments. In posterior-marginal mode this file may be empty but is still written for interface consistency. |
 | `event_marginals.tsv.gz` | Per-bin event marginal probabilities and QUAL scores for deletion and duplication evidence. |
 | `call_log.txt` | Command and calling log. |
@@ -537,7 +537,8 @@ Important `gd_cnv_calls.tsv.gz` columns include `sample`, `cluster`, `GD_ID`,
 `chrom`, `start`, `end`, `svtype`, `BP1`, `BP2`, `n_bins`, `sample_ploidy`,
 `interval_coverage`, `reciprocal_overlap`, `min_interval_confidence`,
 `min_flank_non_event_confidence`, `is_carrier`, `is_best_match`,
-`confidence_score`, `qual_score`, and `calling_method`.
+`null_anomaly_score`, `is_null_anomalous`, `confidence_score`, `qual_score`,
+and `calling_method`.
 
 ### `plot` Outputs
 
@@ -548,13 +549,13 @@ Important `gd_cnv_calls.tsv.gz` columns include `sample`, `cluster`, `GD_ID`,
 | `locus_plots/*.png` | Per-locus overview plots. |
 | `sample_plots/<cluster>/*.png` | Individual sample plots when requested or selected. |
 | `carrier_plots.pdf` | Multi-page PDF of carrier plots. |
-| `true_positives.pdf`, `false_positives.pdf`, `false_negatives.pdf` | Evaluation-stratified PDFs written when `--eval-report` is supplied. |
+| `true_positives.pdf`, `false_positives.pdf`, `false_negatives.pdf`, `anomalous_discrepancies.pdf` | Evaluation PDFs plus an anomalous-sample review PDF; the anomalous PDF is written whenever flagged anomalous samples are present, even if `--eval-report` is omitted. |
 
 ### `eval` Outputs
 
 | File | Description |
 | --- | --- |
-| `truth_evaluation_report.tsv` | Per-GD_ID truth/prediction comparison with truth carriers, predicted carriers, TP, FP, FN, sensitivity, precision, and false-positive/false-negative sample lists. |
+| `truth_evaluation_report.tsv` | Per-GD_ID truth/prediction comparison with truth carriers, predicted carriers, TP, FP, FN, sensitivity, precision, false-positive/false-negative sample lists, and anomalous discrepancy sample lists. |
 | `eval_log.txt` | Command and evaluation log. |
 
 The evaluator accepts two truth-table formats:

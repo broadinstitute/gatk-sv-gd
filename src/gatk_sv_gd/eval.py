@@ -213,6 +213,7 @@ def evaluate_against_truth(
     # breakpoint configuration for its svtype.
     pred_by_gd: Dict[str, set] = {}
     pred_meta_by_gd: Dict[str, dict] = {}
+    anomaly_by_gd_sample: Dict[tuple, bool] = {}
     for gd_id, grp in calls_df.groupby("GD_ID"):
         gd_id_str = str(gd_id)
         carrier_mask = grp["is_carrier"] == True  # noqa: E712
@@ -221,6 +222,11 @@ def evaluate_against_truth(
         pred_by_gd[gd_id_str] = set(
             grp.loc[carrier_mask, "sample"].unique()
         )
+        if "is_null_anomalous" in grp.columns:
+            for sample_id, sample_grp in grp.groupby("sample", sort=False):
+                anomaly_by_gd_sample[(gd_id_str, str(sample_id))] = bool(
+                    sample_grp["is_null_anomalous"].fillna(False).astype(bool).any()
+                )
         first = grp.iloc[0]
         pred_meta_by_gd[gd_id_str] = {
             "chr": first.get("chrom", ""),
@@ -265,6 +271,12 @@ def evaluate_against_truth(
         tp_samples = sorted(truth_set & pred_set)
         fp_samples = sorted(pred_set - truth_set)
         fn_samples = sorted(truth_set - pred_set)
+        discrepancy_samples = sorted((pred_set - truth_set) | (truth_set - pred_set))
+        anomalous_discrepancy_samples = [
+            sample_id
+            for sample_id in discrepancy_samples
+            if anomaly_by_gd_sample.get((gd_id, str(sample_id)), False)
+        ]
         sensitivity = tp / (tp + fn) if (tp + fn) > 0 else float("nan")
         precision = tp / (tp + fp) if (tp + fp) > 0 else float("nan")
 
@@ -291,6 +303,10 @@ def evaluate_against_truth(
             "TP_samples": ",".join(tp_samples) if tp > 0 else "",
             "FP_samples": ",".join(fp_samples) if fp > 0 else "",
             "FN_samples": ",".join(fn_samples) if fn > 0 else "",
+            "anomalous_discrepancy_samples": (
+                ",".join(anomalous_discrepancy_samples)
+                if anomalous_discrepancy_samples else ""
+            ),
         })
 
     report_df = pd.DataFrame(rows)

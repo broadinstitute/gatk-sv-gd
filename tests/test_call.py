@@ -9,6 +9,7 @@ from gatk_sv_gd._util import (
     posterior_probability_to_qual,
 )
 from gatk_sv_gd.call import (
+    _get_mean_null_probability_for_call,
     _build_posterior_entry_spec,
     _compute_flank_confidence_stats,
     _compute_interval_confidence_lookup,
@@ -217,6 +218,24 @@ def test_compute_interval_confidence_lookup_uses_effective_bin_count():
     assert observed["A-B"] == pytest.approx(expected)
 
 
+def test_get_mean_null_probability_for_call_averages_covered_body_bins():
+    call = {"intervals": ["A-B", "B-C"]}
+    interval_bin_arrays = {
+        "A-B": np.array([0, 1], dtype=int),
+        "B-C": np.array([2], dtype=int),
+        "left_flank": np.array([3], dtype=int),
+    }
+    cluster_null_probability = np.array([0.10, 0.40, 0.70, 0.95], dtype=float)
+
+    observed = _get_mean_null_probability_for_call(
+        call,
+        interval_bin_arrays,
+        cluster_null_probability,
+    )
+
+    assert observed == pytest.approx((0.10 + 0.40 + 0.70) / 3.0)
+
+
 def test_score_call_from_posterior_marginals_accumulates_multi_bin_interval_qual():
     locus = GDLocus(
         cluster="test_cluster",
@@ -346,6 +365,32 @@ def test_parse_args_accepts_posterior_interval_bin_correlation(monkeypatch):
     args = parse_args()
 
     assert args.posterior_interval_bin_correlation == pytest.approx(0.25)
+
+
+def test_parse_args_accepts_null_anomaly_threshold(monkeypatch):
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "gatk-sv-gd call",
+            "--cn-posteriors",
+            "cn.tsv.gz",
+            "--bin-mappings",
+            "bins.tsv.gz",
+            "--gd-table",
+            "gd.tsv",
+            "--ploidy-table",
+            "ploidy.tsv",
+            "--output-dir",
+            "out",
+            "--null-anomaly-threshold",
+            "0.2",
+        ],
+    )
+
+    args = parse_args()
+
+    assert args.null_anomaly_threshold == pytest.approx(0.2)
 
 
 def test_score_call_from_posterior_marginals_fast_path_matches_default():
@@ -622,6 +667,7 @@ def test_call_cnvs_from_posteriors_event_qual_is_pignistic_and_raw_qual_is_infor
 
 def test_call_cnvs_marks_best_match_without_confident_carrier(monkeypatch):
     cn_posteriors_df, bin_mappings_df, gd_table = _minimal_call_inputs()
+    cn_posteriors_df["prob_null"] = 0.25
     gd_table.loci["test_cluster"].gd_entries = [
         {
             "GD_ID": "GD1",
@@ -699,3 +745,6 @@ def test_call_cnvs_marks_best_match_without_confident_carrier(monkeypatch):
     assert calls_df.loc[calls_df["GD_ID"] == "GD1", "is_best_match"].item()
     assert calls_df["call_criteria_interval_confidence"].tolist() == [60.0, 60.0]
     assert calls_df["call_criteria_flank_non_event_confidence"].tolist() == [60.0, 60.0]
+    assert calls_df["null_anomaly_score"].tolist() == pytest.approx([0.25, 0.25])
+    assert calls_df["is_null_anomalous"].tolist() == [True, True]
+    assert calls_df["call_criteria_null_anomaly_score"].tolist() == pytest.approx([0.2, 0.2])

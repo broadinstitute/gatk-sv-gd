@@ -12,6 +12,7 @@ from gatk_sv_gd._util import posterior_called_state_to_qual
 from gatk_sv_gd.plot import (
     ViterbiOverlayData,
     _apply_carrier_pdf_x_axis_layout,
+    _build_anomalous_pdf_specs,
     _build_eval_pdf_specs,
     _build_raw_region_df,
     _plot_baf_signal_panel,
@@ -126,6 +127,59 @@ def test_build_eval_pdf_specs_uses_reported_tp_samples(capsys):
 
     assert [spec["sample"] for spec in specs["true_positives"]] == ["S1"]
     assert "derived TP count" not in capsys.readouterr().out
+
+
+def test_build_eval_pdf_specs_uses_flagged_anomalous_calls():
+    calls_df = pd.DataFrame(
+        {
+            "sample": ["S1"],
+            "cluster": ["10q11.2"],
+            "GD_ID": ["GD1"],
+            "is_carrier": [True],
+            "is_best_match": [True],
+            "is_null_anomalous": [True],
+            "qual_score": [20.0],
+        }
+    )
+    eval_report_df = pd.DataFrame(
+        {
+            "GD_ID": ["GD1"],
+            "TP": [1],
+            "TP_samples": ["S1"],
+            "FP_samples": [""],
+            "FN_samples": [""],
+        }
+    )
+
+    specs = _build_eval_pdf_specs(
+        eval_report_df,
+        calls_df,
+        {"10q11.2": _make_eval_locus()},
+    )
+
+    assert [
+        spec["sample"] for spec in specs["anomalous_discrepancies"]
+    ] == ["S1"]
+
+
+def test_build_anomalous_pdf_specs_works_without_eval_report_rows():
+    calls_df = pd.DataFrame(
+        {
+            "sample": ["S1", "S2"],
+            "cluster": ["10q11.2", "10q11.2"],
+            "GD_ID": ["GD1", "GD1"],
+            "is_best_match": [True, False],
+            "is_null_anomalous": [True, True],
+            "qual_score": [20.0, 20.0],
+        }
+    )
+
+    specs = _build_anomalous_pdf_specs(
+        calls_df,
+        {"10q11.2": _make_eval_locus()},
+    )
+
+    assert [spec["sample"] for spec in specs] == ["S1"]
 
 
 def test_viterbi_overlay_data_rejects_legacy_schema():

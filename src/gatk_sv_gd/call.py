@@ -24,6 +24,7 @@ from gatk_sv_gd.viterbi import (
 DEFAULT_MIN_POSTERIOR_INTERVAL_CONFIDENCE = 10.
 DEFAULT_MIN_FLANK_NON_EVENT_CONFIDENCE = 10.
 DEFAULT_POSTERIOR_INTERVAL_BIN_CORRELATION = 0.5
+DEFAULT_NULL_ANOMALY_THRESHOLD = 0.9
 _EMPTY_INT_ARRAY = np.array([], dtype=int)
 
 
@@ -598,12 +599,11 @@ def _build_locus_call_cache(
     }
 
 
-def _get_mean_depth_for_call(
+def _get_covered_bin_indices_for_call(
     call: dict,
     interval_bin_arrays: Dict[str, np.ndarray],
-    cluster_depth: np.ndarray,
-) -> float:
-    """Return mean depth across the bins covered by a call."""
+) -> np.ndarray:
+    """Return concatenated covered body-bin indices for a call."""
     covered_index_arrays = [
         interval_bin_arrays.get(interval_name, _EMPTY_INT_ARRAY)
         for interval_name in call.get("intervals", [])
@@ -614,9 +614,32 @@ def _get_mean_depth_for_call(
         if interval_indices.size > 0
     ]
     if not non_empty_index_arrays:
+        return _EMPTY_INT_ARRAY
+    return np.concatenate(non_empty_index_arrays)
+
+
+def _get_mean_depth_for_call(
+    call: dict,
+    interval_bin_arrays: Dict[str, np.ndarray],
+    cluster_depth: np.ndarray,
+) -> float:
+    """Return mean depth across the bins covered by a call."""
+    covered_bin_indices = _get_covered_bin_indices_for_call(call, interval_bin_arrays)
+    if covered_bin_indices.size == 0:
         return np.nan
-    covered_bin_indices = np.concatenate(non_empty_index_arrays)
     return float(np.mean(cluster_depth[covered_bin_indices]))
+
+
+def _get_mean_null_probability_for_call(
+    call: dict,
+    interval_bin_arrays: Dict[str, np.ndarray],
+    cluster_null_probability: np.ndarray,
+) -> float:
+    """Return mean null posterior across the covered body bins for a call."""
+    covered_bin_indices = _get_covered_bin_indices_for_call(call, interval_bin_arrays)
+    if covered_bin_indices.size == 0:
+        return 0.0
+    return float(np.clip(np.mean(cluster_null_probability[covered_bin_indices]), 0.0, 1.0))
 
 
 def score_call_from_posterior_marginals(
@@ -719,6 +742,7 @@ def call_cnvs_from_posteriors(
     min_posterior_interval_confidence: float = DEFAULT_MIN_POSTERIOR_INTERVAL_CONFIDENCE,
     min_flank_non_event_confidence: float = DEFAULT_MIN_FLANK_NON_EVENT_CONFIDENCE,
     posterior_interval_bin_correlation: float = DEFAULT_POSTERIOR_INTERVAL_BIN_CORRELATION,
+    null_anomaly_threshold: float = DEFAULT_NULL_ANOMALY_THRESHOLD,
 ) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     """Call GD CNVs from posterior probabilities."""
     if calling_mode not in {"viterbi", "posterior-marginal"}:
@@ -728,6 +752,8 @@ def call_cnvs_from_posteriors(
         )
     if not 0.0 <= posterior_interval_bin_correlation <= 1.0:
         raise ValueError("posterior_interval_bin_correlation must be in [0, 1].")
+    if not 0.0 <= null_anomaly_threshold <= 1.0:
+        raise ValueError("null_anomaly_threshold must be in [0, 1].")
     if calling_mode == "viterbi" and transition_matrix is None:
         raise ValueError("transition_matrix is required for calling_mode='viterbi'")
 
@@ -747,7 +773,9 @@ def call_cnvs_from_posteriors(
             "interval bin correlation="
             f"{posterior_interval_bin_correlation:.2f}, "
             "minimum flank non-event QUAL="
-            f"{min_flank_non_event_confidence:.2f})"
+            f"{min_flank_non_event_confidence:.2f}, "
+            "null anomaly threshold="
+            f"{null_anomaly_threshold:.2f})"
         )
     print("=" * 80)
 
@@ -1074,6 +1102,11 @@ def call_cnvs_from_posteriors(
                         interval_bin_arrays_local,
                         cluster_depth,
                     )
+                null_anomaly_score = _get_mean_null_probability_for_call(
+                    call,
+                    interval_bin_arrays_local,
+                    cluster_null_probs,
+                )
                 confidence_score = get_call_confidence(call)
                 result = {
                     "sample": sample_id,
@@ -1130,6 +1163,8 @@ def call_cnvs_from_posteriors(
                     "raw_confidence_score": call.get("raw_confidence_score", np.nan),
                     "qual_score": call.get("qual_score", np.nan),
                     "raw_qual_score": call.get("raw_qual_score", np.nan),
+                    "null_anomaly_score": null_anomaly_score,
+                    "is_null_anomalous": bool(null_anomaly_score > null_anomaly_threshold),
                     "calling_method": calling_mode,
                     "call_criteria_mean_coverage": (
                         float(min_mean_coverage)
@@ -1146,6 +1181,7 @@ def call_cnvs_from_posteriors(
                         if calling_mode == "posterior-marginal"
                         else np.nan
                     ),
+                    "call_criteria_null_anomaly_score": float(null_anomaly_threshold),
                 }
                 all_results.append(result)
 
@@ -1195,10 +1231,13 @@ def call_cnvs_from_posteriors(
             "raw_confidence_score",
             "qual_score",
             "raw_qual_score",
+            "null_anomaly_score",
+            "is_null_anomalous",
             "calling_method",
             "call_criteria_mean_coverage",
             "call_criteria_interval_confidence",
             "call_criteria_flank_non_event_confidence",
+            "call_criteria_null_anomaly_score",
         ],
     )
     paths_df = pd.DataFrame(
@@ -1316,6 +1355,12 @@ def parse_args():
                "0-99 scale.",
     )
     parser.add_argument(
+        "--null-anomaly-threshold",
+        type=float,
+        default=DEFAULT_NULL_ANOMALY_THRESHOLD,
+        help="Flag calls whose covered-body mean null posterior exceeds this threshold.",
+    )
+    parser.add_argument(
         "--verbose", "-v",
         action="store_true",
         help="Print detailed per-sample scores for all GD entries at every locus.",
@@ -1323,6 +1368,8 @@ def parse_args():
     args = parser.parse_args()
     if not 0.0 <= args.posterior_interval_bin_correlation <= 1.0:
         parser.error("--posterior-interval-bin-correlation must be in [0, 1].")
+    if not 0.0 <= args.null_anomaly_threshold <= 1.0:
+        parser.error("--null-anomaly-threshold must be in [0, 1].")
     return args
 
 
@@ -1387,6 +1434,7 @@ def main():
         min_posterior_interval_confidence=args.min_posterior_interval_confidence,
         min_flank_non_event_confidence=args.min_flank_non_event_confidence,
         posterior_interval_bin_correlation=args.posterior_interval_bin_correlation,
+        null_anomaly_threshold=args.null_anomaly_threshold,
     )
 
     output_file = os.path.join(args.output_dir, "gd_cnv_calls.tsv.gz")

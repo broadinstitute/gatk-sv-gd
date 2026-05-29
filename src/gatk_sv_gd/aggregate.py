@@ -60,6 +60,7 @@ _OPTIONAL_ARTIFACTS = (
     ("true_positives_pdf", ("plot", "true_positives.pdf")),
     ("false_positives_pdf", ("plot", "false_positives.pdf")),
     ("false_negatives_pdf", ("plot", "false_negatives.pdf")),
+    ("anomalous_discrepancies_pdf", ("plot", "anomalous_discrepancies.pdf")),
 )
 
 _SUMMARY_COLUMNS = ["metric", "value"]
@@ -82,6 +83,7 @@ _INVENTORY_COLUMNS = [
 _CASE_COLUMNS = [
     "batch_id",
     "batch_label",
+    "work_dir",
     "sample",
     "sample_key",
     "carrier_category",
@@ -121,6 +123,7 @@ _CASE_COLUMNS = [
 _LOCUS_SUMMARY_COLUMNS = [
     "batch_id",
     "batch_label",
+    "work_dir",
     "GD_ID",
     "cluster",
     "chrom",
@@ -138,7 +141,9 @@ _LOCUS_SUMMARY_COLUMNS = [
     "max_confidence",
     "median_confidence",
 ]
-_MISSING_COLUMNS = ["batch_label", "artifact", "path", "reason"]
+_MISSING_COLUMNS = ["batch_label", "work_dir", "artifact", "path", "reason"]
+
+_INTERNAL_BATCH_COLUMNS = ["batch_id", "batch_label"]
 
 _TRUE_VALUES = {"true", "t", "1", "yes", "y"}
 _FALSE_VALUES = {"false", "f", "0", "no", "n", ""}
@@ -174,6 +179,7 @@ class RunData:
     batch_id: int
     batch_label: str
     work_dir: Path
+    work_dir_input: str
     calls_df: pd.DataFrame
     ploidy_df: pd.DataFrame
     gd_table_df: pd.DataFrame
@@ -273,12 +279,14 @@ def _artifact_path(work_dir: Path, parts: Sequence[str]) -> Path:
 
 def _missing_row(
     batch_label: str,
+    work_dir: str,
     artifact: str,
     path: Path,
     reason: str = "not found",
 ) -> Dict[str, str]:
     return {
         "batch_label": batch_label,
+        "work_dir": work_dir,
         "artifact": artifact,
         "path": str(path),
         "reason": reason,
@@ -339,7 +347,7 @@ def _add_batch_columns(df: pd.DataFrame, run: RunData) -> pd.DataFrame:
     out = df.copy()
     out.insert(0, "batch_id", run.batch_id)
     out.insert(1, "batch_label", run.batch_label)
-    out.insert(2, "work_dir", str(run.work_dir))
+    out.insert(2, "work_dir", run.work_dir_input)
     if "sample" in out.columns:
         out.insert(3, "sample_key", out["sample"].map(lambda sample: "{}/{}".format(run.batch_label, sample)))
     return out
@@ -348,6 +356,7 @@ def _add_batch_columns(df: pd.DataFrame, run: RunData) -> pd.DataFrame:
 def _load_optional_eval_report(
     work_dir: Path,
     batch_label: str,
+    work_dir_input: str,
     missing: List[Dict[str, str]],
 ) -> Optional[pd.DataFrame]:
     path = work_dir / "eval" / "truth_evaluation_report.tsv"
@@ -356,10 +365,10 @@ def _load_optional_eval_report(
     try:
         eval_df = _read_tsv(path)
     except ValueError as exc:
-        missing.append(_missing_row(batch_label, "eval_report", path, str(exc)))
+        missing.append(_missing_row(batch_label, work_dir_input, "eval_report", path, str(exc)))
         return None
     if "GD_ID" not in eval_df.columns:
-        missing.append(_missing_row(batch_label, "eval_report", path, "missing GD_ID column"))
+        missing.append(_missing_row(batch_label, work_dir_input, "eval_report", path, "missing GD_ID column"))
         return None
     return eval_df
 
@@ -367,6 +376,7 @@ def _load_optional_eval_report(
 def _scan_optional_artifacts(
     work_dir: Path,
     batch_label: str,
+    work_dir_input: str,
 ) -> Tuple[Dict[str, bool], List[Dict[str, str]]]:
     status: Dict[str, bool] = {}
     missing: List[Dict[str, str]] = []
@@ -375,7 +385,7 @@ def _scan_optional_artifacts(
         present = path.exists()
         status[artifact] = present
         if not present:
-            missing.append(_missing_row(batch_label, artifact, path))
+            missing.append(_missing_row(batch_label, work_dir_input, artifact, path))
     return status, missing
 
 
@@ -409,14 +419,15 @@ def _load_run_data(
     gd_table_df = _read_tsv(gd_table_path)
     _validate_columns(gd_table_df, _REQUIRED_GD_TABLE_COLUMNS, gd_table_path)
 
-    optional_status, missing_artifacts = _scan_optional_artifacts(root, batch_label)
-    eval_df = _load_optional_eval_report(root, batch_label, missing_artifacts)
+    optional_status, missing_artifacts = _scan_optional_artifacts(root, batch_label, work_dir)
+    eval_df = _load_optional_eval_report(root, batch_label, work_dir, missing_artifacts)
     optional_status["eval_report"] = eval_df is not None
 
     return RunData(
         batch_id=batch_id,
         batch_label=batch_label,
         work_dir=root,
+        work_dir_input=work_dir,
         calls_df=calls_df,
         ploidy_df=ploidy_df,
         gd_table_df=gd_table_df,
@@ -687,6 +698,7 @@ def _build_locus_summary_table(calls_df: pd.DataFrame) -> pd.DataFrame:
         rows.append({
             "batch_id": batch_id,
             "batch_label": batch_label,
+            "work_dir": _first_value(group["work_dir"]) if "work_dir" in group.columns else "",
             "GD_ID": gd_id,
             "cluster": cluster,
             "chrom": _first_value(group["chrom"]) if "chrom" in group.columns else "",
@@ -733,7 +745,7 @@ def _build_inventory_table(
         rows.append({
             "batch_id": run.batch_id,
             "batch_label": run.batch_label,
-            "work_dir": str(run.work_dir),
+            "work_dir": run.work_dir_input,
             "sample_count": int(run.ploidy_df["sample"].nunique()),
             "modeled_gd_count": int(run.gd_table_df["GD_ID"].nunique()),
             "modeled_locus_count": int(cluster_series.where(cluster_series != "", run.gd_table_df["GD_ID"].astype(str)).nunique()),
@@ -895,12 +907,12 @@ def _write_sidecars(
 ) -> List[Path]:
     outputs = {
         "aggregate_summary.tsv": summary_df,
-        "aggregate_inventory.tsv": inventory_df,
-        "aggregate_calls.tsv": calls_df,
-        "aggregate_cases.tsv": cases_df,
-        "aggregate_locus_summary.tsv": locus_summary_df,
-        "aggregate_eval.tsv": eval_df,
-        "aggregate_missing_artifacts.tsv": missing_df,
+        "aggregate_inventory.tsv": inventory_df.drop(columns=_INTERNAL_BATCH_COLUMNS, errors="ignore"),
+        "aggregate_calls.tsv": calls_df.drop(columns=_INTERNAL_BATCH_COLUMNS, errors="ignore"),
+        "aggregate_cases.tsv": cases_df.drop(columns=_INTERNAL_BATCH_COLUMNS, errors="ignore"),
+        "aggregate_locus_summary.tsv": locus_summary_df.drop(columns=_INTERNAL_BATCH_COLUMNS, errors="ignore"),
+        "aggregate_eval.tsv": eval_df.drop(columns=_INTERNAL_BATCH_COLUMNS, errors="ignore"),
+        "aggregate_missing_artifacts.tsv": missing_df.drop(columns=["batch_label"], errors="ignore"),
     }
     paths: List[Path] = []
     for name, table in outputs.items():

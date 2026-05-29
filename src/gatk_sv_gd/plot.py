@@ -306,7 +306,7 @@ def _build_eval_pdf_specs(
     calls_df: pd.DataFrame,
     loci_by_cluster: Dict[str, GDLocus],
 ) -> Dict[str, List[dict]]:
-    """Build TP/FP/FN page specs from an eval report and calls table."""
+    """Build eval-category page specs from an eval report and calls table."""
     required_columns = {"GD_ID", "TP_samples", "FP_samples", "FN_samples"}
     missing_columns = sorted(required_columns.difference(eval_report_df.columns))
     if missing_columns:
@@ -321,11 +321,13 @@ def _build_eval_pdf_specs(
         "true_positives": [],
         "false_positives": [],
         "false_negatives": [],
+        "anomalous_discrepancies": [],
     }
     category_labels = {
         "true_positives": "True positive",
         "false_positives": "False positive",
         "false_negatives": "False negative",
+        "anomalous_discrepancies": "Anomalous sample",
     }
 
     for _, row in eval_report_df.iterrows():
@@ -355,7 +357,212 @@ def _build_eval_pdf_specs(
                     }
                 )
 
+    specs["anomalous_discrepancies"] = _build_anomalous_pdf_specs(
+        calls_df,
+        loci_by_cluster,
+    )
+
     return specs
+
+
+def _build_anomalous_pdf_specs(
+    calls_df: pd.DataFrame,
+    loci_by_cluster: Dict[str, GDLocus],
+) -> List[dict]:
+    """Build anomalous-sample page specs from flagged call rows."""
+    required_columns = {"GD_ID", "sample", "is_null_anomalous"}
+    if not required_columns.issubset(calls_df.columns):
+        return []
+
+    anomalous_calls_df = calls_df[calls_df["is_null_anomalous"] == True]  # noqa: E712
+    if anomalous_calls_df.empty:
+        return []
+    if "is_best_match" in anomalous_calls_df.columns:
+        anomalous_calls_df = anomalous_calls_df[
+            anomalous_calls_df["is_best_match"] == True  # noqa: E712
+        ]
+    if anomalous_calls_df.empty:
+        return []
+
+    gd_to_cluster = _build_gd_to_cluster_map(loci_by_cluster)
+    specs: List[dict] = []
+    for gd_id, grp in anomalous_calls_df.groupby("GD_ID", sort=False):
+        gd_id_str = str(gd_id)
+        cluster = gd_to_cluster.get(gd_id_str)
+        if cluster is None:
+            continue
+        for sample_id in sorted(grp["sample"].astype(str).unique().tolist()):
+            specs.append(
+                {
+                    "cluster": cluster,
+                    "sample": sample_id,
+                    "gd_id": gd_id_str,
+                    "title_suffix": f"Anomalous sample: {gd_id_str}",
+                }
+            )
+    return specs
+
+
+def _create_review_category_pdf(
+    category_name: str,
+    page_specs: List[dict],
+    pdf_path: str,
+    calls_df: pd.DataFrame,
+    depth_df: pd.DataFrame,
+    loci_by_cluster: Dict[str, GDLocus],
+    gtf: Optional[GTFParser],
+    segdup: Optional[SegDupAnnotation],
+    event_del_df: Optional[pd.DataFrame],
+    event_dup_df: Optional[pd.DataFrame],
+    minor_baf_df: Optional[pd.DataFrame],
+    baf_sites_df: Optional[pd.DataFrame],
+    gaps: Optional[GapsAnnotation],
+    raw_counts_df: Optional[pd.DataFrame],
+    lowres_median_bin_size: Optional[float],
+    highres_path: Optional[str],
+    flank_scale: float,
+    min_gene_label_spacing: float,
+    event_values_are_qual: bool,
+    viterbi_data: Optional[ViterbiOverlayData],
+    baf_temperature_by_sample: Optional[Dict[str, float]],
+) -> None:
+    """Render one review-category PDF from precomputed page specs."""
+    if not page_specs:
+        print("No pages for one review-category PDF")
+        return
+
+    confidence_column = _get_confidence_column(calls_df)
+    raw_sample_medians = _compute_raw_sample_medians(raw_counts_df)
+    if raw_sample_medians:
+        print(f"  Computed raw autosomal medians for {len(raw_sample_medians)} samples")
+
+    if lowres_median_bin_size is None and raw_counts_df is not None:
+        lowres_median_bin_size = estimate_lowres_bin_size(raw_counts_df)
+
+    print("Creating review-category PDF")
+    category_start = perf_counter()
+    with PdfPages(pdf_path) as pdf:
+        pages_by_cluster: Dict[str, List[dict]] = {}
+        for spec in page_specs:
+            pages_by_cluster.setdefault(str(spec["cluster"]), []).append(spec)
+
+        for cluster in sorted(pages_by_cluster):
+            cluster_start = perf_counter()
+            locus = loci_by_cluster.get(cluster)
+            if locus is None or not locus.breakpoints:
+                print("  Warning: no breakpoints for one locus; skipping")
+                continue
+
+            chrom = locus.chrom
+            stage_start = perf_counter()
+            locus_mask = (
+                (depth_df["Cluster"] == cluster) &
+                (depth_df["Chr"] == chrom)
+            )
+            region_df = depth_df[locus_mask].sort_values("Start")
+            if len(region_df) == 0:
+                continue
+            _print_timing(f"{cluster} {category_name} region slice", stage_start)
+
+            baf_region_df = None
+            baf_sites_region_df = None
+            event_del_region_df = None
+            event_dup_region_df = None
+            if minor_baf_df is not None:
+                baf_region_df = minor_baf_df[locus_mask].sort_values("Start")
+            if baf_sites_df is not None:
+                baf_sites_region_df = baf_sites_df[locus_mask].sort_values("Start")
+            if event_del_df is not None:
+                event_del_region_df = event_del_df[locus_mask].sort_values("Start")
+            if event_dup_df is not None:
+                event_dup_region_df = event_dup_df[locus_mask].sort_values("Start")
+            if len(region_df) > PDF_MAX_SIGNAL_BINS:
+                region_df, rebinned_frames = _rebin_aligned_region_dfs_for_display(
+                    locus,
+                    region_df,
+                    [baf_region_df, baf_sites_region_df, event_del_region_df, event_dup_region_df],
+                    max_total_bins=PDF_MAX_SIGNAL_BINS,
+                )
+                (
+                    baf_region_df,
+                    baf_sites_region_df,
+                    event_del_region_df,
+                    event_dup_region_df,
+                ) = rebinned_frames
+
+            region_start = int(region_df["Start"].min())
+            region_end = int(region_df["End"].max())
+            stage_start = perf_counter()
+            xform = FlankCompressor(
+                region_start,
+                region_end,
+                locus.start,
+                locus.end,
+                flank_scale=flank_scale,
+            )
+            _print_timing(f"{cluster} {category_name} xform", stage_start)
+
+            stage_start = perf_counter()
+            cluster_calls_df = calls_df[calls_df["cluster"] == cluster]
+            raw_region_df = None
+            if all([
+                raw_counts_df is not None or highres_path is not None,
+                bool(raw_sample_medians),
+                lowres_median_bin_size is not None,
+            ]):
+                raw_region_df = _build_raw_region_df(
+                    locus,
+                    region_start,
+                    region_end,
+                    raw_counts_df,
+                    list(raw_sample_medians.keys()),
+                    raw_sample_medians,
+                    lowres_median_bin_size,
+                    processed_region_df=region_df,
+                    highres_path=highres_path,
+                )
+                if raw_region_df is not None:
+                    raw_region_df = _rebin_region_df(raw_region_df, locus)
+            _print_timing(f"{cluster} {category_name} raw-region prep", stage_start)
+
+            cluster_specs = sorted(
+                pages_by_cluster[cluster],
+                key=lambda spec: (str(spec["sample"]), str(spec.get("gd_id", ""))),
+            )
+            print(f"  Adding {len(cluster_specs)} page(s) for one locus")
+            for spec in cluster_specs:
+                _render_pdf_sample_page(
+                    pdf,
+                    str(spec["sample"]),
+                    cluster,
+                    locus,
+                    region_df,
+                    cluster_calls_df,
+                    confidence_column,
+                    gtf,
+                    segdup,
+                    min_gene_label_spacing,
+                    xform,
+                    raw_region_df,
+                    baf_region_df,
+                    baf_sites_region_df,
+                    event_del_region_df,
+                    event_dup_region_df,
+                    gaps,
+                    viterbi_data,
+                    baf_temperature_by_sample=baf_temperature_by_sample,
+                    event_values_are_qual=event_values_are_qual,
+                    target_gd_id=spec.get("gd_id"),
+                    title_suffix=spec.get("title_suffix"),
+                )
+
+            _print_timing(
+                f"{cluster} {category_name} cluster total ({len(cluster_specs)} pages)",
+                cluster_start,
+            )
+
+    print("  Saved review-category PDF")
+    _print_timing(f"{category_name} pdf total", category_start)
 
 
 def _render_pdf_sample_page(
@@ -2221,15 +2428,7 @@ def create_eval_category_pdfs(
     viterbi_data: Optional[ViterbiOverlayData] = None,
     baf_temperature_by_sample: Optional[Dict[str, float]] = None,
 ):
-    """Create TP/FP/FN review PDFs when an eval report is provided."""
-    confidence_column = _get_confidence_column(calls_df)
-    raw_sample_medians = _compute_raw_sample_medians(raw_counts_df)
-    if raw_sample_medians:
-        print(f"  Computed raw autosomal medians for {len(raw_sample_medians)} samples")
-
-    if lowres_median_bin_size is None and raw_counts_df is not None:
-        lowres_median_bin_size = estimate_lowres_bin_size(raw_counts_df)
-
+    """Create eval-category review PDFs when an eval report is provided."""
     specs_by_category = _build_eval_pdf_specs(
         eval_report_df,
         calls_df,
@@ -2239,138 +2438,83 @@ def create_eval_category_pdfs(
         "true_positives": os.path.join(output_dir, "true_positives.pdf"),
         "false_positives": os.path.join(output_dir, "false_positives.pdf"),
         "false_negatives": os.path.join(output_dir, "false_negatives.pdf"),
+        "anomalous_discrepancies": os.path.join(output_dir, "anomalous_discrepancies.pdf"),
     }
 
     for category_name, pdf_path in output_paths.items():
-        page_specs = specs_by_category.get(category_name, [])
-        if not page_specs:
-            print("No pages for one eval-category PDF")
-            continue
+        _create_review_category_pdf(
+            category_name,
+            specs_by_category.get(category_name, []),
+            pdf_path,
+            calls_df,
+            depth_df,
+            loci_by_cluster,
+            gtf,
+            segdup,
+            event_del_df,
+            event_dup_df,
+            minor_baf_df,
+            baf_sites_df,
+            gaps,
+            raw_counts_df,
+            lowres_median_bin_size,
+            highres_path,
+            flank_scale,
+            min_gene_label_spacing,
+            event_values_are_qual,
+            viterbi_data,
+            baf_temperature_by_sample,
+        )
 
-        print("Creating eval-category PDF")
-        category_start = perf_counter()
-        with PdfPages(pdf_path) as pdf:
-            pages_by_cluster: Dict[str, List[dict]] = {}
-            for spec in page_specs:
-                pages_by_cluster.setdefault(str(spec["cluster"]), []).append(spec)
 
-            for cluster in sorted(pages_by_cluster):
-                cluster_start = perf_counter()
-                locus = loci_by_cluster.get(cluster)
-                if locus is None or not locus.breakpoints:
-                    print("  Warning: no breakpoints for one locus; skipping")
-                    continue
-
-                chrom = locus.chrom
-                stage_start = perf_counter()
-                locus_mask = (
-                    (depth_df["Cluster"] == cluster) &
-                    (depth_df["Chr"] == chrom)
-                )
-                region_df = depth_df[locus_mask].sort_values("Start")
-                if len(region_df) == 0:
-                    continue
-                _print_timing(f"{cluster} {category_name} region slice", stage_start)
-
-                baf_region_df = None
-                baf_sites_region_df = None
-                event_del_region_df = None
-                event_dup_region_df = None
-                if minor_baf_df is not None:
-                    baf_region_df = minor_baf_df[locus_mask].sort_values("Start")
-                if baf_sites_df is not None:
-                    baf_sites_region_df = baf_sites_df[locus_mask].sort_values("Start")
-                if event_del_df is not None:
-                    event_del_region_df = event_del_df[locus_mask].sort_values("Start")
-                if event_dup_df is not None:
-                    event_dup_region_df = event_dup_df[locus_mask].sort_values("Start")
-                if len(region_df) > PDF_MAX_SIGNAL_BINS:
-                    region_df, rebinned_frames = _rebin_aligned_region_dfs_for_display(
-                        locus,
-                        region_df,
-                        [baf_region_df, baf_sites_region_df, event_del_region_df, event_dup_region_df],
-                        max_total_bins=PDF_MAX_SIGNAL_BINS,
-                    )
-                    (
-                        baf_region_df,
-                        baf_sites_region_df,
-                        event_del_region_df,
-                        event_dup_region_df,
-                    ) = rebinned_frames
-
-                region_start = int(region_df["Start"].min())
-                region_end = int(region_df["End"].max())
-                stage_start = perf_counter()
-                xform = FlankCompressor(
-                    region_start,
-                    region_end,
-                    locus.start,
-                    locus.end,
-                    flank_scale=flank_scale,
-                )
-                _print_timing(f"{cluster} {category_name} xform", stage_start)
-
-                stage_start = perf_counter()
-                cluster_calls_df = calls_df[calls_df["cluster"] == cluster]
-                raw_region_df = None
-                if all([
-                    raw_counts_df is not None or highres_path is not None,
-                    bool(raw_sample_medians),
-                    lowres_median_bin_size is not None,
-                ]):
-                    raw_region_df = _build_raw_region_df(
-                        locus,
-                        region_start,
-                        region_end,
-                        raw_counts_df,
-                        list(raw_sample_medians.keys()),
-                        raw_sample_medians,
-                        lowres_median_bin_size,
-                        processed_region_df=region_df,
-                        highres_path=highres_path,
-                    )
-                    if raw_region_df is not None:
-                        raw_region_df = _rebin_region_df(raw_region_df, locus)
-                _print_timing(f"{cluster} {category_name} raw-region prep", stage_start)
-
-                cluster_specs = sorted(
-                    pages_by_cluster[cluster],
-                    key=lambda spec: (str(spec["sample"]), str(spec.get("gd_id", ""))),
-                )
-                print(f"  Adding {len(cluster_specs)} page(s) for one locus")
-                for spec in cluster_specs:
-                    _render_pdf_sample_page(
-                        pdf,
-                        str(spec["sample"]),
-                        cluster,
-                        locus,
-                        region_df,
-                        cluster_calls_df,
-                        confidence_column,
-                        gtf,
-                        segdup,
-                        min_gene_label_spacing,
-                        xform,
-                        raw_region_df,
-                        baf_region_df,
-                        baf_sites_region_df,
-                        event_del_region_df,
-                        event_dup_region_df,
-                        gaps,
-                        viterbi_data,
-                        baf_temperature_by_sample=baf_temperature_by_sample,
-                        event_values_are_qual=event_values_are_qual,
-                        target_gd_id=spec.get("gd_id"),
-                        title_suffix=spec.get("title_suffix"),
-                    )
-
-                _print_timing(
-                    f"{cluster} {category_name} cluster total ({len(cluster_specs)} pages)",
-                    cluster_start,
-                )
-
-        print("  Saved eval-category PDF")
-        _print_timing(f"{category_name} pdf total", category_start)
+def create_anomalous_pdf(
+    calls_df: pd.DataFrame,
+    depth_df: pd.DataFrame,
+    loci_by_cluster: Dict[str, GDLocus],
+    gtf: Optional[GTFParser],
+    segdup: Optional[SegDupAnnotation],
+    output_dir: str,
+    event_marginals_df: Optional[pd.DataFrame] = None,
+    event_del_df: Optional[pd.DataFrame] = None,
+    event_dup_df: Optional[pd.DataFrame] = None,
+    event_values_are_qual: bool = False,
+    minor_baf_df: Optional[pd.DataFrame] = None,
+    baf_sites_df: Optional[pd.DataFrame] = None,
+    padding: int = 50000,
+    min_gene_label_spacing: float = 0.05,
+    raw_counts_df: Optional[pd.DataFrame] = None,
+    gaps: Optional[GapsAnnotation] = None,
+    flank_scale: float = 0.20,
+    lowres_median_bin_size: Optional[float] = None,
+    highres_path: Optional[str] = None,
+    viterbi_data: Optional[ViterbiOverlayData] = None,
+    baf_temperature_by_sample: Optional[Dict[str, float]] = None,
+):
+    """Create an anomalous-sample review PDF from flagged call rows."""
+    del event_marginals_df, padding
+    _create_review_category_pdf(
+        "anomalous_discrepancies",
+        _build_anomalous_pdf_specs(calls_df, loci_by_cluster),
+        os.path.join(output_dir, "anomalous_discrepancies.pdf"),
+        calls_df,
+        depth_df,
+        loci_by_cluster,
+        gtf,
+        segdup,
+        event_del_df,
+        event_dup_df,
+        minor_baf_df,
+        baf_sites_df,
+        gaps,
+        raw_counts_df,
+        lowres_median_bin_size,
+        highres_path,
+        flank_scale,
+        min_gene_label_spacing,
+        event_values_are_qual,
+        viterbi_data,
+        baf_temperature_by_sample,
+    )
 
 
 # =============================================================================
@@ -2858,6 +3002,30 @@ def main():
         print("\nCreating carrier PDF...")
         create_carrier_pdf(
             plot_calls_df, depth_df, loci_to_plot, gtf, segdup,
+            args.output_dir,
+            event_marginals_df=event_marginals_df,
+            event_del_df=event_del_df,
+            event_dup_df=event_dup_df,
+            event_values_are_qual=event_values_are_qual,
+            minor_baf_df=minor_baf_df,
+            baf_sites_df=baf_sites_df,
+            padding=args.padding,
+            min_gene_label_spacing=args.min_gene_label_spacing,
+            raw_counts_df=raw_counts_df,
+            gaps=gaps,
+            flank_scale=args.flank_scale,
+            lowres_median_bin_size=lowres_median_bin_size,
+            highres_path=highres_path,
+            viterbi_data=viterbi_data,
+            baf_temperature_by_sample=baf_temperature_by_sample,
+        )
+        print("\nCreating anomalous PDF...")
+        create_anomalous_pdf(
+            plot_calls_df,
+            depth_df,
+            loci_to_plot,
+            gtf,
+            segdup,
             args.output_dir,
             event_marginals_df=event_marginals_df,
             event_del_df=event_del_df,

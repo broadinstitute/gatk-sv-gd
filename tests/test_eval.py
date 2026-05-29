@@ -10,6 +10,8 @@ def test_evaluate_against_truth_uses_call_emitted_carriers(tmp_path):
             "sample": ["S1", "S2", "S3"],
             "is_carrier": [True, False, True],
             "is_best_match": [True, True, True],
+            "is_null_anomalous": [False, True, True],
+            "null_anomaly_score": [0.01, 0.2, 0.3],
             "qual_score": [20.0, 5.0, 20.0],
             "chrom": ["chr1", "chr1", "chr1"],
             "start": [100, 100, 100],
@@ -43,3 +45,4 @@ def test_evaluate_against_truth_uses_call_emitted_carriers(tmp_path):
     assert row["TP_samples"] == "S1"
     assert row["FP_samples"] == "S3"
     assert row["FN_samples"] == "S2"
+    assert row["anomalous_discrepancy_samples"] == "S2,S3"
