@@ -660,7 +660,10 @@ class DepthData:
         self.minor_baf_median = None
         self.baf_variance = None
         self.baf_n_sites = None
+        self.baf_effective_variance = None
+        self.baf_effective_n_sites = None
         self.has_baf = False
+        self.has_baf_effective_count = False
         self.sample_ploidy = None
 
     def attach_baf_summary(self, baf_summary_df: pd.DataFrame, mappings) -> None:
@@ -669,7 +672,9 @@ class DepthData:
         The summary table is expected to contain rows keyed by preprocess
         ``array_idx`` and sample identifier, with columns such as
         ``baf_median``, ``minor_baf_median``, ``baf_variance``, and
-        ``baf_n_sites``.  Only exact sample-id matches are attached.
+        ``baf_n_sites``. Optional occupancy-adjusted columns
+        ``baf_effective_variance`` and ``baf_effective_n_sites`` are
+        attached when present. Only exact sample-id matches are attached.
         """
         if baf_summary_df is None or len(baf_summary_df) == 0:
             return
@@ -688,6 +693,13 @@ class DepthData:
                 "BAF summary is missing required columns for inference: "
                 f"{sorted(missing_columns)}"
             )
+        has_effective_variance = "baf_effective_variance" in baf_summary_df.columns
+        has_effective_n_sites = "baf_effective_n_sites" in baf_summary_df.columns
+        if has_effective_variance != has_effective_n_sites:
+            raise ValueError(
+                "BAF summary must provide both baf_effective_variance and "
+                "baf_effective_n_sites when either effective-count column is present."
+            )
 
         sample_to_idx = {str(sample_id): idx for idx, sample_id in enumerate(self.sample_ids)}
         n_bins = self.n_bins
@@ -697,6 +709,11 @@ class DepthData:
         minor_baf_median = np.full((n_bins, n_samples), np.nan, dtype=np.float32)
         baf_variance = np.full((n_bins, n_samples), np.nan, dtype=np.float32)
         baf_n_sites = np.zeros((n_bins, n_samples), dtype=np.int32)
+        baf_effective_variance = None
+        baf_effective_n_sites = None
+        if has_effective_variance:
+            baf_effective_variance = np.full((n_bins, n_samples), np.nan, dtype=np.float32)
+            baf_effective_n_sites = np.zeros((n_bins, n_samples), dtype=np.int32)
 
         n_attached = 0
         for row in baf_summary_df.itertuples(index=False):
@@ -712,12 +729,31 @@ class DepthData:
             minor_baf_median[bin_idx, sample_idx] = float(row.minor_baf_median)
             baf_variance[bin_idx, sample_idx] = float(row.baf_variance)
             baf_n_sites[bin_idx, sample_idx] = int(row.baf_n_sites)
+            if has_effective_variance:
+                baf_effective_variance[bin_idx, sample_idx] = float(row.baf_effective_variance)
+                baf_effective_n_sites[bin_idx, sample_idx] = int(row.baf_effective_n_sites)
             n_attached += 1
 
         self.baf_median = torch.tensor(baf_median, dtype=self.depth.dtype, device=self.depth.device)
         self.minor_baf_median = torch.tensor(minor_baf_median, dtype=self.depth.dtype, device=self.depth.device)
         self.baf_variance = torch.tensor(baf_variance, dtype=self.depth.dtype, device=self.depth.device)
         self.baf_n_sites = torch.tensor(baf_n_sites, dtype=torch.int32, device=self.depth.device)
+        if has_effective_variance:
+            self.baf_effective_variance = torch.tensor(
+                baf_effective_variance,
+                dtype=self.depth.dtype,
+                device=self.depth.device,
+            )
+            self.baf_effective_n_sites = torch.tensor(
+                baf_effective_n_sites,
+                dtype=torch.int32,
+                device=self.depth.device,
+            )
+            self.has_baf_effective_count = True
+        else:
+            self.baf_effective_variance = None
+            self.baf_effective_n_sites = None
+            self.has_baf_effective_count = False
         self.has_baf = n_attached > 0
 
         print(f"Attached BAF summaries: {n_attached:,} matched bin × sample rows")
@@ -778,6 +814,7 @@ class CNVModel:
         learn_baf_temperature: bool = True,
         baf_temperature_prior_scale: float = 0.5,
         baf_outlier_rate: float = 0.0,
+        use_baf_effective_count: bool = True,
         null_state_prior: float = 1e-4,
         var_bias_bin: float = 0.1,
         var_sample: float = 0.2,
@@ -815,6 +852,9 @@ class CNVModel:
                 noise component. Positive values cap the penalty from
                 contradictory off-model BAF bins without weakening coherent
                 BAF evidence everywhere.
+            use_baf_effective_count: When true, use occupancy-adjusted BAF
+                effective-count summaries when attached to the data object;
+                otherwise fall back to the original raw-site-count path.
             null_state_prior: Prior probability assigned to an outer null
                 state during exact discrete inference. The null state carries
                 no depth or BAF evidence and contributes neutral 1:1 event
@@ -869,6 +909,7 @@ class CNVModel:
         self.learn_baf_temperature = learn_baf_temperature
         self.baf_temperature_prior_scale = baf_temperature_prior_scale
         self.baf_outlier_rate = float(baf_outlier_rate)
+        self.use_baf_effective_count = bool(use_baf_effective_count)
         self.null_state_prior = float(null_state_prior)
         self.var_bias_bin = var_bias_bin
         self.var_sample = var_sample
@@ -999,6 +1040,11 @@ class CNVModel:
 
         # Initialize guide based on type
         self.guide = self._build_guide(guide_type)
+
+    def _select_baf_support(self, data) -> Tuple[torch.Tensor, torch.Tensor]:
+        if getattr(self, "use_baf_effective_count", True) and getattr(data, "has_baf_effective_count", False):
+            return data.baf_effective_variance, data.baf_effective_n_sites
+        return data.baf_variance, data.baf_n_sites
 
     def _build_guide(self, guide_type: str, init_loc_fn=None, model_fn=None, expose_sites=None):
         target_model = self.model if model_fn is None else model_fn
@@ -1494,8 +1540,7 @@ class CNVModel:
             # likelihood. Missing / unsupported bins are masked out.
             if self.baf_temperature > 0 and hasattr(self, "current_data") and getattr(self.current_data, "has_baf", False):
                 baf_obs = self.current_data.minor_baf_median
-                baf_var = self.current_data.baf_variance
-                baf_sites = self.current_data.baf_n_sites
+                baf_var, baf_sites = self._select_baf_support(self.current_data)
 
                 valid_mask = ((torch.isfinite(baf_obs)) &
                               (torch.isfinite(baf_var)) &
@@ -1869,8 +1914,9 @@ class CNVModel:
         # 4b. Optional BAF log-likelihood contribution.
         if getattr(data, "has_baf", False) and baf_temperature > 0:
             minor_baf = data.minor_baf_median.detach().cpu().numpy()
-            baf_var = data.baf_variance.detach().cpu().numpy()
-            baf_sites = data.baf_n_sites.detach().cpu().numpy()
+            baf_var_t, baf_sites_t = self._select_baf_support(data)
+            baf_var = baf_var_t.detach().cpu().numpy()
+            baf_sites = baf_sites_t.detach().cpu().numpy()
 
             valid = ((np.isfinite(minor_baf)) &
                      (np.isfinite(baf_var)) &

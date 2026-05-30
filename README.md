@@ -509,14 +509,14 @@ Routine per-sample, per-bin, and progress-style messages are suppressed.
 | `ploidy_estimates.tsv` | Per-sample, per-contig median depth and rounded ploidy. |
 | `gd_table_filtered.tsv` | GD table restricted to loci that survived preprocessing. Recommended for downstream `call`, `plot`, and `eval`. |
 | `preprocessed_baf.tsv.gz` | Optional BAF records filtered to retained regions. |
-| `preprocessed_baf_summary.tsv.gz` | Optional bin-by-sample BAF summaries used by `infer`. |
+| `preprocessed_baf_summary.tsv.gz` | Optional bin-by-sample BAF summaries used by `infer`, including occupancy-adjusted `baf_effective_n_sites` / `baf_effective_variance` when ploidy context is available. |
 | `preprocess_log.txt` | Command and diagnostic log. |
 
 ### `infer` Outputs
 
 | File | Description |
 | --- | --- |
-| `cn_posteriors.tsv.gz` | One row per bin/sample with depth, total-CN posterior columns such as `prob_cn_0`, pair-state posterior columns such as `prob_pair_0_1`, MAP state columns, and optional BAF summaries. |
+| `cn_posteriors.tsv.gz` | One row per bin/sample with depth, total-CN posterior columns such as `prob_cn_0`, pair-state posterior columns such as `prob_pair_0_1`, MAP state columns, and optional raw plus occupancy-adjusted BAF summaries. |
 | `sample_posteriors.tsv.gz` | Sample-level MAP parameters including `sample_var_map`, shared `length_scale_var_map`, and BAF temperature/variance scale when present. |
 | `bin_posteriors.tsv.gz` | Bin-level MAP bias, compatibility `bin_var_map` values (currently zero under the spatial model), total-CN priors, and pair-state priors. |
 | `normalization_metadata.tsv` | Copy of the normalization metadata used to anchor the depth variance model. Written in both direct-input and preprocessed modes. |

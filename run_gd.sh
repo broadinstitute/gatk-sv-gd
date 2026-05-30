@@ -234,79 +234,79 @@ EVAL_REPORT="${EVAL_DIR}/truth_evaluation_report.tsv"
 mkdir -p "${WORK_DIR}"
 
 # ── Step 1: preprocess ─────────────────────────────────────────────────────
-# log "[1/5] preprocess"
-# rm -rf "${PREPROCESS_DIR}"
-# PREPROCESS_CMD=(
-#     "${GD_CMD[@]}"
-#     preprocess
-#     -i "${INPUT_DEPTH}" \
-#     -g "${GD_TABLE}" \
-#     -o "${PREPROCESS_DIR}" \
-#     --verbose \
-# )
+log "[1/5] preprocess"
+rm -rf "${PREPROCESS_DIR}"
+PREPROCESS_CMD=(
+    "${GD_CMD[@]}"
+    preprocess
+    -i "${INPUT_DEPTH}" \
+    -g "${GD_TABLE}" \
+    -o "${PREPROCESS_DIR}" \
+    --verbose \
+)
 
-# if [[ -n "${HIGH_RESOLUTION_DEPTH}" ]]; then
-#     PREPROCESS_CMD+=(--high-res-counts "${HIGH_RESOLUTION_DEPTH}")
-# fi
+if [[ -n "${HIGH_RESOLUTION_DEPTH}" ]]; then
+    PREPROCESS_CMD+=(--high-res-counts "${HIGH_RESOLUTION_DEPTH}")
+fi
 
-# if [[ -n "${BAF_TABLE}" ]]; then
-#     PREPROCESS_CMD+=(--baf-table "${BAF_TABLE}")
-# fi
+if [[ -n "${BAF_TABLE}" ]]; then
+    PREPROCESS_CMD+=(--baf-table "${BAF_TABLE}")
+fi
 
-# if [[ -n "${SEG_DUP_BED}" ]]; then
-#     PREPROCESS_CMD+=(-e "${SEG_DUP_BED}")
-# fi
+if [[ -n "${SEG_DUP_BED}" ]]; then
+    PREPROCESS_CMD+=(-e "${SEG_DUP_BED}")
+fi
 
-# if [[ -n "${CENTROMERE_BED}" ]]; then
-#     PREPROCESS_CMD+=(-e "${CENTROMERE_BED}")
-# fi
+if [[ -n "${CENTROMERE_BED}" ]]; then
+    PREPROCESS_CMD+=(-e "${CENTROMERE_BED}")
+fi
 
-# if [[ -n "${ACROCENTRIC_ARM_BED}" ]]; then
-#     PREPROCESS_CMD+=(-e "${ACROCENTRIC_ARM_BED}")
-# fi
+if [[ -n "${ACROCENTRIC_ARM_BED}" ]]; then
+    PREPROCESS_CMD+=(-e "${ACROCENTRIC_ARM_BED}")
+fi
 
-# if [[ -n "${CUSTOM_MASK_BED}" ]]; then
-#     PREPROCESS_CMD+=(-e "${CUSTOM_MASK_BED}")
-# fi
+if [[ -n "${CUSTOM_MASK_BED}" ]]; then
+    PREPROCESS_CMD+=(-e "${CUSTOM_MASK_BED}")
+fi
 
-# if [[ ${#HARD_INCLUSION_INTERVALS[@]} -gt 0 ]]; then
-#     PREPROCESS_CMD+=(--hard-inclusion-intervals "${HARD_INCLUSION_INTERVALS[@]}")
-# fi
+if [[ ${#HARD_INCLUSION_INTERVALS[@]} -gt 0 ]]; then
+    PREPROCESS_CMD+=(--hard-inclusion-intervals "${HARD_INCLUSION_INTERVALS[@]}")
+fi
 
-# if [[ -n "${PAR_BED}" ]]; then
-#     PREPROCESS_CMD+=(--par-intervals "${PAR_BED}")
-# fi
+if [[ -n "${PAR_BED}" ]]; then
+    PREPROCESS_CMD+=(--par-intervals "${PAR_BED}")
+fi
 
-# if [[ ${#FLANK_EXCLUSION_INTERVALS[@]} -gt 0 ]]; then
-#     PREPROCESS_CMD+=(--flank-exclusion-intervals "${FLANK_EXCLUSION_INTERVALS[@]}")
-# fi
+if [[ ${#FLANK_EXCLUSION_INTERVALS[@]} -gt 0 ]]; then
+    PREPROCESS_CMD+=(--flank-exclusion-intervals "${FLANK_EXCLUSION_INTERVALS[@]}")
+fi
 
-# if [[ -n "${PREPROCESS_ARGS}" ]]; then
-#     # shellcheck disable=SC2206
-#     PREPROCESS_EXTRA=( ${PREPROCESS_ARGS} )
-#     PREPROCESS_CMD+=("${PREPROCESS_EXTRA[@]}")
-# fi
+if [[ -n "${PREPROCESS_ARGS}" ]]; then
+    # shellcheck disable=SC2206
+    PREPROCESS_EXTRA=( ${PREPROCESS_ARGS} )
+    PREPROCESS_CMD+=("${PREPROCESS_EXTRA[@]}")
+fi
 
-# "${PREPROCESS_CMD[@]}"
+"${PREPROCESS_CMD[@]}"
 
-# # ── Step 2: infer ──────────────────────────────────────────────────────────
-# log "[2/5] infer"
-# rm -rf "${INFER_DIR}"
-# INFER_CMD=(
-#     "${GD_CMD[@]}"
-#     infer
-#     --preprocessed-dir "${PREPROCESS_DIR}" \
-#     -o "${INFER_DIR}" \
-#     --verbose \
-# )
+# ── Step 2: infer ──────────────────────────────────────────────────────────
+log "[2/5] infer"
+rm -rf "${INFER_DIR}"
+INFER_CMD=(
+    "${GD_CMD[@]}"
+    infer
+    --preprocessed-dir "${PREPROCESS_DIR}" \
+    -o "${INFER_DIR}" \
+    --verbose \
+)
 
-# if [[ -n "${INFER_ARGS}" ]]; then
-#     # shellcheck disable=SC2206
-#     INFER_EXTRA=( ${INFER_ARGS} )
-#     INFER_CMD+=("${INFER_EXTRA[@]}")
-# fi
+if [[ -n "${INFER_ARGS}" ]]; then
+    # shellcheck disable=SC2206
+    INFER_EXTRA=( ${INFER_ARGS} )
+    INFER_CMD+=("${INFER_EXTRA[@]}")
+fi
 
-# "${INFER_CMD[@]}"
+"${INFER_CMD[@]}"
 
 # ── Step 3: call ───────────────────────────────────────────────────────────
 log "[3/5] call"

@@ -252,6 +252,7 @@ def run_gd_analysis(
         learn_baf_temperature=not args.fixed_baf_temperature and args.baf_temperature > 0,
         baf_temperature_prior_scale=args.baf_temperature_prior_scale,
         baf_outlier_rate=args.baf_outlier_rate,
+        use_baf_effective_count=args.use_baf_effective_count,
         var_bias_bin=args.var_bias_bin,
         var_sample=args.var_sample,
         var_bin=args.var_bin,
@@ -506,6 +507,14 @@ def parse_args():
         help="Mixture weight for a uniform minor-allele BAF noise component. "
              "Positive values cap the penalty from contradictory off-model "
              "BAF bins; 0 disables the noise component.",
+    )
+    parser.add_argument(
+        "--disable-baf-effective-count",
+        dest="use_baf_effective_count",
+        action="store_false",
+        default=True,
+        help="Use the original raw BAF site-count variance path even when "
+             "occupancy-adjusted effective-count summaries are available.",
     )
     parser.add_argument(
         "--null-state-prior",

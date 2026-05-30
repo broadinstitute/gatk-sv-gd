@@ -36,6 +36,10 @@ from gatk_sv_gd.highres import normalize_highres_bins, query_highres_bins
 from gatk_sv_gd.output import build_ploidy_map, estimate_ploidy, write_locus_metadata
 
 
+_BAF_EFFECTIVE_WINDOW_BP = 10_000
+_BAF_EFFECTIVE_WINDOW_PSEUDOCOUNT = 0.5
+
+
 # ── Region parsing helpers ───────────────────────────────────────────
 
 
@@ -1250,6 +1254,7 @@ def write_preprocessed_baf(
     baf_path: str,
     mappings: List[LocusBinMapping],
     output_dir: str,
+    ploidy_map: Optional[Dict[Tuple[str, str], int]] = None,
 ) -> str:
     """Filter a genome-wide BAF table down to preprocessed GD regions.
 
@@ -1303,6 +1308,38 @@ def write_preprocessed_baf(
         )
 
     baf_values_by_bin_sample: Dict[Tuple[int, str], List[float]] = defaultdict(list)
+    occupied_windows_by_bin_sample: Dict[Tuple[int, str], set] = defaultdict(set)
+    diploid_window_counts_by_bin: Dict[int, np.ndarray] = {}
+
+    def _window_count_for_mapping(mapping: LocusBinMapping) -> int:
+        return max(1, (int(mapping.end) - int(mapping.start) + _BAF_EFFECTIVE_WINDOW_BP - 1) // _BAF_EFFECTIVE_WINDOW_BP)
+
+    def _window_index_for_position(mapping: LocusBinMapping, pos: int) -> int:
+        n_windows = _window_count_for_mapping(mapping)
+        window_idx = (int(pos) - int(mapping.start)) // _BAF_EFFECTIVE_WINDOW_BP
+        return min(max(int(window_idx), 0), n_windows - 1)
+
+    def _expected_occupied_windows_from_weights(window_weights: np.ndarray, max_sites: int) -> np.ndarray:
+        expected = np.zeros(int(max_sites) + 1, dtype=np.float64)
+        if max_sites <= 0:
+            return expected
+        retained_empty_prob = np.ones_like(window_weights, dtype=np.float64)
+        window_decay = 1.0 - np.asarray(window_weights, dtype=np.float64)
+        for site_count in range(1, int(max_sites) + 1):
+            retained_empty_prob *= window_decay
+            expected[site_count] = float(window_weights.size - retained_empty_prob.sum())
+        return expected
+
+    def _infer_effective_site_count(
+        expected_occupied_windows: np.ndarray,
+        occupied_window_count: int,
+        raw_site_count: int,
+    ) -> int:
+        if raw_site_count <= 0:
+            return 0
+        max_supported = min(int(raw_site_count), int(expected_occupied_windows.size) - 1)
+        target_occupied = min(float(occupied_window_count), float(expected_occupied_windows[max_supported]))
+        return int(np.searchsorted(expected_occupied_windows[: max_supported + 1], target_occupied, side="left"))
 
     with gzip.open(output_path, "wt") as out_handle:
         out_handle.write("Chr\tPos\tBAF\tSample\n")
@@ -1322,7 +1359,24 @@ def write_preprocessed_baf(
             if tree is None:
                 continue
             for hit in tree.at(pos):
-                baf_values_by_bin_sample[(int(hit.data), sample_id)].append(baf)
+                array_idx = int(hit.data)
+                key = (array_idx, sample_id)
+                baf_values_by_bin_sample[key].append(baf)
+
+                mapping = mapping_by_idx.get(array_idx)
+                if mapping is None:
+                    continue
+
+                window_idx = _window_index_for_position(mapping, pos)
+                occupied_windows_by_bin_sample[key].add(window_idx)
+
+                sample_ploidy = None if ploidy_map is None else ploidy_map.get((str(sample_id), mapping.chrom))
+                if sample_ploidy == 2:
+                    window_counts = diploid_window_counts_by_bin.get(array_idx)
+                    if window_counts is None:
+                        window_counts = np.zeros(_window_count_for_mapping(mapping), dtype=np.float64)
+                        diploid_window_counts_by_bin[array_idx] = window_counts
+                    window_counts[window_idx] += 1.0
 
     summary_rows: List[dict] = []
     summary_columns = [
@@ -1338,6 +1392,8 @@ def write_preprocessed_baf(
         "baf_variance",
         "baf_empirical_var",
         "baf_n_sites",
+        "baf_effective_variance",
+        "baf_effective_n_sites",
     ]
     prior_site_var = 0.01
     for (array_idx, sample_id), baf_values in baf_values_by_bin_sample.items():
@@ -1361,6 +1417,24 @@ def write_preprocessed_baf(
             ) / n_sites
         median_variance = float((np.pi / (2.0 * n_sites)) * shrunken_site_var)
 
+        effective_n_sites = n_sites
+        reference_window_counts = diploid_window_counts_by_bin.get(array_idx)
+        if reference_window_counts is not None and float(reference_window_counts.sum()) > 0.0:
+            occupied_window_count = len(occupied_windows_by_bin_sample.get((array_idx, sample_id), set()))
+            reference_weights = (reference_window_counts + _BAF_EFFECTIVE_WINDOW_PSEUDOCOUNT) / (
+                float(reference_window_counts.sum()) +
+                (_BAF_EFFECTIVE_WINDOW_PSEUDOCOUNT * reference_window_counts.size)
+            )
+            expected_occupied_windows = _expected_occupied_windows_from_weights(reference_weights, n_sites)
+            inferred_effective_n_sites = _infer_effective_site_count(
+                expected_occupied_windows,
+                occupied_window_count,
+                n_sites,
+            )
+            if inferred_effective_n_sites > 0:
+                effective_n_sites = inferred_effective_n_sites
+        effective_variance = float(median_variance * (n_sites / effective_n_sites)) if effective_n_sites > 0 else float("nan")
+
         summary_rows.append({
             "cluster": mapping.cluster,
             "interval": mapping.interval_name,
@@ -1374,6 +1448,8 @@ def write_preprocessed_baf(
             "baf_variance": median_variance,
             "baf_empirical_var": empirical_var,
             "baf_n_sites": n_sites,
+            "baf_effective_variance": effective_variance,
+            "baf_effective_n_sites": int(effective_n_sites),
         })
 
     summary_df = pd.DataFrame(summary_rows, columns=summary_columns)
@@ -1750,6 +1826,7 @@ def main():
             args.baf_table,
             mappings,
             args.output_dir,
+            ploidy_map=ploidy_map,
         )
 
     # Write a filtered GD table containing only the loci that survived

@@ -213,7 +213,96 @@ def test_write_preprocessed_baf_excludes_constant_samples(tmp_path, monkeypatch)
     assert set(filtered_baf_df["Sample"]) == {"good_sample"}
     assert set(summary_df["sample"]) == {"good_sample"}
     assert summary_df["baf_n_sites"].tolist() == [2]
+    assert summary_df["baf_effective_n_sites"].tolist() == [2]
     assert summary_df["minor_baf_median"].tolist() == pytest.approx([0.25])
+    assert summary_df["baf_effective_variance"].tolist() == pytest.approx(
+        summary_df["baf_variance"].tolist()
+    )
+
+
+def test_write_preprocessed_baf_computes_effective_site_counts_from_diploid_reference(tmp_path, monkeypatch):
+    class FakeHit:
+        def __init__(self, data):
+            self.data = data
+
+    class FakeIntervalTree:
+        def __init__(self):
+            self._intervals = []
+
+        def addi(self, start, end, data):
+            self._intervals.append((start, end, data))
+
+        def at(self, pos):
+            return [
+                FakeHit(data)
+                for start, end, data in self._intervals
+                if start <= pos < end
+            ]
+
+    class FakeTabixFile:
+        def __init__(self, path):
+            self.path = path
+
+        def fetch(self, chrom, start, end):
+            if (chrom, start, end) != ("chrX", 0, 30000):
+                return iter(())
+            return iter([
+                "chrX\t1000\t0.25\tdip_a",
+                "chrX\t11000\t0.75\tdip_a",
+                "chrX\t21000\t0.30\tdip_a",
+                "chrX\t1500\t0.20\tdip_b",
+                "chrX\t11500\t0.80\tdip_b",
+                "chrX\t21500\t0.35\tdip_b",
+                "chrX\t1000\t0.40\thap_x",
+                "chrX\t1200\t0.45\thap_x",
+                "chrX\t1400\t0.60\thap_x",
+            ])
+
+        def close(self):
+            return None
+
+    monkeypatch.setattr(preprocess_module, "IntervalTree", FakeIntervalTree)
+    monkeypatch.setattr(preprocess_module.pysam, "TabixFile", FakeTabixFile)
+
+    baf_path = tmp_path / "input_baf.tsv"
+    baf_path.write_text("chrX\t1000\t0.25\tdip_a\n")
+
+    mappings = [
+        preprocess_module.LocusBinMapping(
+            cluster="cluster_x",
+            locus=None,
+            interval_name="body",
+            array_idx=0,
+            chrom="chrX",
+            start=0,
+            end=30000,
+        )
+    ]
+
+    preprocess_module.write_preprocessed_baf(
+        str(baf_path),
+        mappings,
+        str(tmp_path),
+        ploidy_map={
+            ("dip_a", "chrX"): 2,
+            ("dip_b", "chrX"): 2,
+            ("hap_x", "chrX"): 1,
+        },
+    )
+
+    summary_df = pd.read_csv(
+        tmp_path / "preprocessed_baf_summary.tsv.gz",
+        sep="\t",
+        compression="gzip",
+    ).set_index("sample")
+
+    assert summary_df.loc["dip_a", "baf_n_sites"] == 3
+    assert summary_df.loc["dip_a", "baf_effective_n_sites"] == 3
+    assert summary_df.loc["dip_b", "baf_n_sites"] == 3
+    assert summary_df.loc["dip_b", "baf_effective_n_sites"] == 3
+    assert summary_df.loc["hap_x", "baf_n_sites"] == 3
+    assert summary_df.loc["hap_x", "baf_effective_n_sites"] == 1
+    assert summary_df.loc["hap_x", "baf_effective_variance"] > summary_df.loc["hap_x", "baf_variance"]
 
 
 def test_write_and_load_normalization_metadata_round_trip(tmp_path):

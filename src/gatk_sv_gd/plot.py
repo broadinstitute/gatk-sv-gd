@@ -91,6 +91,7 @@ PLOT_TIMING_ENABLED = os.getenv("GATK_SV_GD_PLOT_TIMING", "").strip().lower() in
 }
 
 PDF_MAX_SIGNAL_BINS = 300
+BAF_95_CI_Z_SCORE = 1.959963984540054
 
 
 def _print_timing(label: str, start_time: float) -> None:
@@ -266,6 +267,22 @@ def _compute_raw_sample_medians(
     return raw_sample_medians
 
 
+def _select_baf_plot_support_columns(
+    cn_posteriors_df: pd.DataFrame,
+) -> Tuple[Optional[str], Optional[str]]:
+    """Return the variance/count columns to use for BAF plot intervals."""
+    if {
+        "baf_effective_variance",
+        "baf_effective_n_sites",
+    }.issubset(cn_posteriors_df.columns):
+        return "baf_effective_variance", "baf_effective_n_sites"
+    if {"baf_variance", "baf_n_sites"}.issubset(cn_posteriors_df.columns):
+        return "baf_variance", "baf_n_sites"
+    if "baf_n_sites" in cn_posteriors_df.columns:
+        return None, "baf_n_sites"
+    return None, None
+
+
 def _parse_eval_sample_list(value: object) -> List[str]:
     """Parse a comma-delimited eval report sample field into sample IDs."""
     if pd.isna(value):
@@ -415,6 +432,7 @@ def _create_review_category_pdf(
     event_del_df: Optional[pd.DataFrame],
     event_dup_df: Optional[pd.DataFrame],
     minor_baf_df: Optional[pd.DataFrame],
+    baf_variance_df: Optional[pd.DataFrame],
     baf_sites_df: Optional[pd.DataFrame],
     gaps: Optional[GapsAnnotation],
     raw_counts_df: Optional[pd.DataFrame],
@@ -465,30 +483,20 @@ def _create_review_category_pdf(
             _print_timing(f"{cluster} {category_name} region slice", stage_start)
 
             baf_region_df = None
+            baf_variance_region_df = None
             baf_sites_region_df = None
             event_del_region_df = None
             event_dup_region_df = None
             if minor_baf_df is not None:
                 baf_region_df = minor_baf_df[locus_mask].sort_values("Start")
+            if baf_variance_df is not None:
+                baf_variance_region_df = baf_variance_df[locus_mask].sort_values("Start")
             if baf_sites_df is not None:
                 baf_sites_region_df = baf_sites_df[locus_mask].sort_values("Start")
             if event_del_df is not None:
                 event_del_region_df = event_del_df[locus_mask].sort_values("Start")
             if event_dup_df is not None:
                 event_dup_region_df = event_dup_df[locus_mask].sort_values("Start")
-            if len(region_df) > PDF_MAX_SIGNAL_BINS:
-                region_df, rebinned_frames = _rebin_aligned_region_dfs_for_display(
-                    locus,
-                    region_df,
-                    [baf_region_df, baf_sites_region_df, event_del_region_df, event_dup_region_df],
-                    max_total_bins=PDF_MAX_SIGNAL_BINS,
-                )
-                (
-                    baf_region_df,
-                    baf_sites_region_df,
-                    event_del_region_df,
-                    event_dup_region_df,
-                ) = rebinned_frames
 
             region_start = int(region_df["Start"].min())
             region_end = int(region_df["End"].max())
@@ -545,6 +553,7 @@ def _create_review_category_pdf(
                     xform,
                     raw_region_df,
                     baf_region_df,
+                    baf_variance_region_df,
                     baf_sites_region_df,
                     event_del_region_df,
                     event_dup_region_df,
@@ -579,6 +588,7 @@ def _render_pdf_sample_page(
     xform: FlankCompressor,
     raw_region_df: Optional[pd.DataFrame],
     minor_baf_region_df: Optional[pd.DataFrame],
+    baf_variance_region_df: Optional[pd.DataFrame],
     baf_sites_region_df: Optional[pd.DataFrame],
     event_del_region_df: Optional[pd.DataFrame],
     event_dup_region_df: Optional[pd.DataFrame],
@@ -620,9 +630,10 @@ def _render_pdf_sample_page(
     )
 
     sample_depth = region_df[sample_id].values
-    sample_minor_baf, sample_baf_sites = _extract_sample_baf_vectors(
+    sample_minor_baf, sample_baf_variance, sample_baf_sites = _extract_sample_baf_vectors(
         region_df,
         minor_baf_region_df,
+        baf_variance_region_df,
         baf_sites_region_df,
         sample_id,
     )
@@ -667,6 +678,7 @@ def _render_pdf_sample_page(
             plot_region_df,
             plot_sample_depth,
             plot_sample_minor_baf,
+            plot_sample_baf_variance,
             plot_sample_baf_sites,
             plot_event_probs,
         ) = _coarsen_pdf_page_signals(
@@ -674,10 +686,13 @@ def _render_pdf_sample_page(
             region_df,
             sample_depth,
             sample_minor_baf,
+            sample_baf_variance,
             sample_baf_sites,
             event_probs,
             max_total_bins=PDF_MAX_SIGNAL_BINS,
         )
+    else:
+        plot_sample_baf_variance = sample_baf_variance
 
     plot_bin_mids = (plot_region_df["Start"].values + plot_region_df["End"].values) / 2
     d_bin_mids = xform(plot_bin_mids)
@@ -801,6 +816,7 @@ def _render_pdf_sample_page(
         chrom,
         baf_temperature=sample_baf_temperature,
         show_xlabel=False,
+        baf_variances=plot_sample_baf_variance,
     )
     _print_timing(f"{cluster} {sample_id} pdf baf panel", stage_start)
 
@@ -1117,14 +1133,64 @@ def _aligned_region_sample_vector(
 def _extract_sample_baf_vectors(
     region_df: pd.DataFrame,
     minor_baf_df: Optional[pd.DataFrame],
+    baf_variance_df: Optional[pd.DataFrame],
     baf_sites_df: Optional[pd.DataFrame],
     sample_id: str,
-) -> Tuple[Optional[np.ndarray], Optional[np.ndarray]]:
+) -> Tuple[Optional[np.ndarray], Optional[np.ndarray], Optional[np.ndarray]]:
     """Align per-bin BAF summaries to a region/sample depth slice."""
     return (
         _aligned_region_sample_vector(region_df, minor_baf_df, sample_id),
+        _aligned_region_sample_vector(region_df, baf_variance_df, sample_id),
         _aligned_region_sample_vector(region_df, baf_sites_df, sample_id),
     )
+
+
+def _approximate_minor_baf_variance(
+    minor_baf_values: np.ndarray,
+    baf_site_counts: np.ndarray,
+) -> np.ndarray:
+    """Approximate the variance of the minor-BAF median when none is saved."""
+    clipped_minor_baf = np.clip(np.asarray(minor_baf_values, dtype=float), 0.0, 0.5)
+    site_counts = np.asarray(baf_site_counts, dtype=float)
+    estimated_site_variance = clipped_minor_baf * (1.0 - clipped_minor_baf)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        return (np.pi / (2.0 * site_counts)) * estimated_site_variance
+
+
+def _compute_minor_baf_confidence_intervals(
+    minor_baf_values: np.ndarray,
+    baf_site_counts: np.ndarray,
+    baf_variances: Optional[np.ndarray],
+) -> Tuple[np.ndarray, np.ndarray]:
+    """Return clipped 95% confidence intervals for minor-BAF means."""
+    clipped_minor_baf = np.clip(np.asarray(minor_baf_values, dtype=float), 0.0, 0.5)
+    site_counts = np.asarray(baf_site_counts, dtype=float)
+    variances = np.full(clipped_minor_baf.shape, np.nan, dtype=float)
+    if baf_variances is not None:
+        variances = np.asarray(baf_variances, dtype=float).copy()
+
+    fallback_mask = (
+        np.isfinite(clipped_minor_baf)
+        & np.isfinite(site_counts)
+        & (site_counts > 0)
+        & ~np.isfinite(variances)
+    )
+    if np.any(fallback_mask):
+        variances[fallback_mask] = _approximate_minor_baf_variance(
+            clipped_minor_baf[fallback_mask],
+            site_counts[fallback_mask],
+        )
+
+    variances = np.where(np.isfinite(variances), np.maximum(variances, 0.0), np.nan)
+    stderr = np.sqrt(variances)
+    lower = np.clip(clipped_minor_baf - (BAF_95_CI_Z_SCORE * stderr), 0.0, 0.5)
+    upper = np.clip(clipped_minor_baf + (BAF_95_CI_Z_SCORE * stderr), 0.0, 0.5)
+    return lower, upper
+
+
+def _minor_baf_reference_levels() -> np.ndarray:
+    """Return fixed dotted guide levels for the minor-BAF panel."""
+    return np.arange(0.1, 0.51, 0.1, dtype=float)
 
 
 def _plot_baf_signal_panel(
@@ -1139,12 +1205,13 @@ def _plot_baf_signal_panel(
     baf_temperature: Optional[float] = None,
     show_xlabel: bool = True,
     rasterized: bool = False,
+    baf_variances: Optional[np.ndarray] = None,
 ) -> None:
     """Render the modeled per-bin minor-BAF signal for one sample."""
     ax.set_xlim(0.0, xform.d_end)
-    ax.set_ylim(0.0, 1.0)
+    ax.set_ylim(0.0, 0.5)
 
-    for y_value in (1.0 / 3.0, 0.5, 2.0 / 3.0):
+    for y_value in _minor_baf_reference_levels():
         ax.axhline(y_value, color="gray", linestyle=":", linewidth=0.8, alpha=0.25, zorder=0)
 
     if minor_baf_values is None or baf_site_counts is None:
@@ -1166,6 +1233,8 @@ def _plot_baf_signal_panel(
 
     minor_baf_values = np.asarray(minor_baf_values, dtype=float)
     baf_site_counts = np.asarray(baf_site_counts)
+    if baf_variances is not None:
+        baf_variances = np.asarray(baf_variances, dtype=float)
     bar_widths = np.asarray(bar_widths, dtype=float) * 0.85
     valid_baf = np.logical_and.reduce([
         np.isfinite(minor_baf_values),
@@ -1184,18 +1253,25 @@ def _plot_baf_signal_panel(
             zorder=1,
             rasterized=rasterized,
         )
-        baf_stems = ax.vlines(
-            x_positions[valid_baf],
-            0.0,
-            clipped_minor_baf,
-            colors="#7B61A8",
-            linewidth=0.7,
-            alpha=0.5,
-            zorder=1.5,
-            rasterized=rasterized,
+        ci_lower, ci_upper = _compute_minor_baf_confidence_intervals(
+            minor_baf_values[valid_baf],
+            baf_site_counts[valid_baf],
+            None if baf_variances is None else baf_variances[valid_baf],
         )
-        if hasattr(baf_stems, "set_capstyle"):
-            baf_stems.set_capstyle("round")
+        valid_ci = np.isfinite(ci_lower) & np.isfinite(ci_upper)
+        if np.any(valid_ci):
+            baf_intervals = ax.vlines(
+                x_positions[valid_baf][valid_ci],
+                ci_lower[valid_ci],
+                ci_upper[valid_ci],
+                colors="#7B61A8",
+                linewidth=0.9,
+                alpha=0.6,
+                zorder=1.5,
+                rasterized=rasterized,
+            )
+            if hasattr(baf_intervals, "set_capstyle"):
+                baf_intervals.set_capstyle("round")
         ax.scatter(
             x_positions[valid_baf],
             clipped_minor_baf,
@@ -1289,7 +1365,7 @@ def _plot_event_marginal_panel(
         called_event_mask = np.asarray(called_event_mask, dtype=bool)
         if called_event_mask.shape != event_probabilities.shape:
             raise ValueError("called_event_mask must align with event_probabilities")
-        y_label = f"QUAL({svtype} site state)"
+        y_label = f"QUAL({svtype})"
     valid = np.isfinite(event_probabilities)
     color = "#C23B22" if svtype == "DEL" else "#2A6FBB"
 
@@ -1742,13 +1818,28 @@ def _coarsen_pdf_page_signals(
     region_df: pd.DataFrame,
     sample_depth: np.ndarray,
     minor_baf_values: Optional[np.ndarray],
+    baf_variances: Optional[np.ndarray],
     baf_site_counts: Optional[np.ndarray],
     event_probabilities: Optional[np.ndarray],
     max_total_bins: int = PDF_MAX_SIGNAL_BINS,
-) -> Tuple[pd.DataFrame, np.ndarray, Optional[np.ndarray], Optional[np.ndarray], Optional[np.ndarray]]:
+) -> Tuple[
+    pd.DataFrame,
+    np.ndarray,
+    Optional[np.ndarray],
+    Optional[np.ndarray],
+    Optional[np.ndarray],
+    Optional[np.ndarray],
+]:
     """Coarsen one PDF page's sample-specific signal arrays for display only."""
     if len(region_df) <= max_total_bins:
-        return region_df, sample_depth, minor_baf_values, baf_site_counts, event_probabilities
+        return (
+            region_df,
+            sample_depth,
+            minor_baf_values,
+            baf_variances,
+            baf_site_counts,
+            event_probabilities,
+        )
 
     starts = region_df["Start"].to_numpy(dtype=int)
     ends = region_df["End"].to_numpy(dtype=int)
@@ -1763,12 +1854,14 @@ def _coarsen_pdf_page_signals(
 
     sample_depth = np.asarray(sample_depth, dtype=float)
     minor_baf_arr = None if minor_baf_values is None else np.asarray(minor_baf_values, dtype=float)
+    baf_var_arr = None if baf_variances is None else np.asarray(baf_variances, dtype=float)
     baf_sites_arr = None if baf_site_counts is None else np.asarray(baf_site_counts)
     event_probs_arr = None if event_probabilities is None else np.asarray(event_probabilities, dtype=float)
 
     rebinned_rows: List[dict] = []
     rebinned_depth: List[float] = []
     rebinned_minor_baf: List[float] = [] if minor_baf_arr is not None else None
+    rebinned_baf_variance: List[float] = [] if baf_var_arr is not None else None
     rebinned_baf_sites: List[float] = [] if baf_sites_arr is not None else None
     rebinned_event_probs: List[float] = [] if event_probs_arr is not None else None
 
@@ -1786,6 +1879,8 @@ def _coarsen_pdf_page_signals(
                 rebinned_depth.append(float(sample_depth[index]))
                 if rebinned_minor_baf is not None:
                     rebinned_minor_baf.append(float(minor_baf_arr[index]))
+                if rebinned_baf_variance is not None:
+                    rebinned_baf_variance.append(float(baf_var_arr[index]))
                 if rebinned_baf_sites is not None:
                     rebinned_baf_sites.append(float(baf_sites_arr[index]))
                 if rebinned_event_probs is not None:
@@ -1807,23 +1902,44 @@ def _coarsen_pdf_page_signals(
                 if key in ("Cluster", "Chr", "Start", "End")
             })
             rebinned_depth.append(float(np.nanmean(sample_depth[group_indices])))
+            group_sites = None if baf_sites_arr is None else np.asarray(baf_sites_arr[group_indices], dtype=float)
             if rebinned_minor_baf is not None:
-                group_sites = baf_sites_arr[group_indices] if baf_sites_arr is not None else None
-                valid_minor = np.isfinite(minor_baf_arr[group_indices])
+                group_minor = minor_baf_arr[group_indices]
+                valid_minor = np.isfinite(group_minor)
                 if group_sites is not None:
                     valid_minor &= np.isfinite(group_sites) & (group_sites > 0)
                 if np.any(valid_minor):
                     if group_sites is not None:
-                        weights = group_sites[group_indices * 0 + valid_minor] if False else group_sites[valid_minor]
-                        values = minor_baf_arr[group_indices][valid_minor]
+                        weights = group_sites[valid_minor]
+                        values = group_minor[valid_minor]
                         weight_sum = float(np.sum(weights))
                         rebinned_minor_baf.append(float(np.sum(values * weights) / weight_sum) if weight_sum > 0 else float(np.nanmean(values)))
                     else:
-                        rebinned_minor_baf.append(float(np.nanmean(minor_baf_arr[group_indices][valid_minor])))
+                        rebinned_minor_baf.append(float(np.nanmean(group_minor[valid_minor])))
                 else:
                     rebinned_minor_baf.append(np.nan)
+            if rebinned_baf_variance is not None:
+                group_variance = baf_var_arr[group_indices]
+                valid_var = np.isfinite(group_variance)
+                if group_sites is not None:
+                    valid_var &= np.isfinite(group_sites) & (group_sites > 0)
+                if np.any(valid_var):
+                    if group_sites is not None:
+                        variance_weights = group_sites[valid_var]
+                    else:
+                        variance_weights = np.ones(int(valid_var.sum()), dtype=float)
+                    variance_weight_sum = float(np.sum(variance_weights))
+                    if variance_weight_sum > 0:
+                        normalized_weights = variance_weights / variance_weight_sum
+                        rebinned_baf_variance.append(
+                            float(np.sum((normalized_weights ** 2) * group_variance[valid_var]))
+                        )
+                    else:
+                        rebinned_baf_variance.append(float(np.nanmean(group_variance[valid_var])))
+                else:
+                    rebinned_baf_variance.append(np.nan)
             if rebinned_baf_sites is not None:
-                valid_sites = baf_sites_arr[group_indices]
+                valid_sites = group_sites
                 rebinned_baf_sites.append(float(np.nansum(valid_sites[np.isfinite(valid_sites)])))
             if rebinned_event_probs is not None:
                 valid_event = event_probs_arr[group_indices]
@@ -1834,6 +1950,7 @@ def _coarsen_pdf_page_signals(
         plot_region_df,
         np.asarray(rebinned_depth, dtype=float),
         None if rebinned_minor_baf is None else np.asarray(rebinned_minor_baf, dtype=float),
+        None if rebinned_baf_variance is None else np.asarray(rebinned_baf_variance, dtype=float),
         None if rebinned_baf_sites is None else np.asarray(rebinned_baf_sites, dtype=float),
         None if rebinned_event_probs is None else np.asarray(rebinned_event_probs, dtype=float),
     )
@@ -2257,6 +2374,7 @@ def create_carrier_pdf(
     event_dup_df: Optional[pd.DataFrame] = None,
     event_values_are_qual: bool = False,
     minor_baf_df: Optional[pd.DataFrame] = None,
+    baf_variance_df: Optional[pd.DataFrame] = None,
     baf_sites_df: Optional[pd.DataFrame] = None,
     padding: int = 50000,
     min_gene_label_spacing: float = 0.05,
@@ -2310,11 +2428,14 @@ def create_carrier_pdf(
             )
             region_df = depth_df[locus_mask].sort_values("Start")
             baf_region_df = None
+            baf_variance_region_df = None
             baf_sites_region_df = None
             event_del_region_df = None
             event_dup_region_df = None
             if minor_baf_df is not None:
                 baf_region_df = minor_baf_df[locus_mask].sort_values("Start")
+            if baf_variance_df is not None:
+                baf_variance_region_df = baf_variance_df[locus_mask].sort_values("Start")
             if baf_sites_df is not None:
                 baf_sites_region_df = baf_sites_df[locus_mask].sort_values("Start")
             if event_del_df is not None:
@@ -2323,19 +2444,6 @@ def create_carrier_pdf(
                 event_dup_region_df = event_dup_df[locus_mask].sort_values("Start")
             if len(region_df) == 0:
                 continue
-            if len(region_df) > PDF_MAX_SIGNAL_BINS:
-                region_df, rebinned_frames = _rebin_aligned_region_dfs_for_display(
-                    locus,
-                    region_df,
-                    [baf_region_df, baf_sites_region_df, event_del_region_df, event_dup_region_df],
-                    max_total_bins=PDF_MAX_SIGNAL_BINS,
-                )
-                (
-                    baf_region_df,
-                    baf_sites_region_df,
-                    event_del_region_df,
-                    event_dup_region_df,
-                ) = rebinned_frames
             _print_timing(f"{cluster} carrier region slice", stage_start)
 
             region_start = int(region_df["Start"].min())
@@ -2383,6 +2491,7 @@ def create_carrier_pdf(
                     xform,
                     _raw_region,
                     baf_region_df,
+                    baf_variance_region_df,
                     baf_sites_region_df,
                     event_del_region_df,
                     event_dup_region_df,
@@ -2417,6 +2526,7 @@ def create_eval_category_pdfs(
     event_dup_df: Optional[pd.DataFrame] = None,
     event_values_are_qual: bool = False,
     minor_baf_df: Optional[pd.DataFrame] = None,
+    baf_variance_df: Optional[pd.DataFrame] = None,
     baf_sites_df: Optional[pd.DataFrame] = None,
     padding: int = 50000,
     min_gene_label_spacing: float = 0.05,
@@ -2454,6 +2564,7 @@ def create_eval_category_pdfs(
             event_del_df,
             event_dup_df,
             minor_baf_df,
+            baf_variance_df,
             baf_sites_df,
             gaps,
             raw_counts_df,
@@ -2479,6 +2590,7 @@ def create_anomalous_pdf(
     event_dup_df: Optional[pd.DataFrame] = None,
     event_values_are_qual: bool = False,
     minor_baf_df: Optional[pd.DataFrame] = None,
+    baf_variance_df: Optional[pd.DataFrame] = None,
     baf_sites_df: Optional[pd.DataFrame] = None,
     padding: int = 50000,
     min_gene_label_spacing: float = 0.05,
@@ -2504,6 +2616,7 @@ def create_anomalous_pdf(
         event_del_df,
         event_dup_df,
         minor_baf_df,
+        baf_variance_df,
         baf_sites_df,
         gaps,
         raw_counts_df,
@@ -2755,7 +2868,12 @@ def main():
     print(f"    {len(depth_df)} bin-rows x {len(sample_cols_all)} samples (across all loci)")
 
     minor_baf_df = None
+    baf_variance_df = None
     baf_sites_df = None
+    baf_variance_column = None
+    baf_site_count_column = None
+    if "minor_baf_median" in cn_posteriors_df.columns:
+        baf_variance_column, baf_site_count_column = _select_baf_plot_support_columns(cn_posteriors_df)
     if "minor_baf_median" in cn_posteriors_df.columns and "baf_n_sites" in cn_posteriors_df.columns:
         minor_baf_df = cn_posteriors_df.pivot(
             index=["cluster", "chr", "start", "end"],
@@ -2765,15 +2883,25 @@ def main():
         minor_baf_df = minor_baf_df.rename(columns={
             "cluster": "Cluster", "chr": "Chr", "start": "Start", "end": "End",
         })
-        baf_sites_df = cn_posteriors_df.pivot(
-            index=["cluster", "chr", "start", "end"],
-            columns="sample",
-            values="baf_n_sites",
-        ).reset_index()
-        baf_sites_df = baf_sites_df.rename(columns={
-            "cluster": "Cluster", "chr": "Chr", "start": "Start", "end": "End",
-        })
-        print("    Built aligned minor-BAF matrices for carrier PDF bars")
+        if baf_variance_column is not None:
+            baf_variance_df = cn_posteriors_df.pivot(
+                index=["cluster", "chr", "start", "end"],
+                columns="sample",
+                values=baf_variance_column,
+            ).reset_index()
+            baf_variance_df = baf_variance_df.rename(columns={
+                "cluster": "Cluster", "chr": "Chr", "start": "Start", "end": "End",
+            })
+        if baf_site_count_column is not None:
+            baf_sites_df = cn_posteriors_df.pivot(
+                index=["cluster", "chr", "start", "end"],
+                columns="sample",
+                values=baf_site_count_column,
+            ).reset_index()
+            baf_sites_df = baf_sites_df.rename(columns={
+                "cluster": "Cluster", "chr": "Chr", "start": "Start", "end": "End",
+            })
+        print("    Built aligned minor-BAF matrices for carrier PDF bars and intervals")
 
     # Optional annotations
     gtf = None
@@ -2987,6 +3115,7 @@ def main():
             event_dup_df=event_dup_df,
             event_values_are_qual=event_values_are_qual,
             minor_baf_df=minor_baf_df,
+            baf_variance_df=baf_variance_df,
             baf_sites_df=baf_sites_df,
             padding=args.padding,
             min_gene_label_spacing=args.min_gene_label_spacing,
@@ -3008,6 +3137,7 @@ def main():
             event_dup_df=event_dup_df,
             event_values_are_qual=event_values_are_qual,
             minor_baf_df=minor_baf_df,
+            baf_variance_df=baf_variance_df,
             baf_sites_df=baf_sites_df,
             padding=args.padding,
             min_gene_label_spacing=args.min_gene_label_spacing,
@@ -3032,6 +3162,7 @@ def main():
             event_dup_df=event_dup_df,
             event_values_are_qual=event_values_are_qual,
             minor_baf_df=minor_baf_df,
+            baf_variance_df=baf_variance_df,
             baf_sites_df=baf_sites_df,
             padding=args.padding,
             min_gene_label_spacing=args.min_gene_label_spacing,

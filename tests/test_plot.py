@@ -15,6 +15,7 @@ from gatk_sv_gd.plot import (
     _build_anomalous_pdf_specs,
     _build_eval_pdf_specs,
     _build_raw_region_df,
+    _coarsen_pdf_page_signals,
     _plot_baf_signal_panel,
     _plot_event_marginal_panel,
     _rebin_aligned_region_dfs_for_display,
@@ -353,11 +354,12 @@ def test_build_raw_region_df_coarsens_highres_before_normalization(monkeypatch):
     assert len(result) == 3
 
 
-def test_plot_baf_signal_panel_adds_stems_for_valid_points():
+def test_plot_baf_signal_panel_draws_confidence_intervals_for_valid_points():
     locus = _make_locus()
     x_positions = pd.Series([46050000, 48190000, 49800000], dtype=float).to_numpy()
     bar_widths = pd.Series([0.001, 0.001, 0.001], dtype=float).to_numpy()
-    minor_baf_values = pd.Series([0.45, 0.40, 0.48], dtype=float).to_numpy()
+    minor_baf_values = pd.Series([0.45, 0.40, 0.49], dtype=float).to_numpy()
+    baf_variances = pd.Series([0.0004, 0.0009, 0.0001], dtype=float).to_numpy()
     baf_site_counts = pd.Series([20, 15, 30], dtype=int).to_numpy()
     xform = FlankCompressor(46005406, 49845537, locus.start, locus.end, flank_scale=0.2)
 
@@ -372,17 +374,110 @@ def test_plot_baf_signal_panel_adds_stems_for_valid_points():
             xform,
             locus,
             locus.chrom,
+            baf_variances=baf_variances,
         )
 
         line_collections = [
             collection for collection in ax.collections
             if isinstance(collection, LineCollection)
         ]
+        interval_segments = None
+        for collection in line_collections:
+            segments = collection.get_segments()
+            if len(segments) == 3:
+                interval_segments = np.asarray(segments, dtype=float)
+                break
 
         assert len(ax.patches) == 3
-        assert any(len(collection.get_segments()) == 3 for collection in line_collections)
+        assert interval_segments is not None
+        expected_lower = np.clip(
+            minor_baf_values - (1.959963984540054 * np.sqrt(baf_variances)),
+            0.0,
+            0.5,
+        )
+        expected_upper = np.clip(
+            minor_baf_values + (1.959963984540054 * np.sqrt(baf_variances)),
+            0.0,
+            0.5,
+        )
+        assert interval_segments[:, 0, 1].tolist() == pytest.approx(expected_lower.tolist())
+        assert interval_segments[:, 1, 1].tolist() == pytest.approx(expected_upper.tolist())
+        assert expected_upper[-1] == pytest.approx(0.5)
     finally:
         plt.close(fig)
+
+
+def test_plot_baf_signal_panel_uses_fixed_minor_baf_reference_lines():
+    locus = _make_locus()
+    x_positions = pd.Series([46050000, 48190000, 49800000], dtype=float).to_numpy()
+    bar_widths = pd.Series([0.001, 0.001, 0.001], dtype=float).to_numpy()
+    minor_baf_values = pd.Series([0.45, 0.40, 0.49], dtype=float).to_numpy()
+    baf_variances = pd.Series([0.0004, 0.0009, 0.0001], dtype=float).to_numpy()
+    baf_site_counts = pd.Series([20, 15, 30], dtype=int).to_numpy()
+    xform = FlankCompressor(46005406, 49845537, locus.start, locus.end, flank_scale=0.2)
+
+    fig, ax = plt.subplots()
+    try:
+        _plot_baf_signal_panel(
+            ax,
+            x_positions,
+            bar_widths,
+            minor_baf_values,
+            baf_site_counts,
+            xform,
+            locus,
+            locus.chrom,
+            baf_temperature=25.0,
+            baf_variances=baf_variances,
+        )
+
+        observed_reference_levels = [
+            float(line.get_ydata()[0])
+            for line in ax.lines
+            if line.get_linestyle() == ":"
+        ]
+
+        assert observed_reference_levels == pytest.approx([0.1, 0.2, 0.3, 0.4, 0.5])
+    finally:
+        plt.close(fig)
+
+
+def test_coarsen_pdf_page_signals_aggregates_baf_intervals_with_site_weights():
+    locus = GDLocus(
+        cluster="left-flank-only",
+        chrom="chr1",
+        breakpoints=[(100, 100), (200, 200)],
+        breakpoint_names=["A", "B"],
+        gd_entries=[],
+        is_nahr=False,
+        is_terminal=False,
+    )
+    region_df = pd.DataFrame(
+        {
+            "Cluster": [locus.cluster] * 4,
+            "Chr": [locus.chrom] * 4,
+            "Start": [0, 10, 20, 30],
+            "End": [10, 20, 30, 40],
+        }
+    )
+
+    plot_region_df, plot_depth, plot_minor_baf, plot_baf_variance, plot_baf_sites, plot_event_probs = _coarsen_pdf_page_signals(
+        locus,
+        region_df,
+        np.array([2.0, 2.0, 2.0, 2.0], dtype=float),
+        np.array([0.2, 0.4, 0.3, 0.5], dtype=float),
+        np.array([0.04, 0.01, 0.09, 0.16], dtype=float),
+        np.array([2.0, 6.0, 3.0, 1.0], dtype=float),
+        None,
+        max_total_bins=2,
+    )
+
+    assert len(plot_region_df) == 2
+    assert plot_depth.tolist() == pytest.approx([2.0, 2.0])
+    assert plot_minor_baf.tolist() == pytest.approx([0.35, 0.35])
+    assert plot_baf_variance.tolist() == pytest.approx([0.008125, 0.060625])
+    assert plot_baf_sites.tolist() == pytest.approx([8.0, 4.0])
+    assert plot_event_probs is None
 
 
 def test_plot_baf_signal_panel_omits_baf_temperature_title():
@@ -465,7 +560,7 @@ def test_plot_event_marginal_panel_uses_called_state_qual_scale():
         )
 
         assert ax.get_ylim() == (-99.0, 99.0)
-        assert ax.get_ylabel() == "QUAL(DEL site state)"
+        assert ax.get_ylabel() == "QUAL(DEL)"
         assert len(ax.lines) == 1
         assert list(ax.lines[0].get_ydata()) == pytest.approx(
             posterior_called_state_to_qual(
@@ -504,7 +599,7 @@ def test_plot_event_marginal_panel_accepts_precomputed_event_qual_values():
         )
 
         assert ax.get_ylim() == (-99.0, 99.0)
-        assert ax.get_ylabel() == "QUAL(DEL site state)"
+        assert ax.get_ylabel() == "QUAL(DEL)"
         assert len(ax.lines) == 1
         assert list(ax.lines[0].get_ydata()) == pytest.approx([
             10.0 * np.log10(9.0),

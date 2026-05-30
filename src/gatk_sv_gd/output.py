@@ -147,11 +147,16 @@ def write_posterior_tables(
     minor_baf = None
     baf_var = None
     baf_n_sites = None
+    baf_effective_var = None
+    baf_effective_n_sites = None
     if getattr(combined_data, "has_baf", False):
         baf_median = np.asarray(combined_data.baf_median.cpu().numpy())
         minor_baf = np.asarray(combined_data.minor_baf_median.cpu().numpy())
         baf_var = np.asarray(combined_data.baf_variance.cpu().numpy())
         baf_n_sites = np.asarray(combined_data.baf_n_sites.cpu().numpy())
+        if getattr(combined_data, "has_baf_effective_count", False):
+            baf_effective_var = np.asarray(combined_data.baf_effective_variance.cpu().numpy())
+            baf_effective_n_sites = np.asarray(combined_data.baf_effective_n_sites.cpu().numpy())
 
     # Ensure proper dimensions
     if depth.ndim == 1:
@@ -194,6 +199,9 @@ def write_posterior_tables(
                 row["minor_baf_median"] = float(minor_baf[bin_idx, sample_idx])
                 row["baf_variance"] = float(baf_var[bin_idx, sample_idx])
                 row["baf_n_sites"] = int(baf_n_sites[bin_idx, sample_idx])
+                if baf_effective_var is not None:
+                    row["baf_effective_variance"] = float(baf_effective_var[bin_idx, sample_idx])
+                    row["baf_effective_n_sites"] = int(baf_effective_n_sites[bin_idx, sample_idx])
 
             # Optional pair-state marginals (for future diploid model use)
             if pair_post is not None and pair_state_labels is not None:

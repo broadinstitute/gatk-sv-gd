@@ -20,6 +20,7 @@ def test_parse_args_uses_learned_baf_temperature_by_default(monkeypatch):
 
     assert args.fixed_baf_temperature is False
     assert args.baf_outlier_rate == pytest.approx(0.0)
+    assert args.use_baf_effective_count is True
     assert args.null_state_prior == pytest.approx(1e-3)
     assert args.var_length_scale == pytest.approx(20000.0)
     assert not hasattr(args, "state_prior_weight")
@@ -64,6 +65,25 @@ def test_parse_args_allows_explicit_baf_outlier_rate(monkeypatch):
     args = parse_args()
 
     assert args.baf_outlier_rate == pytest.approx(0.05)
+
+
+def test_parse_args_can_disable_baf_effective_count(monkeypatch):
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "gatk-sv-gd infer",
+            "--preprocessed-dir",
+            "./preprocess",
+            "-o",
+            "./out",
+            "--disable-baf-effective-count",
+        ],
+    )
+
+    args = parse_args()
+
+    assert args.use_baf_effective_count is False
 
 
 def test_parse_args_allows_explicit_null_state_prior(monkeypatch):

@@ -20,7 +20,11 @@ from matplotlib.lines import Line2D
 from gatk_sv_gd.annotations import FlankCompressor
 from gatk_sv_gd._util import get_logger, setup_logging
 from gatk_sv_gd.models import GDTable
-from gatk_sv_gd.plot import ViterbiOverlayData, _render_pdf_sample_page
+from gatk_sv_gd.plot import (
+    ViterbiOverlayData,
+    _render_pdf_sample_page,
+    _select_baf_plot_support_columns,
+)
 
 _CONFIDENCE_COLUMNS = ("qual_score", "confidence_score", "log_prob_score")
 _REQUIRED_CALL_COLUMNS = {
@@ -202,6 +206,7 @@ class PlotRunContext:
     loci_by_cluster: Dict[str, Any]
     depth_by_cluster: Dict[str, pd.DataFrame]
     minor_baf_by_cluster: Dict[str, pd.DataFrame]
+    baf_variance_by_cluster: Dict[str, pd.DataFrame]
     baf_sites_by_cluster: Dict[str, pd.DataFrame]
     event_del_by_cluster: Dict[str, pd.DataFrame]
     event_dup_by_cluster: Dict[str, pd.DataFrame]
@@ -480,6 +485,7 @@ def _load_plot_run_context(run: RunData) -> PlotRunContext:
             loci_by_cluster={},
             depth_by_cluster={},
             minor_baf_by_cluster={},
+            baf_variance_by_cluster={},
             baf_sites_by_cluster={},
             event_del_by_cluster={},
             event_dup_by_cluster={},
@@ -526,7 +532,9 @@ def _load_plot_run_context(run: RunData) -> PlotRunContext:
             }
 
     minor_baf_df = _pivot_plot_matrix(cn_posteriors_df, "minor_baf_median")
-    baf_sites_df = _pivot_plot_matrix(cn_posteriors_df, "baf_n_sites")
+    baf_variance_column, baf_site_count_column = _select_baf_plot_support_columns(cn_posteriors_df)
+    baf_variance_df = _pivot_plot_matrix(cn_posteriors_df, baf_variance_column) if baf_variance_column else None
+    baf_sites_df = _pivot_plot_matrix(cn_posteriors_df, baf_site_count_column) if baf_site_count_column else None
 
     event_del_by_cluster: Dict[str, pd.DataFrame] = {}
     event_dup_by_cluster: Dict[str, pd.DataFrame] = {}
@@ -577,6 +585,7 @@ def _load_plot_run_context(run: RunData) -> PlotRunContext:
         loci_by_cluster=gd_table.loci,
         depth_by_cluster=_group_plot_frames_by_cluster(depth_df),
         minor_baf_by_cluster=_group_plot_frames_by_cluster(minor_baf_df),
+        baf_variance_by_cluster=_group_plot_frames_by_cluster(baf_variance_df),
         baf_sites_by_cluster=_group_plot_frames_by_cluster(baf_sites_df),
         event_del_by_cluster=event_del_by_cluster,
         event_dup_by_cluster=event_dup_by_cluster,
@@ -1672,6 +1681,7 @@ def _add_case_plot_page(
         xform,
         None,
         plot_context.minor_baf_by_cluster.get(cluster),
+        plot_context.baf_variance_by_cluster.get(cluster),
         plot_context.baf_sites_by_cluster.get(cluster),
         plot_context.event_del_by_cluster.get(cluster),
         plot_context.event_dup_by_cluster.get(cluster),
