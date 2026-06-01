@@ -1,17 +1,26 @@
+import gzip
 import logging
+import math
 from types import SimpleNamespace
 
 import numpy as np
+import pandas as pd
 
 import pytest
 
 from gatk_sv_gd.depth import (
     CNVModel,
+    DepthData,
+    ExclusionMask,
+    _clip_baf_variance_numpy,
     build_diploid_pair_states,
     _center_state_log_likelihood_table_numpy,
     _count_anchored_reference_variance_numpy,
     _depth_variance_scale_numpy,
     _lognormal_location_from_mean,
+    _logit_clipped,
+    _positive_clipped_log,
+    _robust_baf_log_likelihood_numpy,
     _size_modifier_numpy,
     _variance_expected_depth_numpy,
     pair_state_minor_baf,
@@ -71,6 +80,393 @@ def test_windowed_relative_elbo_change_uses_two_latest_windows():
     )
 
     assert relative_change == pytest.approx(1e-4)
+
+
+def test_baf_helper_numpy_functions_clip_and_mix_extremes():
+    clipped = _clip_baf_variance_numpy(
+        np.asarray([np.nan, np.inf, -np.inf, 0.0, 0.25], dtype=np.float64)
+    )
+    assert clipped.tolist() == pytest.approx([1e6, 1e6, 1e-6, 1e-6, 0.25])
+
+    log_lik = np.asarray([[-2.0, -0.5]], dtype=np.float64)
+    unchanged = _robust_baf_log_likelihood_numpy(log_lik, outlier_rate=0.0)
+    fully_uniform = _robust_baf_log_likelihood_numpy(log_lik, outlier_rate=1.0)
+    mixed = _robust_baf_log_likelihood_numpy(log_lik, outlier_rate=0.25)
+
+    assert np.allclose(unchanged, log_lik)
+    assert np.allclose(fully_uniform, np.full_like(log_lik, math.log(2.0)))
+    assert np.allclose(
+        mixed,
+        np.logaddexp(log_lik + math.log(0.75), math.log(2.0) + math.log(0.25)),
+    )
+
+
+def test_finite_logit_and_log_helpers_clip_to_safe_domain():
+    assert _logit_clipped(0.0) == pytest.approx(math.log(1e-6 / (1.0 - 1e-6)))
+    assert _logit_clipped(1.0) == pytest.approx(math.log((1.0 - 1e-6) / 1e-6))
+    assert _logit_clipped(0.25) == pytest.approx(math.log(0.25 / 0.75))
+
+    assert _positive_clipped_log(0.0) == pytest.approx(math.log(1e-6))
+    assert _positive_clipped_log(-5.0) == pytest.approx(math.log(1e-6))
+    assert _positive_clipped_log(3.0) == pytest.approx(math.log(3.0))
+
+
+def test_exclusion_mask_merges_across_files_and_updates_queries(tmp_path, monkeypatch):
+    class FakeInterval:
+        def __init__(self, begin, end):
+            self.begin = int(begin)
+            self.end = int(end)
+
+    class FakeIntervalTree:
+        def __init__(self):
+            self._intervals = []
+
+        def addi(self, start, end):
+            self._intervals.append(FakeInterval(start, end))
+
+        def merge_overlaps(self):
+            merged = []
+            for interval in sorted(self._intervals, key=lambda iv: (iv.begin, iv.end)):
+                if not merged or interval.begin > merged[-1].end:
+                    merged.append(FakeInterval(interval.begin, interval.end))
+                else:
+                    merged[-1].end = max(merged[-1].end, interval.end)
+            self._intervals = merged
+
+        def overlap(self, start, end):
+            return [
+                iv for iv in self._intervals
+                if iv.begin < int(end) and int(start) < iv.end
+            ]
+
+        def __len__(self):
+            return len(self._intervals)
+
+    monkeypatch.setattr(depth_module, "IntervalTree", FakeIntervalTree)
+
+    bed_a = tmp_path / "mask_a.bed"
+    bed_a.write_text("chr1\t10\t20\nchr1\t18\t25\nchr2\t5\t10\n")
+
+    bed_b = tmp_path / "mask_b.bed.gz"
+    with gzip.open(bed_b, "wt") as handle:
+        handle.write("chr1\t24\t30\nchr2\t8\t12\textra\n")
+
+    mask = ExclusionMask([str(bed_a), str(bed_b)], label="test regions")
+
+    assert len(mask.df) == 5
+    assert sum(len(tree) for tree in mask.trees.values()) == 2
+    assert mask.has_any_overlap("chr1", 0, 12) is True
+    assert mask.has_any_overlap("chr3", 0, 10) is False
+    assert mask.get_overlap_fraction("chr1", 0, 40) == pytest.approx(20.0 / 40.0)
+    assert mask.get_overlap_fraction("chr2", 6, 11) == pytest.approx(1.0)
+    assert mask.get_overlap_fraction("chr1", 10, 10) == 0.0
+
+    batch = mask.get_overlap_fractions_batch(
+        "chr1",
+        np.asarray([0, 10, 26, 35], dtype=np.int64),
+        np.asarray([10, 20, 29, 35], dtype=np.int64),
+    )
+    assert batch.tolist() == pytest.approx([0.0, 1.0, 1.0, 0.0])
+    assert mask.get_overlap_fractions_batch(
+        "chr3",
+        np.asarray([0, 1], dtype=np.int64),
+        np.asarray([2, 3], dtype=np.int64),
+    ).tolist() == pytest.approx([0.0, 0.0])
+
+    assert mask.is_masked("chr1", 0, 40, threshold=0.5) is True
+    assert mask.is_masked("chr1", 0, 40, threshold=0.6) is False
+
+    bed_c = tmp_path / "mask_c.bed"
+    bed_c.write_text("chr1\t40\t50\nchr2\t0\t6\n")
+    mask.add_beds(str(bed_c))
+
+    assert len(mask.df) == 7
+    assert sum(len(tree) for tree in mask.trees.values()) == 3
+    assert mask.get_overlap_fraction("chr2", 0, 12) == pytest.approx(1.0)
+    assert mask.has_any_overlap("chr1", 45, 46) is True
+
+
+def test_depth_data_attach_baf_summary_populates_matching_cells_and_effective_counts():
+    df = pd.DataFrame([
+        {"Chr": "chr1", "Start": 100, "End": 200, "sample1": 2.5, "sample2": 6.0},
+        {"Chr": "chr2", "Start": 200, "End": 260, "sample1": 1.5, "sample2": 3.0},
+    ])
+    data = DepthData(df, clamp_threshold=5.0)
+
+    summary_df = pd.DataFrame([
+        {
+            "array_idx": 0,
+            "sample": "sample1",
+            "baf_median": 0.40,
+            "minor_baf_median": 0.40,
+            "baf_variance": 0.02,
+            "baf_n_sites": 3,
+            "baf_effective_variance": 0.03,
+            "baf_effective_n_sites": 2,
+        },
+        {
+            "array_idx": 1,
+            "sample": "sample2",
+            "baf_median": 0.60,
+            "minor_baf_median": 0.40,
+            "baf_variance": 0.05,
+            "baf_n_sites": 4,
+            "baf_effective_variance": 0.08,
+            "baf_effective_n_sites": 1,
+        },
+        {
+            "array_idx": 4,
+            "sample": "sample1",
+            "baf_median": 0.20,
+            "minor_baf_median": 0.20,
+            "baf_variance": 0.10,
+            "baf_n_sites": 2,
+            "baf_effective_variance": 0.10,
+            "baf_effective_n_sites": 2,
+        },
+        {
+            "array_idx": 0,
+            "sample": "missing_sample",
+            "baf_median": 0.20,
+            "minor_baf_median": 0.20,
+            "baf_variance": 0.10,
+            "baf_n_sites": 2,
+            "baf_effective_variance": 0.10,
+            "baf_effective_n_sites": 2,
+        },
+    ])
+
+    data.attach_baf_summary(summary_df, mappings=None)
+
+    assert np.allclose(
+        data.depth.detach().cpu().numpy(),
+        np.asarray([[2.5, 5.0], [1.5, 3.0]], dtype=np.float32),
+    )
+    assert data.has_baf is True
+    assert data.has_baf_effective_count is True
+    assert data.baf_n_sites.detach().cpu().numpy().tolist() == [[3, 0], [0, 4]]
+    assert data.baf_effective_n_sites.detach().cpu().numpy().tolist() == [[2, 0], [0, 1]]
+
+    baf_median = data.baf_median.detach().cpu().numpy()
+    assert baf_median[0, 0] == pytest.approx(0.40)
+    assert np.isnan(baf_median[0, 1])
+    assert baf_median[1, 1] == pytest.approx(0.60)
+
+
+def test_depth_data_attach_baf_summary_validates_required_columns_and_effective_pairs():
+    df = pd.DataFrame([
+        {"Chr": "chr1", "Start": 100, "End": 200, "sample1": 2.0}
+    ])
+    data = DepthData(df)
+
+    with pytest.raises(ValueError, match="missing required columns"):
+        data.attach_baf_summary(
+            pd.DataFrame([
+                {
+                    "array_idx": 0,
+                    "sample": "sample1",
+                    "baf_median": 0.5,
+                    "minor_baf_median": 0.5,
+                    "baf_variance": 0.1,
+                }
+            ]),
+            mappings=None,
+        )
+
+    with pytest.raises(ValueError, match="must provide both baf_effective_variance and baf_effective_n_sites"):
+        data.attach_baf_summary(
+            pd.DataFrame([
+                {
+                    "array_idx": 0,
+                    "sample": "sample1",
+                    "baf_median": 0.5,
+                    "minor_baf_median": 0.5,
+                    "baf_variance": 0.1,
+                    "baf_n_sites": 2,
+                    "baf_effective_variance": 0.2,
+                }
+            ]),
+            mappings=None,
+        )
+
+
+def test_depth_data_attach_sample_ploidy_requires_complete_pairs_and_attaches_matrix():
+    df = pd.DataFrame([
+        {"Chr": "chr1", "Start": 100, "End": 200, "sample1": 2.0, "sample2": 2.5},
+        {"Chr": "chrX", "Start": 200, "End": 260, "sample1": 1.5, "sample2": 1.0},
+    ])
+    data = DepthData(df)
+
+    with pytest.raises(ValueError, match="sample2/chrX"):
+        data.attach_sample_ploidy({
+            ("sample1", "chr1"): 2,
+            ("sample2", "chr1"): 2,
+            ("sample1", "chrX"): 1,
+        })
+
+    data.attach_sample_ploidy({
+        ("sample1", "chr1"): 2,
+        ("sample2", "chr1"): 2,
+        ("sample1", "chrX"): 1,
+        ("sample2", "chrX"): 2,
+    })
+
+    assert data.sample_ploidy.detach().cpu().numpy().tolist() == [[2, 2], [1, 2]]
+
+
+def test_depth_data_subsamples_bins_and_samples_deterministically(monkeypatch):
+    df = pd.DataFrame([
+        {"Chr": "chr1", "Start": 100, "End": 150, "sample1": 1.0, "sample2": 2.0, "sample3": 3.0},
+        {"Chr": "chr1", "Start": 150, "End": 200, "sample1": 1.1, "sample2": 2.1, "sample3": 3.1},
+        {"Chr": "chr2", "Start": 200, "End": 260, "sample1": 1.2, "sample2": 2.2, "sample3": 3.2},
+        {"Chr": "chr2", "Start": 260, "End": 320, "sample1": 1.3, "sample2": 2.3, "sample3": 3.3},
+    ])
+
+    choices = iter([
+        np.asarray([2, 0], dtype=np.int64),
+        np.asarray([2, 0], dtype=np.int64),
+    ])
+    monkeypatch.setattr(depth_module.np.random, "choice", lambda *args, **kwargs: next(choices))
+
+    data = DepthData(
+        df,
+        subsample_bins=2,
+        subsample_samples=2,
+        seed=123,
+        clamp_threshold=None,
+    )
+
+    assert data.sample_ids == ["sample3", "sample1"]
+    assert data.chr.tolist() == ["chr1", "chr2"]
+    assert data.start.tolist() == [100, 200]
+    assert np.allclose(
+        data.depth.detach().cpu().numpy(),
+        np.asarray([[3.0, 1.0], [3.2, 1.2]], dtype=np.float32),
+    )
+    assert data.interval_sizes.detach().cpu().numpy().reshape(-1).tolist() == pytest.approx([50.0, 60.0])
+
+
+def test_depth_data_attach_baf_summary_without_effective_counts_leaves_effective_fields_unset():
+    df = pd.DataFrame([
+        {"Chr": "chr1", "Start": 100, "End": 200, "sample1": 2.0}
+    ])
+    data = DepthData(df)
+
+    data.attach_baf_summary(
+        pd.DataFrame([
+            {
+                "array_idx": 0,
+                "sample": "sample1",
+                "baf_median": 0.5,
+                "minor_baf_median": 0.5,
+                "baf_variance": 0.1,
+                "baf_n_sites": 2,
+            }
+        ]),
+        mappings=None,
+    )
+
+    assert data.has_baf is True
+    assert data.has_baf_effective_count is False
+    assert data.baf_effective_variance is None
+    assert data.baf_effective_n_sites is None
+    assert data.baf_n_sites.detach().cpu().numpy().tolist() == [[2]]
+
+
+def test_depth_data_attach_sample_ploidy_ignores_empty_map():
+    df = pd.DataFrame([
+        {"Chr": "chr1", "Start": 100, "End": 200, "sample1": 2.0}
+    ])
+    data = DepthData(df)
+
+    data.attach_sample_ploidy({})
+
+    assert data.sample_ploidy is None
+
+
+def test_torch_depth_helper_variants_match_expected_numeric_behavior():
+    torch = depth_module.torch
+
+    expected_depth = torch.tensor([0.0, 1.0, 2.0, 4.0], dtype=torch.float32)
+    scaled = depth_module._depth_variance_scale_torch(expected_depth)
+    floored = depth_module._variance_expected_depth_torch(expected_depth, 0.5)
+    unchanged = depth_module._variance_expected_depth_torch(expected_depth, 0.0)
+
+    reference_variance = depth_module._count_anchored_reference_variance_torch(
+        torch.tensor([100.0, 200.0], dtype=torch.float32),
+        reference_bin_size=1000.0,
+        bin_size_factor=500.0,
+    )
+    size_modifier = depth_module._size_modifier_torch(
+        torch.tensor([50.0, 100.0], dtype=torch.float32),
+        bin_size_factor=100.0,
+    )
+    spatial = depth_module._spatial_aggregate_variance_scale_torch(
+        torch.tensor([1.0, 1_000.0, 20_000.0], dtype=torch.float32),
+        torch.tensor(1_000.0, dtype=torch.float32),
+    )
+
+    assert np.allclose(
+        scaled.detach().cpu().numpy(),
+        _depth_variance_scale_numpy(np.asarray([0.0, 1.0, 2.0, 4.0], dtype=np.float32)),
+    )
+    assert np.allclose(floored.detach().cpu().numpy(), np.asarray([0.5, 1.0, 2.0, 4.0], dtype=np.float32))
+    assert np.allclose(unchanged.detach().cpu().numpy(), np.asarray([0.0, 1.0, 2.0, 4.0], dtype=np.float32))
+    assert np.allclose(reference_variance.detach().cpu().numpy(), np.asarray([[0.08, 0.04]], dtype=np.float32))
+    assert np.allclose(size_modifier.detach().cpu().numpy(), np.asarray([2.0, 1.0], dtype=np.float32))
+    assert np.allclose(
+        spatial.detach().cpu().numpy(),
+        _spatial_aggregate_variance_scale_numpy(
+            np.asarray([1.0, 1_000.0, 20_000.0], dtype=np.float32),
+            1_000.0,
+        ),
+        rtol=1e-5,
+        atol=1e-6,
+    )
+
+
+def test_torch_center_and_baf_helpers_cover_reference_and_clipping_paths():
+    torch = depth_module.torch
+
+    log_lik = torch.tensor(
+        [[[-2.0, -1.0]], [[-0.5, -3.0]]],
+        dtype=torch.float32,
+    )
+    reference_probs = torch.tensor([0.75, 0.25], dtype=torch.float32)
+    centered = depth_module._center_state_log_likelihood_table_torch(log_lik, reference_probs)
+
+    centered_np = centered.detach().cpu().numpy()
+    expected_np = _center_state_log_likelihood_table_numpy(
+        log_lik.detach().cpu().numpy(),
+        reference_probs.detach().cpu().numpy(),
+    )
+    assert np.allclose(centered_np, expected_np, rtol=1e-5, atol=1e-6)
+
+    normalized = np.log(reference_probs.detach().cpu().numpy()).reshape(-1, 1, 1) + centered_np
+    assert np.allclose(np.exp(normalized).sum(axis=0), np.ones((1, 2), dtype=np.float32), rtol=1e-5, atol=1e-6)
+
+    clipped = depth_module._clip_baf_variance_torch(
+        torch.tensor([float("nan"), float("inf"), float("-inf"), 0.0, 0.25], dtype=torch.float32)
+    )
+    robust_none = depth_module._robust_baf_log_likelihood_torch(log_lik, outlier_rate=0.0)
+    robust_full = depth_module._robust_baf_log_likelihood_torch(log_lik, outlier_rate=1.0)
+    robust_mixed = depth_module._robust_baf_log_likelihood_torch(log_lik, outlier_rate=0.25)
+
+    assert np.allclose(clipped.detach().cpu().numpy(), np.asarray([1e6, 1e6, 1e-6, 1e-6, 0.25], dtype=np.float32))
+    assert np.allclose(robust_none.detach().cpu().numpy(), log_lik.detach().cpu().numpy())
+    assert np.allclose(
+        robust_full.detach().cpu().numpy(),
+        np.full_like(log_lik.detach().cpu().numpy(), math.log(2.0)),
+    )
+    assert np.allclose(
+        robust_mixed.detach().cpu().numpy(),
+        np.logaddexp(
+            log_lik.detach().cpu().numpy() + math.log(0.75),
+            math.log(2.0) + math.log(0.25),
+        ),
+        rtol=1e-5,
+        atol=1e-6,
+    )
 
 
 def test_train_early_stopping_uses_windowed_relative_elbo_change(monkeypatch):

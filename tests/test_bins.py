@@ -2,9 +2,13 @@ import pandas as pd
 import numpy as np
 import pytest
 
+import gatk_sv_gd.bins as bins_module
 from gatk_sv_gd.bins import compute_flank_regions_from_bins
 from gatk_sv_gd.bins import compute_bin_quality_mask
+from gatk_sv_gd.bins import compute_interval_cn_stats
+from gatk_sv_gd.bins import call_gd_cnv
 from gatk_sv_gd.bins import filter_low_quality_bins
+from gatk_sv_gd.bins import extract_locus_bins
 from gatk_sv_gd.bins import get_flank_filter_params
 from gatk_sv_gd.bins import rebin_locus_intervals
 from gatk_sv_gd.bins import _allocate_bins_across_segments
@@ -31,6 +35,18 @@ class DummyOverlapMask:
             return np.zeros(len(starts))
         overlap = np.maximum(0, np.minimum(ends, 25) - np.maximum(starts, 15))
         return overlap / np.maximum(1, ends - starts)
+
+
+class IndexedOverlapMask:
+    def __init__(self, fractions_by_start):
+        self.fractions_by_start = dict(fractions_by_start)
+
+    def get_overlap_fractions_batch(self, chrom, starts, ends):
+        starts = np.asarray(starts)
+        return np.asarray([
+            self.fractions_by_start.get((chrom, int(start)), 0.0)
+            for start in starts
+        ], dtype=float)
 
 
 def test_fragmented_flank_rebinning_preserves_masked_gap():
@@ -73,6 +89,71 @@ def test_mask_overlap_bool_handles_none_empty_and_positive_overlap_cases():
     assert _mask_overlap_bool(DummyOverlapMask(), "chr1", np.array([], dtype=int), np.array([], dtype=int)).tolist() == []
     assert _mask_overlap_bool(DummyOverlapMask(), "chr1", starts, ends).tolist() == [False, True, True, False]
     assert _mask_overlap_bool(DummyOverlapMask(), "chr2", starts, ends).tolist() == [False, False, False, False]
+
+
+def test_extract_locus_bins_returns_empty_when_region_has_no_overlap():
+    locus = GDLocus(
+        cluster="cluster1",
+        chrom="chr1",
+        breakpoints=[(100, 100), (200, 200)],
+        breakpoint_names=["1", "2"],
+        gd_entries=[],
+        is_nahr=True,
+        is_terminal=False,
+    )
+    df = pd.DataFrame(
+        {
+            "Chr": ["chr2"],
+            "Start": [0],
+            "End": [50],
+            "sample1": [1.0],
+        }
+    )
+
+    result = extract_locus_bins(df, locus)
+
+    assert result.empty
+
+
+def test_extract_locus_bins_applies_exclusion_bypass_and_hard_include():
+    locus = GDLocus(
+        cluster="cluster1",
+        chrom="chr1",
+        breakpoints=[(100, 100), (140, 140)],
+        breakpoint_names=["1", "2"],
+        gd_entries=[],
+        is_nahr=True,
+        is_terminal=False,
+    )
+    df = pd.DataFrame(
+        {
+            "Chr": ["chr1", "chr1", "chr1", "chr1"],
+            "Start": [90, 100, 110, 120],
+            "End": [100, 110, 120, 130],
+            "sample1": [1.0, 1.1, 1.2, 1.3],
+        }
+    )
+    exclusion_mask = IndexedOverlapMask(
+        {
+            ("chr1", 90): 0.0,
+            ("chr1", 100): 0.7,
+            ("chr1", 110): 0.8,
+            ("chr1", 120): 0.6,
+        }
+    )
+    hard_inclusion_mask = IndexedOverlapMask({("chr1", 120): 1.0})
+
+    result = extract_locus_bins(
+        df,
+        locus,
+        exclusion_mask=exclusion_mask,
+        exclusion_threshold=0.5,
+        padding=10,
+        exclusion_bypass_regions=[(110, 115)],
+        hard_inclusion_mask=hard_inclusion_mask,
+    )
+
+    assert result["Start"].tolist() == [90, 110, 120]
 
 
 def test_ploidy_adjust_depths_scales_each_sample_by_chromosome_specific_ploidy():
@@ -205,6 +286,140 @@ def test_flank_selection_uses_all_filtered_bins():
     # segment restriction would have stopped at 960.
     assert lf_start == 700
     assert lf_end == 1000
+
+
+def test_compute_flank_regions_from_bins_applies_quality_filter_before_accumulation(monkeypatch):
+    locus = GDLocus(
+        cluster="test_cluster",
+        chrom="chr1",
+        breakpoints=[(100, 100), (140, 140)],
+        breakpoint_names=["1", "2"],
+        gd_entries=[],
+        is_nahr=True,
+        is_terminal=False,
+    )
+    df = pd.DataFrame(
+        {
+            "Chr": ["chr1", "chr1", "chr1", "chr1"],
+            "Start": [60, 80, 140, 160],
+            "End": [80, 100, 160, 180],
+            "sample_1": [1.0, 1.1, 1.2, 1.3],
+        }
+    )
+
+    def fake_compute_bin_quality_mask(locus_df, **kwargs):
+        assert kwargs["median_min"] == 1.0
+        assert kwargs["median_max"] == 3.0
+        assert kwargs["mad_max"] == 0.2
+        return np.asarray([True, False, True, True]), {"filtered": 1, "par_ignored": 1}
+
+    monkeypatch.setattr(bins_module, "compute_bin_quality_mask", fake_compute_bin_quality_mask)
+
+    flanks = compute_flank_regions_from_bins(
+        df,
+        locus,
+        target_size=20,
+        min_flank_bases=20,
+        min_flank_bins=2,
+        min_flank_coverage=0.9,
+        filter_params={"median_min": 1.0, "median_max": 3.0, "mad_max": 0.2},
+    )
+
+    assert flanks == [
+        (60, 100, "left_flank"),
+        (140, 180, "right_flank"),
+    ]
+
+
+def test_compute_interval_cn_stats_averages_probabilities_and_handles_empty_intervals():
+    cn_posterior = np.asarray(
+        [
+            [[[0.7, 0.2, 0.1, 0.0, 0.0, 0.0]]],
+            [[[0.1, 0.4, 0.5, 0.0, 0.0, 0.0]]],
+            [[[0.0, 0.0, 0.2, 0.3, 0.3, 0.2]]],
+        ],
+        dtype=float,
+    ).reshape(3, 1, 6)
+
+    stats = compute_interval_cn_stats(
+        cn_posterior,
+        {"body": [0, 1], "empty": [], "flank": [2]},
+        sample_idx=0,
+    )
+
+    assert stats["body"]["n_bins"] == 2
+    assert stats["body"]["cn_probs"].tolist() == pytest.approx([0.4, 0.3, 0.3, 0.0, 0.0, 0.0])
+    assert stats["empty"]["n_bins"] == 0
+    assert stats["empty"]["cn_probs"].tolist() == pytest.approx([0.0] * 6)
+    assert stats["flank"]["cn_probs"].tolist() == pytest.approx([0.0, 0.0, 0.2, 0.3, 0.3, 0.2])
+
+
+def test_call_gd_cnv_distinguishes_supported_spanning_and_unsupported_events():
+    class FakeLocus:
+        cluster = "cluster1"
+        chrom = "chr1"
+        is_terminal = False
+        gd_entries = [
+            {
+                "GD_ID": "del_supported",
+                "svtype": "DEL",
+                "start_GRCh38": 100,
+                "end_GRCh38": 200,
+                "BP1": "1",
+                "BP2": "2",
+            },
+            {
+                "GD_ID": "dup_spanning",
+                "svtype": "DUP",
+                "start_GRCh38": 200,
+                "end_GRCh38": 300,
+                "BP1": "2",
+                "BP2": "3",
+            },
+            {
+                "GD_ID": "del_unsupported",
+                "svtype": "DEL",
+                "start_GRCh38": 300,
+                "end_GRCh38": 400,
+                "BP1": "3",
+                "BP2": "4",
+            },
+        ]
+
+        def get_intervals_between(self, bp1, bp2):
+            mapping = {
+                ("1", "2"): [(100, 200, "A")],
+                ("2", "3"): [(200, 300, "B")],
+                ("3", "4"): [(300, 400, "C")],
+            }
+            return mapping.get((bp1, bp2), [])
+
+        def get_flanking_regions(self):
+            return [(0, 100, "left_flank"), (400, 500, "right_flank")]
+
+    interval_stats = {
+        "A": {"n_bins": 2, "cn_probs": np.asarray([0.5, 0.4, 0.1, 0.0, 0.0, 0.0])},
+        "B": {"n_bins": 3, "cn_probs": np.asarray([0.0, 0.0, 0.1, 0.4, 0.3, 0.2])},
+        "C": {"n_bins": 0, "cn_probs": np.zeros(6)},
+        "left_flank": {"n_bins": 2, "cn_probs": np.asarray([0.0, 0.0, 0.1, 0.4, 0.3, 0.2])},
+        "right_flank": {"n_bins": 2, "cn_probs": np.asarray([0.0, 0.0, 0.1, 0.4, 0.3, 0.2])},
+    }
+
+    calls = call_gd_cnv(FakeLocus(), interval_stats, log_prob_threshold=-0.5)
+    by_id = {call["GD_ID"]: call for call in calls}
+
+    assert bool(by_id["del_supported"]["is_carrier"])
+    assert not bool(by_id["del_supported"]["is_spanning"])
+    assert by_id["del_supported"]["n_bins"] == 2
+    assert by_id["del_supported"]["intervals"] == ["A"]
+
+    assert not bool(by_id["dup_spanning"]["is_carrier"])
+    assert bool(by_id["dup_spanning"]["is_spanning"])
+    assert by_id["dup_spanning"]["flanking_log_prob_score"] > -0.5
+
+    assert np.isnan(by_id["del_unsupported"]["log_prob_score"])
+    assert not bool(by_id["del_unsupported"]["is_carrier"])
+    assert by_id["del_unsupported"]["n_bins"] == 0
 
 
 def test_filter_low_quality_bins_excludes_ploidy_zero_samples():

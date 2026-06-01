@@ -493,6 +493,86 @@ def test_write_and_load_normalization_metadata_round_trip(tmp_path):
     assert loaded_metadata_df["reference_bin_size"].tolist() == pytest.approx([10000.0, 10000.0])
 
 
+def test_write_preprocessed_bins_persists_expected_table(tmp_path):
+    combined_df = pd.DataFrame([
+        {"Chr": "chr1", "Start": 100, "End": 200, "sample1": 2.0},
+        {"Chr": "chr1", "Start": 200, "End": 300, "sample1": 2.1},
+    ])
+
+    output_path = preprocess_module.write_preprocessed_bins(combined_df, str(tmp_path))
+
+    assert output_path.endswith("preprocessed_bins.tsv.gz")
+    loaded_df = pd.read_csv(output_path, sep="\t", compression="gzip")
+    pd.testing.assert_frame_equal(loaded_df, combined_df)
+
+
+def test_build_normalization_metadata_validates_inputs():
+    with pytest.raises(ValueError, match="same length"):
+        preprocess_module.build_normalization_metadata(
+            ["sample1"],
+            np.asarray([10.0, 20.0], dtype=np.float64),
+            1000.0,
+        )
+
+    with pytest.raises(ValueError, match="must be positive"):
+        preprocess_module.build_normalization_metadata(
+            ["sample1"],
+            np.asarray([10.0], dtype=np.float64),
+            0.0,
+        )
+
+    with pytest.raises(ValueError, match="must all be positive"):
+        preprocess_module.build_normalization_metadata(
+            ["sample1", "sample2"],
+            np.asarray([10.0, 0.0], dtype=np.float64),
+            1000.0,
+        )
+
+
+def test_load_preprocessed_data_reads_optional_baf_summary(tmp_path):
+    pd.DataFrame(
+        [{"Chr": "chr1", "Start": 100, "End": 200, "sample1": 2.0}]
+    ).to_csv(
+        tmp_path / "preprocessed_bins.tsv.gz",
+        sep="\t",
+        index=False,
+        compression="gzip",
+    )
+    pd.DataFrame(
+        [{
+            "cluster": "cluster1",
+            "interval": "A-C",
+            "array_idx": 0,
+            "chr": "chr1",
+            "start": 100,
+            "end": 200,
+        }]
+    ).to_csv(
+        tmp_path / "bin_mappings.tsv.gz",
+        sep="\t",
+        index=False,
+        compression="gzip",
+    )
+    pd.DataFrame(
+        [{"sample": "sample1", "baf_n_sites": 2, "baf_effective_n_sites": 2}]
+    ).to_csv(
+        tmp_path / "preprocessed_baf_summary.tsv.gz",
+        sep="\t",
+        index=False,
+        compression="gzip",
+    )
+
+    combined_df, mappings, baf_summary_df, normalization_metadata_df = preprocess_module.load_preprocessed_data(
+        str(tmp_path)
+    )
+
+    assert combined_df.shape == (1, 4)
+    assert len(mappings) == 1
+    assert baf_summary_df is not None
+    assert baf_summary_df["sample"].tolist() == ["sample1"]
+    assert normalization_metadata_df is None
+
+
 def test_select_highres_interval_replacements_returns_only_improved_intervals():
     undercovered = [("A-C", 5), ("C-D", 8), ("D-E", 3)]
     hr_interval_bins = {
