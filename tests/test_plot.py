@@ -14,10 +14,12 @@ from gatk_sv_gd import plot as plot_module
 from gatk_sv_gd.plot import (
     _apply_carrier_pdf_x_axis_layout,
     _aligned_region_sample_vector,
+    _approximate_minor_baf_variance,
     _build_anomalous_pdf_specs,
     _build_eval_pdf_specs,
     _build_called_event_mask,
     _build_carrier_best_match_mask,
+    _compute_minor_baf_confidence_intervals,
     _build_gd_to_cluster_map,
     _build_raw_region_df,
     _allocate_segment_bin_targets,
@@ -27,6 +29,7 @@ from gatk_sv_gd.plot import (
     create_anomalous_pdf,
     create_carrier_pdf,
     create_eval_category_pdfs,
+    _extract_sample_baf_vectors,
     _extract_sample_event_probabilities,
     _get_event_probability_column,
     _get_confidence_column,
@@ -303,6 +306,59 @@ def test_plot_helpers_cover_event_probability_alignment_and_called_masks():
     assert _build_called_event_mask(region_df, 150, None) is None
     assert _build_called_event_mask(region_df, 150, 320).tolist() == [False, True, True]
     assert _build_called_event_mask(region_df, 150, 200).tolist() == [False, False, False]
+
+
+def test_plot_helpers_cover_baf_vector_alignment_and_variance_fallbacks():
+    region_df = pd.DataFrame(
+        {
+            "Cluster": ["c1", "c1", "c1"],
+            "Chr": ["chr1", "chr1", "chr1"],
+            "Start": [100, 200, 300],
+            "End": [150, 250, 350],
+        }
+    )
+    baf_df = pd.DataFrame(
+        {
+            "Cluster": ["c1", "c1", "c1"],
+            "Chr": ["chr1", "chr1", "chr1"],
+            "Start": [300, 100, 200],
+            "End": [350, 150, 250],
+            "S1": [0.30, 0.10, 0.20],
+        }
+    )
+    variance_df = baf_df.copy()
+    variance_df["S1"] = [0.03, np.nan, 0.02]
+    sites_df = baf_df.copy()
+    sites_df["S1"] = [12, 10, 0]
+
+    minor_baf, baf_variance, baf_sites = _extract_sample_baf_vectors(
+        region_df,
+        baf_df,
+        variance_df,
+        sites_df,
+        "S1",
+    )
+
+    assert np.allclose(minor_baf, [0.10, 0.20, 0.30])
+    assert np.isnan(baf_variance[0])
+    assert np.allclose(baf_variance[1:], [0.02, 0.03])
+    assert np.allclose(baf_sites, [10, 0, 12])
+
+    approx_var = _approximate_minor_baf_variance(np.array([0.25, 0.75]), np.array([10.0, 0.0]))
+    assert approx_var[0] == pytest.approx((np.pi / 20.0) * 0.25 * 0.75)
+    assert np.isinf(approx_var[1])
+
+    lower, upper = _compute_minor_baf_confidence_intervals(
+        np.array([0.25, 0.60, np.nan]),
+        np.array([10.0, 4.0, 5.0]),
+        np.array([np.nan, 0.04, np.nan]),
+    )
+
+    assert lower[0] < 0.25 < upper[0]
+    assert lower[1] == pytest.approx(max(0.0, 0.5 - 1.96 * np.sqrt(0.04)), rel=1e-4)
+    assert upper[1] == pytest.approx(0.5)
+    assert np.isnan(lower[2])
+    assert np.isnan(upper[2])
 
 
 def test_plot_helpers_cover_baf_support_column_selection():
@@ -714,6 +770,87 @@ def test_plot_locus_overview_draws_raw_and_processed_columns(monkeypatch, tmp_pa
     assert any(label.endswith("overview total") for label in timing_calls)
 
 
+def test_plot_locus_overview_draws_single_processed_column_without_raw_counts(monkeypatch, tmp_path):
+    locus = _make_eval_locus()
+    draw_calls = []
+    timing_calls = []
+    saved_paths = []
+
+    class _DummyFigure:
+        def subplots_adjust(self, **kwargs):
+            return None
+
+        def savefig(self, path, **kwargs):
+            saved_paths.append(path)
+
+    def fake_subplots(n_rows, n_cols, **kwargs):
+        axes = np.empty((n_rows, n_cols), dtype=object)
+        axes[:] = object()
+        return _DummyFigure(), axes
+
+    monkeypatch.setattr(plot_module.plt, "subplots", fake_subplots)
+    monkeypatch.setattr(plot_module.plt, "tight_layout", lambda *args, **kwargs: None)
+    monkeypatch.setattr(plot_module.plt, "close", lambda *args, **kwargs: None)
+    monkeypatch.setattr(plot_module, "get_sample_columns", lambda df: ["S1", "S2"])
+    monkeypatch.setattr(plot_module, "_build_ploidy_lookup", lambda df: {("S1", "chr10"): 2, ("S2", "chr10"): 2})
+    monkeypatch.setattr(plot_module, "_sort_samples_by_ploidy", lambda samples, chrom, lookup: list(samples))
+    monkeypatch.setattr(plot_module, "_rebin_region_df", lambda df, locus: df)
+    monkeypatch.setattr(
+        plot_module,
+        "_draw_overview_column",
+        lambda axes, region_df, locus, calls_df, region_start, region_end, carrier_cols, non_carrier_cols, all_ploidies, ploidy_lookup, sample_cols, carriers, gtf, segdup, **kwargs: draw_calls.append(
+            {
+                "title": kwargs["col_title"],
+                "carrier_cols": carrier_cols,
+                "non_carrier_cols": non_carrier_cols,
+                "sample_cols": sample_cols,
+                "rows": len(axes),
+            }
+        ),
+    )
+    monkeypatch.setattr(plot_module, "_print_timing", lambda label, start: timing_calls.append(label))
+
+    calls_df = pd.DataFrame(
+        {
+            "cluster": ["10q11.2"],
+            "sample": ["S2"],
+            "is_carrier": [True],
+        }
+    )
+    depth_df = pd.DataFrame(
+        {
+            "Cluster": ["10q11.2", "10q11.2"],
+            "Chr": ["chr10", "chr10"],
+            "Start": [46005406, 48181660],
+            "End": [48181660, 49845537],
+            "S1": [2.0, 1.8],
+            "S2": [2.3, 1.7],
+        }
+    )
+
+    plot_locus_overview(
+        locus,
+        calls_df,
+        depth_df,
+        None,
+        None,
+        str(tmp_path),
+        raw_counts_df=None,
+    )
+
+    assert draw_calls == [
+        {
+            "title": "10q11.2 (chr10:46,005,406-50,651,802)",
+            "carrier_cols": ["S2"],
+            "non_carrier_cols": ["S1"],
+            "sample_cols": ["S1", "S2"],
+            "rows": 5,
+        }
+    ]
+    assert saved_paths == [str(tmp_path / "locus_plots" / "10q11.2_overview.png")]
+    assert any(label.endswith("single column draw") for label in timing_calls)
+
+
 def test_plot_sample_at_locus_skips_missing_sample_and_saves_carrier_plot(monkeypatch, tmp_path):
     locus = _make_eval_locus()
     annotation_titles = []
@@ -865,6 +1002,87 @@ def test_create_carrier_pdf_handles_empty_and_nonempty_carrier_sets(monkeypatch,
     )
 
     assert render_calls == [("S1", "10q11.2", 1, 1, "qual_score", True)]
+
+
+def test_create_carrier_pdf_skips_loci_without_breakpoints_or_region_rows(monkeypatch, tmp_path, capsys):
+    missing_breakpoints_locus = GDLocus(
+        cluster="10q11.2",
+        chrom="chr10",
+        breakpoints=[],
+        breakpoint_names=[],
+        gd_entries=[],
+        is_nahr=False,
+        is_terminal=False,
+    )
+    empty_region_locus = GDLocus(
+        cluster="20q11.2",
+        chrom="chr20",
+        breakpoints=[(200, 200), (300, 300)],
+        breakpoint_names=["A", "B"],
+        gd_entries=[],
+        is_nahr=False,
+        is_terminal=False,
+    )
+
+    monkeypatch.setattr(plot_module, "PdfPages", _StubPdfPages)
+    monkeypatch.setattr(plot_module, "_print_timing", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        plot_module,
+        "_render_pdf_sample_page",
+        lambda *args, **kwargs: pytest.fail("render should be skipped when breakpoints or region rows are missing"),
+    )
+
+    calls_df = pd.DataFrame(
+        {
+            "cluster": ["10q11.2", "20q11.2"],
+            "sample": ["S1", "S2"],
+            "is_carrier": [True, True],
+            "is_best_match": [True, True],
+            "qual_score": [30.0, 25.0],
+            "svtype": ["DEL", "DUP"],
+        }
+    )
+    depth_df = pd.DataFrame(
+        {
+            "Cluster": ["other"],
+            "Chr": ["chr20"],
+            "Start": [100],
+            "End": [150],
+            "S1": [2.0],
+            "S2": [1.8],
+        }
+    )
+    baf_like_df = pd.DataFrame(
+        {
+            "Cluster": ["other"],
+            "Chr": ["chr20"],
+            "Start": [100],
+            "End": [150],
+            "S1": [0.4],
+            "S2": [0.3],
+        }
+    )
+
+    create_carrier_pdf(
+        calls_df,
+        depth_df,
+        {
+            "10q11.2": missing_breakpoints_locus,
+            "20q11.2": empty_region_locus,
+        },
+        None,
+        None,
+        str(tmp_path),
+        minor_baf_df=baf_like_df,
+        baf_variance_df=baf_like_df,
+        baf_sites_df=baf_like_df,
+        event_del_df=baf_like_df,
+        event_dup_df=baf_like_df,
+    )
+
+    out = capsys.readouterr().out
+    assert "Warning: no breakpoints for one locus; skipping" in out
+    assert "Adding 1 confident sample plot(s)" in out
 
 
 def test_eval_and_anomalous_pdf_wrappers_delegate_to_review_builder(monkeypatch, tmp_path):
@@ -2081,3 +2299,89 @@ def test_rebin_region_df_rebins_left_body_and_right_segments_independently():
     assert rebinned["Start"].tolist() == [0, 20, 110, 130, 260, 280]
     assert rebinned["End"].tolist() == [20, 30, 130, 140, 280, 290]
     assert rebinned["sample_1"].tolist() == pytest.approx([1.5, 3.0, 15.0, 30.0, 4.5, 6.0])
+
+
+def test_coarsen_pdf_page_signals_preserves_rows_when_segment_targets_do_not_force_grouping(monkeypatch):
+    locus = GDLocus(
+        cluster="1q21",
+        chrom="chr1",
+        breakpoints=[(100, 100), (150, 150), (200, 200), (250, 250)],
+        breakpoint_names=["1", "2", "3", "4"],
+        gd_entries=[],
+        is_nahr=True,
+        is_terminal=False,
+    )
+    region_df = pd.DataFrame(
+        {
+            "Cluster": [locus.cluster] * 4,
+            "Chr": [locus.chrom] * 4,
+            "Start": [10, 40, 120, 260],
+            "End": [20, 50, 130, 270],
+        }
+    )
+    sample_depth = np.array([1.0, 2.0, 3.0, 4.0], dtype=float)
+    minor_baf = np.array([0.1, 0.2, 0.3, 0.4], dtype=float)
+    baf_variance = np.array([0.01, 0.02, 0.03, 0.04], dtype=float)
+    baf_sites = np.array([5.0, 6.0, 7.0, 8.0], dtype=float)
+    event_probabilities = np.array([0.9, 0.8, 0.7, 0.6], dtype=float)
+
+    monkeypatch.setattr(plot_module, "_allocate_segment_bin_targets", lambda counts, max_total_bins: [0, 1, 1])
+
+    rebinned_region, rebinned_depth, rebinned_minor_baf, rebinned_baf_variance, rebinned_baf_sites, rebinned_event_probs = _coarsen_pdf_page_signals(
+        locus,
+        region_df,
+        sample_depth,
+        minor_baf,
+        baf_variance,
+        baf_sites,
+        event_probabilities,
+        max_total_bins=2,
+    )
+
+    assert rebinned_region[["Cluster", "Chr", "Start", "End"]].reset_index(drop=True).equals(region_df)
+    assert rebinned_depth.tolist() == pytest.approx(sample_depth.tolist())
+    assert rebinned_minor_baf.tolist() == pytest.approx(minor_baf.tolist())
+    assert rebinned_baf_variance.tolist() == pytest.approx(baf_variance.tolist())
+    assert rebinned_baf_sites.tolist() == pytest.approx(baf_sites.tolist())
+    assert rebinned_event_probs.tolist() == pytest.approx(event_probabilities.tolist())
+
+
+def test_coarsen_pdf_page_signals_groups_values_with_site_weighting_and_invalid_baf_inputs(monkeypatch):
+    locus = GDLocus(
+        cluster="1q21",
+        chrom="chr1",
+        breakpoints=[(100, 100), (150, 150), (200, 200), (250, 250)],
+        breakpoint_names=["1", "2", "3", "4"],
+        gd_entries=[],
+        is_nahr=True,
+        is_terminal=False,
+    )
+    region_df = pd.DataFrame(
+        {
+            "Cluster": [locus.cluster] * 6,
+            "Chr": [locus.chrom] * 6,
+            "Start": [10, 20, 30, 40, 120, 130],
+            "End": [15, 25, 35, 45, 125, 135],
+        }
+    )
+
+    monkeypatch.setattr(plot_module, "_allocate_segment_bin_targets", lambda counts, max_total_bins: [2, 1, 0])
+
+    rebinned_region, rebinned_depth, rebinned_minor_baf, rebinned_baf_variance, rebinned_baf_sites, rebinned_event_probs = _coarsen_pdf_page_signals(
+        locus,
+        region_df,
+        np.array([1.0, 3.0, 2.0, 6.0, 5.0, 7.0], dtype=float),
+        np.array([0.1, 0.5, np.nan, 0.7, 0.3, 0.9], dtype=float),
+        np.array([0.04, 0.09, 0.16, 0.25, 0.01, 0.04], dtype=float),
+        np.array([2.0, 6.0, 0.0, np.nan, 1.0, 3.0], dtype=float),
+        np.array([0.2, 0.4, 0.6, np.nan, 0.5, 0.7], dtype=float),
+        max_total_bins=3,
+    )
+
+    assert rebinned_region["Start"].tolist() == [10, 30, 120]
+    assert rebinned_region["End"].tolist() == [25, 45, 135]
+    assert rebinned_depth.tolist() == pytest.approx([2.0, 4.0, 6.0])
+    assert rebinned_minor_baf.tolist() == pytest.approx([0.4, np.nan, 0.75], nan_ok=True)
+    assert rebinned_baf_variance.tolist() == pytest.approx([0.053125, np.nan, 0.023125], nan_ok=True)
+    assert rebinned_baf_sites.tolist() == pytest.approx([8.0, 0.0, 4.0])
+    assert rebinned_event_probs.tolist() == pytest.approx([0.3, 0.6, 0.6])

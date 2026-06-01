@@ -34,11 +34,14 @@ import gatk_sv_gd.depth as depth_module
 
 
 class _FakeTensor:
-    def __init__(self, values):
-        self._values = np.asarray(values, dtype=np.float32)
+    def __init__(self, values, dtype=np.float32):
+        self._values = np.asarray(values, dtype=dtype)
 
     def detach(self):
         return self
+
+    def clone(self):
+        return _FakeTensor(self._values.copy(), dtype=self._values.dtype)
 
     def cpu(self):
         return self
@@ -716,6 +719,288 @@ def test_init_omits_baf_temperature_when_fixed(monkeypatch):
     assert "baf_temperature" not in block_calls["expose"]
 
 
+def test_build_guide_diagonal_splits_baf_temperature_into_separate_guides(monkeypatch):
+    model = object.__new__(CNVModel)
+    model.model = object()
+    model.learn_baf_temperature = True
+    model.latent_sites = ["sample_var", "baf_temperature", "pair_state_probs"]
+    block_calls = []
+
+    class FakeGuideList(list):
+        def __init__(self, model_fn):
+            super().__init__()
+            self.model_fn = model_fn
+
+    monkeypatch.setattr(
+        depth_module.poutine,
+        "block",
+        lambda model_fn, expose: block_calls.append((model_fn, list(expose))) or (model_fn, tuple(expose)),
+        raising=False,
+    )
+    monkeypatch.setattr(depth_module, "AutoGuideList", FakeGuideList)
+    monkeypatch.setattr(
+        depth_module,
+        "AutoDiagonalNormal",
+        lambda model_fn, init_loc_fn=None: ("diag", model_fn, init_loc_fn),
+    )
+    monkeypatch.setattr(
+        depth_module,
+        "AutoDelta",
+        lambda model_fn, init_loc_fn=None: ("delta", model_fn, init_loc_fn),
+    )
+
+    init_loc_fn = object()
+    guide = CNVModel._build_guide(model, "diagonal", init_loc_fn=init_loc_fn)
+
+    assert isinstance(guide, FakeGuideList)
+    assert guide == [
+        ("diag", (model.model, ("sample_var", "pair_state_probs")), init_loc_fn),
+        ("delta", (model.model, ("baf_temperature",)), init_loc_fn),
+    ]
+    assert block_calls == [
+        (model.model, ["sample_var", "baf_temperature", "pair_state_probs"]),
+        (model.model, ["sample_var", "pair_state_probs"]),
+        (model.model, ["baf_temperature"]),
+    ]
+
+
+def test_build_guide_diagonal_without_baf_temperature_and_unknown_type(monkeypatch):
+    model = object.__new__(CNVModel)
+    model.model = object()
+    model.learn_baf_temperature = False
+    model.latent_sites = ["sample_var"]
+
+    monkeypatch.setattr(
+        depth_module.poutine,
+        "block",
+        lambda model_fn, expose: (model_fn, tuple(expose)),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        depth_module,
+        "AutoDiagonalNormal",
+        lambda model_fn, init_loc_fn=None: ("diag", model_fn, init_loc_fn),
+    )
+
+    init_loc_fn = object()
+    assert CNVModel._build_guide(model, "diagonal", init_loc_fn=init_loc_fn) == (
+        "diag",
+        (model.model, ("sample_var",)),
+        init_loc_fn,
+    )
+
+    with pytest.raises(ValueError, match="Unknown guide_type"):
+        CNVModel._build_guide(model, "unsupported")
+
+
+def test_build_guide_diagonal_without_init_function_uses_default_autoguides(monkeypatch):
+    model = object.__new__(CNVModel)
+    model.model = object()
+    model.learn_baf_temperature = True
+    model.latent_sites = ["sample_var", "baf_temperature"]
+
+    class FakeGuideList(list):
+        def __init__(self, model_fn):
+            super().__init__()
+            self.model_fn = model_fn
+
+    monkeypatch.setattr(
+        depth_module.poutine,
+        "block",
+        lambda model_fn, expose: (model_fn, tuple(expose)),
+        raising=False,
+    )
+    monkeypatch.setattr(depth_module, "AutoGuideList", FakeGuideList)
+    monkeypatch.setattr(depth_module, "AutoDiagonalNormal", lambda model_fn, init_loc_fn=None: ("diag", model_fn, init_loc_fn))
+    monkeypatch.setattr(depth_module, "AutoDelta", lambda model_fn, init_loc_fn=None: ("delta", model_fn, init_loc_fn))
+
+    split_guide = CNVModel._build_guide(model, "diagonal")
+    assert split_guide == [
+        ("diag", (model.model, ("sample_var",)), None),
+        ("delta", (model.model, ("baf_temperature",)), None),
+    ]
+
+    model.learn_baf_temperature = False
+    model.latent_sites = ["sample_var"]
+    assert CNVModel._build_guide(model, "diagonal") == ("diag", (model.model, ("sample_var",)), None)
+
+
+def test_warmup_model_and_initial_values_conditions_baf_temperature_when_learned(monkeypatch):
+    model = object.__new__(CNVModel)
+    model.model = object()
+    model.latent_sites = ["sample_var", "baf_temperature", "pair_state_probs"]
+    model.learn_baf_temperature = True
+
+    class _CloneableTensor:
+        def detach(self):
+            return self
+
+        def clone(self):
+            return self
+
+    fixed_temperature = _CloneableTensor()
+    model._fixed_baf_temperature_tensor = lambda: fixed_temperature
+
+    monkeypatch.setattr(
+        depth_module.poutine,
+        "condition",
+        lambda model_fn, data: ("conditioned", model_fn, data),
+        raising=False,
+    )
+
+    conditioned_model, expose_sites, init_values = CNVModel._warmup_model_and_initial_values(model)
+
+    assert conditioned_model == ("conditioned", model.model, {"baf_temperature": fixed_temperature})
+    assert expose_sites == ["sample_var", "pair_state_probs"]
+    assert init_values == {"baf_temperature": fixed_temperature}
+
+    model.learn_baf_temperature = False
+    plain_model, plain_sites, plain_init_values = CNVModel._warmup_model_and_initial_values(model)
+    assert plain_model is model.model
+    assert plain_sites == model.latent_sites
+    assert plain_init_values == {}
+
+
+def test_extract_guide_latent_values_filters_to_present_latent_sites(monkeypatch):
+    model = object.__new__(CNVModel)
+    model.latent_sites = ["sample_var", "length_scale_var", "baf_temperature"]
+
+    guide_trace = SimpleNamespace(
+        nodes={
+            "sample_var": {"value": _FakeTensor([0.1, 0.2])},
+            "length_scale_var": {"value": _FakeTensor([1000.0])},
+            "extra": {"value": _FakeTensor([5.0])},
+        }
+    )
+
+    monkeypatch.setattr(
+        depth_module.poutine,
+        "trace",
+        lambda guide: SimpleNamespace(get_trace=lambda **kwargs: guide_trace),
+        raising=False,
+    )
+
+    values = CNVModel._extract_guide_latent_values(
+        model,
+        guide=object(),
+        data=SimpleNamespace(depth=object(), interval_sizes=object(), n_bins=2, n_samples=1),
+    )
+
+    assert set(values) == {"sample_var", "length_scale_var"}
+    assert np.allclose(values["sample_var"].numpy(), np.array([0.1, 0.2], dtype=np.float32))
+    assert np.allclose(values["length_scale_var"].numpy(), np.array([1000.0], dtype=np.float32))
+
+
+def test_get_map_estimates_extracts_learned_latents_and_cn_probabilities(monkeypatch):
+    guide_token = object()
+    inferred_token = object()
+    guide_trace = SimpleNamespace(
+        nodes={
+            "bin_bias": {"value": _FakeTensor([[1.1], [0.9]])},
+            "sample_var": {"value": _FakeTensor([0.2])},
+            "length_scale_var": {"value": _FakeTensor([500.0])},
+            "baf_temperature": {"value": _FakeTensor([1.5])},
+            "pair_state_probs": {"value": _FakeTensor([[0.7, 0.3], [0.4, 0.6]])},
+        }
+    )
+    discrete_trace = SimpleNamespace(
+        nodes={
+            "pair_state": {"value": _FakeTensor([[1], [0]], dtype=np.int64)},
+        }
+    )
+
+    model = object.__new__(CNVModel)
+    model.guide = guide_token
+    model.model = object()
+    model.freeze_bin_bias = False
+    model.freeze_pair_state_priors = False
+    model.learn_baf_temperature = True
+    model.pair_states = [(0, 1), (1, 1)]
+    model.max_total_cn = 2
+    model._effective_pair_state_prior_values = lambda probs: np.asarray(probs, dtype=np.float32)
+    model._null_state_prior_value = lambda: 0.05
+
+    monkeypatch.setattr(
+        depth_module.poutine,
+        "trace",
+        lambda target: SimpleNamespace(
+            get_trace=lambda **kwargs: guide_trace if target is guide_token else discrete_trace
+        ),
+        raising=False,
+    )
+    monkeypatch.setattr(depth_module.poutine, "replay", lambda model_fn, trace: ("replayed", model_fn, trace), raising=False)
+    monkeypatch.setattr(depth_module, "infer_discrete", lambda trained_model, **kwargs: inferred_token)
+
+    map_estimates = CNVModel.get_map_estimates(
+        model,
+        SimpleNamespace(depth=object(), interval_sizes=object(), n_bins=2, n_samples=1),
+    )
+
+    assert np.allclose(map_estimates["bin_bias"], np.array([[1.1], [0.9]], dtype=np.float32))
+    assert np.allclose(map_estimates["sample_var"], np.array([0.2], dtype=np.float32))
+    assert np.allclose(map_estimates["length_scale_var"], np.array([500.0], dtype=np.float32))
+    assert np.allclose(map_estimates["baf_temperature"], np.array([1.5], dtype=np.float32))
+    assert np.allclose(map_estimates["pair_state_probs"], np.array([[0.7, 0.3], [0.4, 0.6]], dtype=np.float32))
+    assert np.allclose(map_estimates["pair_state"], np.array([1, 0], dtype=np.int64))
+    assert np.allclose(map_estimates["cn"], np.array([2, 1], dtype=np.int64))
+    assert map_estimates["pair_state_labels"] == [(0, 1), (1, 1)]
+    assert np.allclose(map_estimates["null_state_prior"], np.array([0.05, 0.05], dtype=np.float32))
+    assert np.allclose(
+        map_estimates["cn_probs"],
+        np.array([[0.0, 0.7, 0.3], [0.0, 0.4, 0.6]], dtype=np.float32),
+    )
+
+
+def test_get_map_estimates_uses_fixed_latents_when_requested(monkeypatch):
+    guide_token = object()
+    inferred_token = object()
+    guide_trace = SimpleNamespace(
+        nodes={
+            "sample_var": {"value": _FakeTensor([0.3])},
+            "length_scale_var": {"value": _FakeTensor([250.0])},
+        }
+    )
+    discrete_trace = SimpleNamespace(
+        nodes={
+            "pair_state": {"value": _FakeTensor([[0], [1]], dtype=np.int64)},
+        }
+    )
+
+    model = object.__new__(CNVModel)
+    model.guide = guide_token
+    model.model = object()
+    model.freeze_bin_bias = True
+    model.freeze_pair_state_priors = True
+    model.learn_baf_temperature = False
+    model.pair_states = [(0, 1), (1, 1)]
+    model.max_total_cn = 2
+    model._fixed_bin_bias_values = lambda n_bins: np.ones(n_bins, dtype=np.float32)
+    model._fixed_baf_temperature_values = lambda: np.asarray([2.0], dtype=np.float32)
+    model._fixed_pair_state_probs_values = lambda n_bins: np.asarray([[0.9, 0.1], [0.2, 0.8]], dtype=np.float32)
+    model._effective_pair_state_prior_values = lambda probs: np.asarray(probs, dtype=np.float32)
+    model._null_state_prior_value = lambda: 0.1
+
+    monkeypatch.setattr(
+        depth_module.poutine,
+        "trace",
+        lambda target: SimpleNamespace(
+            get_trace=lambda **kwargs: guide_trace if target is guide_token else discrete_trace
+        ),
+        raising=False,
+    )
+    monkeypatch.setattr(depth_module.poutine, "replay", lambda model_fn, trace: ("replayed", model_fn, trace), raising=False)
+    monkeypatch.setattr(depth_module, "infer_discrete", lambda trained_model, **kwargs: inferred_token)
+
+    map_estimates = CNVModel.get_map_estimates(
+        model,
+        SimpleNamespace(depth=object(), interval_sizes=object(), n_bins=2, n_samples=1),
+    )
+
+    assert np.allclose(map_estimates["bin_bias"], np.ones(2, dtype=np.float32))
+    assert np.allclose(map_estimates["baf_temperature"], np.array([2.0], dtype=np.float32))
+    assert np.allclose(map_estimates["pair_state_probs"], np.array([[0.9, 0.1], [0.2, 0.8]], dtype=np.float32))
+
+
 def test_model_requires_count_anchored_normalization_metadata():
     model = object.__new__(CNVModel)
     model.debug = False
@@ -724,6 +1009,368 @@ def test_model_requires_count_anchored_normalization_metadata():
 
     with pytest.raises(RuntimeError, match="sample_raw_count_medians and reference_bin_size are required"):
         model.model(depth=None, interval_sizes=None, n_bins=1, n_samples=1)
+
+
+def test_model_uses_sampled_latents_and_emits_baf_factor(monkeypatch):
+    torch = depth_module.torch
+
+    class _FakePlate:
+        def __enter__(self):
+            return None
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+    class _FakeNormal:
+        def __init__(self, loc, scale):
+            self.loc = loc
+            self.scale = scale
+
+        def log_prob(self, value):
+            safe_scale = torch.clamp(self.scale, min=1e-6)
+            return -((value - self.loc) ** 2) / (2.0 * safe_scale ** 2)
+
+    model = object.__new__(CNVModel)
+    model.debug = False
+    model.device = "cpu"
+    model.dtype = torch.float32
+    model._zero_t = torch.tensor(0.0, dtype=torch.float32)
+    model._count_anchored_reference_variance_t = torch.tensor([[0.2, 0.4]], dtype=torch.float32)
+    model._sample_var_rate_t = torch.tensor(1.0, dtype=torch.float32)
+    model._length_scale_var_rate_t = torch.tensor(1.0, dtype=torch.float32)
+    model._baf_temperature_log_t = torch.tensor(0.0, dtype=torch.float32)
+    model._baf_temperature_prior_scale_t = torch.tensor(0.1, dtype=torch.float32)
+    model._var_bias_bin_t = torch.tensor(0.1, dtype=torch.float32)
+    model._alpha_pair_t = torch.tensor([1.0, 1.0], dtype=torch.float32)
+    model.learn_baf_temperature = True
+    model.freeze_bin_bias = False
+    model.freeze_pair_state_priors = False
+    model.bin_size_factor = 100.0
+    model.baf_temperature = 1.0
+    model.baf_outlier_rate = 0.05
+    model.total_cn_by_state = torch.tensor([1.0, 2.0], dtype=torch.float32)
+    model.minor_baf_by_state = torch.tensor([0.0, 0.5], dtype=torch.float32)
+    model.n_states = 2
+    model.use_baf_effective_count = False
+    model._baf_reference_probs_tensor = lambda: torch.tensor([0.5, 0.5], dtype=torch.float32)
+    model.current_data = SimpleNamespace(
+        has_baf=True,
+        has_baf_effective_count=False,
+        minor_baf_median=torch.tensor([[0.2, 0.3], [0.4, 0.5]], dtype=torch.float32),
+        baf_variance=torch.tensor([[0.01, 0.02], [0.03, 0.04]], dtype=torch.float32),
+        baf_n_sites=torch.tensor([[5.0, 5.0], [5.0, 5.0]], dtype=torch.float32),
+    )
+
+    sample_calls = []
+    factor_calls = []
+
+    def fake_sample(name, distribution, obs=None):
+        sample_calls.append(name)
+        if name == "sample_var":
+            return torch.tensor([0.1, 0.2], dtype=torch.float32)
+        if name == "length_scale_var":
+            return torch.tensor(10.0, dtype=torch.float32)
+        if name == "baf_temperature":
+            return torch.tensor(1.5, dtype=torch.float32)
+        if name == "bin_bias":
+            return torch.tensor([[1.0], [1.2]], dtype=torch.float32)
+        if name == "pair_state_probs":
+            return torch.tensor([[[0.7, 0.3]], [[0.4, 0.6]]], dtype=torch.float32)
+        if name == "pair_state":
+            return torch.tensor([[0, 1], [1, 0]], dtype=torch.long)
+        if name == "obs":
+            return obs
+        raise AssertionError(f"Unexpected sample site: {name}")
+
+    monkeypatch.setattr(depth_module.pyro, "plate", lambda *args, **kwargs: _FakePlate(), raising=False)
+    monkeypatch.setattr(depth_module.pyro, "sample", fake_sample, raising=False)
+    monkeypatch.setattr(
+        depth_module,
+        "dist",
+        SimpleNamespace(
+            Exponential=lambda rate: ("exponential", rate),
+            LogNormal=lambda loc, scale: ("lognormal", loc, scale),
+            Dirichlet=lambda alpha: ("dirichlet", alpha),
+            Categorical=lambda probs: ("categorical", probs),
+            Normal=_FakeNormal,
+        ),
+    )
+    monkeypatch.setattr(depth_module, "Vindex", lambda value: value)
+    monkeypatch.setattr(
+        depth_module.pyro,
+        "factor",
+        lambda name, value: factor_calls.append((name, value.detach().cpu().numpy())),
+        raising=False,
+    )
+
+    depth = torch.tensor([[1.9, 2.1], [2.8, 1.1]], dtype=torch.float32)
+    interval_sizes = torch.tensor([[100.0], [200.0]], dtype=torch.float32)
+
+    model.model(depth=depth, interval_sizes=interval_sizes, n_bins=2, n_samples=2)
+
+    assert sample_calls == [
+        "sample_var",
+        "length_scale_var",
+        "baf_temperature",
+        "bin_bias",
+        "pair_state_probs",
+        "pair_state",
+        "obs",
+    ]
+    assert len(factor_calls) == 1
+    assert factor_calls[0][0] == "baf_lik"
+    assert factor_calls[0][1].shape == (2, 2)
+
+
+def test_model_uses_fixed_latents_without_baf_factor(monkeypatch):
+    torch = depth_module.torch
+
+    class _FakePlate:
+        def __enter__(self):
+            return None
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+    class _FakeNormal:
+        def __init__(self, loc, scale):
+            self.loc = loc
+            self.scale = scale
+
+        def log_prob(self, value):
+            safe_scale = torch.clamp(self.scale, min=1e-6)
+            return -((value - self.loc) ** 2) / (2.0 * safe_scale ** 2)
+
+    model = object.__new__(CNVModel)
+    model.debug = False
+    model.device = "cpu"
+    model.dtype = torch.float32
+    model._zero_t = torch.tensor(0.0, dtype=torch.float32)
+    model._count_anchored_reference_variance_t = torch.tensor([[0.2, 0.4]], dtype=torch.float32)
+    model._sample_var_rate_t = torch.tensor(1.0, dtype=torch.float32)
+    model._length_scale_var_rate_t = torch.tensor(1.0, dtype=torch.float32)
+    model.learn_baf_temperature = False
+    model.freeze_bin_bias = True
+    model.freeze_pair_state_priors = True
+    model.bin_size_factor = 100.0
+    model.baf_temperature = 0.0
+    model.baf_outlier_rate = 0.0
+    model.total_cn_by_state = torch.tensor([1.0, 2.0], dtype=torch.float32)
+    model.n_states = 2
+    model.use_baf_effective_count = False
+    model.current_data = SimpleNamespace(has_baf=False)
+
+    fixed_calls = []
+    sample_calls = []
+    factor_calls = []
+
+    model._fixed_baf_temperature_tensor = lambda: fixed_calls.append("baf_temperature") or torch.tensor(2.0, dtype=torch.float32)
+    model._fixed_bin_bias_tensor = lambda n_bins: fixed_calls.append(("bin_bias", n_bins)) or torch.ones((n_bins, 1), dtype=torch.float32)
+    model._fixed_pair_state_probs_tensor = lambda n_bins: fixed_calls.append(("pair_state_probs", n_bins)) or torch.full((n_bins, 1, 2), 0.5, dtype=torch.float32)
+
+    def fake_sample(name, distribution, obs=None):
+        sample_calls.append(name)
+        if name == "sample_var":
+            return torch.tensor([0.1, 0.2], dtype=torch.float32)
+        if name == "length_scale_var":
+            return torch.tensor(10.0, dtype=torch.float32)
+        if name == "pair_state":
+            return torch.tensor([[0, 1], [1, 0]], dtype=torch.long)
+        if name == "obs":
+            return obs
+        raise AssertionError(f"Unexpected sample site: {name}")
+
+    monkeypatch.setattr(depth_module.pyro, "plate", lambda *args, **kwargs: _FakePlate(), raising=False)
+    monkeypatch.setattr(depth_module.pyro, "sample", fake_sample, raising=False)
+    monkeypatch.setattr(
+        depth_module,
+        "dist",
+        SimpleNamespace(
+            Exponential=lambda rate: ("exponential", rate),
+            LogNormal=lambda loc, scale: ("lognormal", loc, scale),
+            Dirichlet=lambda alpha: ("dirichlet", alpha),
+            Categorical=lambda probs: ("categorical", probs),
+            Normal=_FakeNormal,
+        ),
+    )
+    monkeypatch.setattr(depth_module, "Vindex", lambda value: value)
+    monkeypatch.setattr(depth_module.pyro, "factor", lambda name, value: factor_calls.append(name), raising=False)
+
+    depth = torch.tensor([[1.9, 2.1], [2.8, 1.1]], dtype=torch.float32)
+    interval_sizes = torch.tensor([[100.0], [200.0]], dtype=torch.float32)
+
+    model.model(depth=depth, interval_sizes=interval_sizes, n_bins=2, n_samples=2)
+
+    assert fixed_calls == ["baf_temperature", ("bin_bias", 2), ("pair_state_probs", 2)]
+    assert sample_calls == ["sample_var", "length_scale_var", "pair_state", "obs"]
+    assert factor_calls == []
+
+
+def test_model_debug_path_reports_tensor_shapes(monkeypatch, capsys):
+    torch = depth_module.torch
+
+    class _FakePlate:
+        def __enter__(self):
+            return None
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+    class _FakeNormal:
+        def __init__(self, loc, scale):
+            self.loc = loc
+            self.scale = scale
+
+        def log_prob(self, value):
+            safe_scale = torch.clamp(self.scale, min=1e-6)
+            return -((value - self.loc) ** 2) / (2.0 * safe_scale ** 2)
+
+    model = object.__new__(CNVModel)
+    model.debug = True
+    model.device = "cpu"
+    model.dtype = torch.float32
+    model._zero_t = torch.tensor(0.0, dtype=torch.float32)
+    model._count_anchored_reference_variance_t = torch.tensor([[0.2, 0.4]], dtype=torch.float32)
+    model._sample_var_rate_t = torch.tensor(1.0, dtype=torch.float32)
+    model._length_scale_var_rate_t = torch.tensor(1.0, dtype=torch.float32)
+    model.learn_baf_temperature = False
+    model.freeze_bin_bias = True
+    model.freeze_pair_state_priors = True
+    model.bin_size_factor = 100.0
+    model.baf_temperature = 0.0
+    model.baf_outlier_rate = 0.0
+    model.total_cn_by_state = torch.tensor([1.0, 2.0], dtype=torch.float32)
+    model.n_states = 2
+    model.use_baf_effective_count = False
+    model.current_data = SimpleNamespace(has_baf=False)
+    model._fixed_baf_temperature_tensor = lambda: torch.tensor(2.0, dtype=torch.float32)
+    model._fixed_bin_bias_tensor = lambda n_bins: torch.ones((n_bins, 1), dtype=torch.float32)
+    model._fixed_pair_state_probs_tensor = lambda n_bins: torch.full((n_bins, 1, 2), 0.5, dtype=torch.float32)
+
+    def fake_sample(name, distribution, obs=None):
+        if name == "sample_var":
+            return torch.tensor([0.1, 0.2], dtype=torch.float32)
+        if name == "length_scale_var":
+            return torch.tensor(10.0, dtype=torch.float32)
+        if name == "pair_state":
+            return torch.tensor([[0, 1], [1, 0]], dtype=torch.long)
+        if name == "obs":
+            return obs
+        raise AssertionError(f"Unexpected sample site: {name}")
+
+    monkeypatch.setattr(depth_module.pyro, "plate", lambda *args, **kwargs: _FakePlate(), raising=False)
+    monkeypatch.setattr(depth_module.pyro, "sample", fake_sample, raising=False)
+    monkeypatch.setattr(depth_module.pyro, "factor", lambda name, value: None, raising=False)
+    monkeypatch.setattr(
+        depth_module,
+        "dist",
+        SimpleNamespace(
+            Exponential=lambda rate: ("exponential", rate),
+            LogNormal=lambda loc, scale: ("lognormal", loc, scale),
+            Dirichlet=lambda alpha: ("dirichlet", alpha),
+            Categorical=lambda probs: ("categorical", probs),
+            Normal=_FakeNormal,
+        ),
+    )
+    monkeypatch.setattr(depth_module, "Vindex", lambda value: value)
+
+    model.model(
+        depth=torch.tensor([[1.9, 2.1], [2.8, 1.1]], dtype=torch.float32),
+        interval_sizes=torch.tensor([[100.0], [200.0]], dtype=torch.float32),
+        n_bins=2,
+        n_samples=2,
+    )
+
+    out = capsys.readouterr().out
+    assert "=== MODEL DEBUG ===" in out
+    assert "sample_var.shape:" in out
+    assert "pair_state.shape:" in out
+    assert "About to sample obs with expected_depth.shape=" in out
+    assert "=== END MODEL DEBUG ===" in out
+
+
+def test_model_raises_when_reference_variance_sample_count_does_not_match(monkeypatch):
+    torch = depth_module.torch
+
+    class _FakePlate:
+        def __enter__(self):
+            return None
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+    model = object.__new__(CNVModel)
+    model.debug = False
+    model.device = "cpu"
+    model.dtype = torch.float32
+    model._zero_t = torch.tensor(0.0, dtype=torch.float32)
+    model._count_anchored_reference_variance_t = torch.tensor([[0.2]], dtype=torch.float32)
+    model._sample_var_rate_t = torch.tensor(1.0, dtype=torch.float32)
+    model._length_scale_var_rate_t = torch.tensor(1.0, dtype=torch.float32)
+    model.learn_baf_temperature = False
+    model.freeze_bin_bias = True
+    model.freeze_pair_state_priors = True
+    model.bin_size_factor = 100.0
+    model.baf_temperature = 0.0
+    model.baf_outlier_rate = 0.0
+    model.total_cn_by_state = torch.tensor([1.0, 2.0], dtype=torch.float32)
+    model.n_states = 2
+    model.current_data = SimpleNamespace(has_baf=False)
+    model._fixed_baf_temperature_tensor = lambda: torch.tensor(2.0, dtype=torch.float32)
+    model._fixed_bin_bias_tensor = lambda n_bins: torch.ones((n_bins, 1), dtype=torch.float32)
+    model._fixed_pair_state_probs_tensor = lambda n_bins: torch.full((n_bins, 1, 2), 0.5, dtype=torch.float32)
+
+    monkeypatch.setattr(depth_module.pyro, "plate", lambda *args, **kwargs: _FakePlate(), raising=False)
+    monkeypatch.setattr(
+        depth_module.pyro,
+        "sample",
+        lambda name, distribution, obs=None: torch.tensor([0.1, 0.2], dtype=torch.float32)
+        if name == "sample_var"
+        else torch.tensor(10.0, dtype=torch.float32)
+        if name == "length_scale_var"
+        else torch.tensor([[0, 1], [1, 0]], dtype=torch.long)
+        if name == "pair_state"
+        else obs,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        depth_module,
+        "dist",
+        SimpleNamespace(
+            Exponential=lambda rate: ("exponential", rate),
+            LogNormal=lambda loc, scale: ("lognormal", loc, scale),
+            Dirichlet=lambda alpha: ("dirichlet", alpha),
+            Categorical=lambda probs: ("categorical", probs),
+            Normal=lambda loc, scale: ("normal", loc, scale),
+        ),
+    )
+    monkeypatch.setattr(depth_module, "Vindex", lambda value: value)
+
+    with pytest.raises(ValueError, match="sample_raw_count_medians length does not match"):
+        model.model(
+            depth=torch.tensor([[1.9, 2.1], [2.8, 1.1]], dtype=torch.float32),
+            interval_sizes=torch.tensor([[100.0], [200.0]], dtype=torch.float32),
+            n_bins=2,
+            n_samples=2,
+        )
+
+
+def test_train_prints_interrupt_message_and_clears_current_data(monkeypatch, capsys):
+    model = object.__new__(CNVModel)
+    model.guide_type = "delta"
+    model._build_guide = lambda *args, **kwargs: object()
+    model._run_svi_training = lambda *args, **kwargs: (_ for _ in ()).throw(KeyboardInterrupt())
+    model.current_data = None
+
+    monkeypatch.setattr(depth_module.pyro, "clear_param_store", lambda: None, raising=False)
+
+    data = SimpleNamespace(depth=object(), interval_sizes=object(), n_bins=1, n_samples=1)
+
+    model.train(data, max_iter=1, guide_warmup_iter=0, early_stopping=False)
+
+    out = capsys.readouterr().out
+    assert "Training interrupted by user." in out
+    assert model.current_data is None
 
 
 def test_fixed_bin_latent_values_use_centered_defaults():

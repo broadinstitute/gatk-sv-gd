@@ -11,6 +11,7 @@ from gatk_sv_gd.bins import determine_best_breakpoints
 from gatk_sv_gd.bins import read_data
 from gatk_sv_gd.bins import filter_low_quality_bins
 from gatk_sv_gd.bins import extract_locus_bins
+from gatk_sv_gd.bins import assign_bins_to_intervals
 from gatk_sv_gd.bins import get_flank_filter_params
 from gatk_sv_gd.bins import rebin_locus_intervals
 from gatk_sv_gd.bins import _allocate_bins_across_segments
@@ -156,6 +157,61 @@ def test_extract_locus_bins_applies_exclusion_bypass_and_hard_include():
     )
 
     assert result["Start"].tolist() == [90, 110, 120]
+
+
+def test_assign_bins_to_intervals_prefers_greatest_overlap_and_tracks_breakpoint_ranges():
+    locus = GDLocus(
+        cluster="cluster1",
+        chrom="chr1",
+        breakpoints=[(100, 110), (150, 160), (210, 220)],
+        breakpoint_names=["1", "2", "3"],
+        gd_entries=[],
+        is_nahr=True,
+        is_terminal=False,
+    )
+    df = pd.DataFrame(
+        {
+            "Start": [85, 112, 100, 220, 500],
+            "End": [100, 140, 110, 240, 510],
+        }
+    )
+
+    interval_bins = assign_bins_to_intervals(
+        df,
+        locus,
+        flank_regions=[(80, 100, "left_flank"), (220, 240, "right_flank")],
+    )
+
+    assert interval_bins["left_flank"] == [0]
+    assert interval_bins["1-2"] == [1]
+    assert interval_bins["2-3"] == []
+    assert interval_bins["right_flank"] == [3]
+    assert interval_bins["breakpoint_ranges"] == [2, 4]
+
+
+def test_assign_bins_to_intervals_falls_back_to_locus_flanking_regions():
+    locus = GDLocus(
+        cluster="cluster1",
+        chrom="chr1",
+        breakpoints=[(100, 110), (150, 160)],
+        breakpoint_names=["1", "2"],
+        gd_entries=[],
+        is_nahr=True,
+        is_terminal=False,
+    )
+    df = pd.DataFrame(
+        {
+            "Start": [90, 112, 160],
+            "End": [100, 148, 170],
+        }
+    )
+
+    interval_bins = assign_bins_to_intervals(df, locus)
+
+    assert interval_bins["left_flank"] == [0]
+    assert interval_bins["1-2"] == [1]
+    assert interval_bins["right_flank"] == [2]
+    assert interval_bins["breakpoint_ranges"] == []
 
 
 def test_ploidy_adjust_depths_scales_each_sample_by_chromosome_specific_ploidy():
@@ -516,6 +572,18 @@ def test_read_data_renames_chr_builds_bin_index_and_sets_source_file(tmp_path):
     assert loaded["source_file"].tolist() == ["panel_run", "panel_run"]
 
 
+def test_read_data_prints_error_and_reraises_on_invalid_input(tmp_path, capsys):
+    input_path = tmp_path / "bins.tsv.gz"
+    input_path.write_text("not\ta\tvalid\tgzip\n", encoding="utf-8")
+
+    with pytest.raises(Exception):
+        read_data(str(input_path))
+
+    out = capsys.readouterr().out
+    assert "Loading binned read-count data" in out
+    assert "Error loading binned read-count data" in out
+
+
 def test_filter_low_quality_bins_excludes_ploidy_zero_samples():
     df = pd.DataFrame(
         {
@@ -563,6 +631,40 @@ def test_filter_low_quality_bins_ignores_par_bins():
     )
 
     assert len(filtered) == 1
+
+
+def test_filter_low_quality_bins_reports_no_informative_and_verbose_breakdown(monkeypatch, capsys):
+    df = pd.DataFrame(
+        {
+            "Chr": ["chr1", "chr1"],
+            "Start": [100, 200],
+            "End": [150, 250],
+            "sample_1": [0.1, 0.2],
+        }
+    )
+
+    monkeypatch.setattr(
+        bins_module,
+        "compute_bin_quality_mask",
+        lambda *args, **kwargs: (
+            np.asarray([True, False], dtype=bool),
+            {
+                "filtered": 1,
+                "par_ignored": 0,
+                "hard_included": 0,
+                "no_informative": 2,
+            },
+        ),
+    )
+    monkeypatch.setattr(bins_module._util, "VERBOSE", True)
+
+    filtered = filter_low_quality_bins(df)
+
+    out = capsys.readouterr().out
+    assert "Bins with no informative samples: 2" in out
+    assert "[verbose] Filter breakdown:" in out
+    assert "bins without informative samples: 2" in out
+    assert filtered["Start"].tolist() == [100]
 
 
 def test_get_flank_filter_params_tightens_autosomes_only():
