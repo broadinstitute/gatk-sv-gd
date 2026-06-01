@@ -53,6 +53,13 @@ class _IntervalMask:
         self.start = start
         self.end = end
 
+    def get_overlap_fraction(self, chrom, start, end):
+        if chrom != self.chrom:
+            return 0.0
+        overlap = max(0, min(end, self.end) - max(start, self.start))
+        length = max(1, end - start)
+        return overlap / length
+
     def get_overlap_fractions_batch(self, chrom, starts, ends):
         if chrom != self.chrom:
             return np.zeros(len(starts))
@@ -696,6 +703,43 @@ def test_write_preprocessed_bins_persists_expected_table(tmp_path):
     pd.testing.assert_frame_equal(loaded_df, combined_df)
 
 
+def test_get_locus_interval_bins_groups_only_requested_cluster():
+    mappings = [
+        preprocess_module.LocusBinMapping(
+            cluster="cluster1",
+            locus=None,
+            interval_name="body",
+            array_idx=2,
+            chrom="chr1",
+            start=100,
+            end=150,
+        ),
+        preprocess_module.LocusBinMapping(
+            cluster="cluster2",
+            locus=None,
+            interval_name="body",
+            array_idx=7,
+            chrom="chr1",
+            start=150,
+            end=200,
+        ),
+        preprocess_module.LocusBinMapping(
+            cluster="cluster1",
+            locus=None,
+            interval_name="left_flank",
+            array_idx=1,
+            chrom="chr1",
+            start=50,
+            end=100,
+        ),
+    ]
+
+    assert preprocess_module.get_locus_interval_bins(mappings, "cluster1") == {
+        "body": [2],
+        "left_flank": [1],
+    }
+
+
 def test_build_normalization_metadata_validates_inputs():
     with pytest.raises(ValueError, match="same length"):
         preprocess_module.build_normalization_metadata(
@@ -1044,6 +1088,164 @@ def test_main_rejects_empty_preprocessed_output(tmp_path, monkeypatch):
         preprocess_module.main()
 
 
+def test_main_without_baf_table_skips_baf_outputs_and_reports_seven_tables(tmp_path, monkeypatch, capsys):
+    class FakeGDTable:
+        def __init__(self, path):
+            self.loci = {"cluster_keep": SimpleNamespace(breakpoints=[(1, 1)], n_breakpoints=1)}
+            self.df = pd.DataFrame([
+                {
+                    "cluster": "cluster_keep",
+                    "chr": "chr1",
+                    "start_GRCh38": 100,
+                    "end_GRCh38": 200,
+                    "GD_ID": "GD_KEEP",
+                    "svtype": "DEL",
+                    "NAHR": "yes",
+                    "terminal": "no",
+                    "BP1": "1",
+                    "BP2": "2",
+                },
+            ])
+
+        @staticmethod
+        def _standalone_locus_key(row):
+            return "unused"
+
+    args = SimpleNamespace(
+        exclusion_intervals=[],
+        flank_exclusion_intervals=[],
+        par_intervals=[["par.bed"]],
+        hard_inclusion_intervals=[],
+        verbose=False,
+        output_dir=str(tmp_path),
+        gd_table="gd_table.tsv",
+        input="input.tsv.gz",
+        median_min=1.0,
+        median_max=3.0,
+        mad_max=0.2,
+        high_res_counts=None,
+        regions=None,
+        exclusion_threshold=0.25,
+        locus_padding=0,
+        min_bins_per_interval=1,
+        max_bins_per_interval=0,
+        exclusion_bypass_threshold=1.0,
+        min_rebin_coverage=0.5,
+        min_flank_bases=10,
+        max_flank_bases=100,
+        min_flank_bins=1,
+        min_flank_coverage=0.0,
+        baf_table=None,
+    )
+
+    monkeypatch.setattr(preprocess_module, "parse_args", lambda: args)
+    monkeypatch.setattr(preprocess_module, "setup_logging", lambda *args, **kwargs: None)
+    monkeypatch.setattr(preprocess_module, "GDTable", FakeGDTable)
+    monkeypatch.setattr(preprocess_module, "validate_gd_table_for_preprocess", lambda gd_table: None)
+    monkeypatch.setattr(preprocess_module, "ExclusionMask", lambda *args, **kwargs: object())
+    monkeypatch.setattr(
+        preprocess_module,
+        "read_data",
+        lambda path: pd.DataFrame({"Chr": ["chr1"], "Start": [100], "End": [150], "sample1": [10.0]}),
+    )
+    monkeypatch.setattr(preprocess_module, "get_sample_columns", lambda df: ["sample1"])
+    monkeypatch.setattr(preprocess_module, "estimate_ploidy", lambda df, output_dir: pd.DataFrame([{"sample": "sample1"}]))
+    monkeypatch.setattr(preprocess_module, "build_ploidy_map", lambda ploidy_df: {("sample1", "chr1"): 2})
+    monkeypatch.setattr(preprocess_module, "filter_low_quality_bins", lambda df, **kwargs: df.copy())
+    monkeypatch.setattr(
+        preprocess_module,
+        "collect_all_locus_bins",
+        lambda *args, **kwargs: (
+            pd.DataFrame([{"Chr": "chr1", "Start": 100, "End": 150, "sample1": 2.0}]),
+            [
+                preprocess_module.LocusBinMapping(
+                    cluster="cluster_keep",
+                    locus=None,
+                    interval_name="body",
+                    array_idx=0,
+                    chrom="chr1",
+                    start=100,
+                    end=150,
+                )
+            ],
+            {"cluster_keep": object()},
+        ),
+    )
+    monkeypatch.setattr(
+        preprocess_module,
+        "build_normalization_metadata",
+        lambda *args, **kwargs: pd.DataFrame([{"sample": "sample1", "raw_count_median": 10.0, "reference_bin_size": 50.0}]),
+    )
+    monkeypatch.setattr(preprocess_module, "write_preprocessed_bins", lambda *args, **kwargs: str(tmp_path / "preprocessed_bins.tsv.gz"))
+    monkeypatch.setattr(preprocess_module, "write_normalization_metadata", lambda *args, **kwargs: str(tmp_path / "normalization_metadata.tsv"))
+    monkeypatch.setattr(preprocess_module, "write_locus_metadata", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        preprocess_module,
+        "write_preprocessed_baf",
+        lambda *args, **kwargs: pytest.fail("write_preprocessed_baf should not run when baf_table is absent"),
+    )
+
+    preprocess_module.main()
+
+    stdout = capsys.readouterr().out
+    assert "Output tables written: 7" in stdout
+    assert "BAF outputs included" not in stdout
+
+
+def test_collect_all_locus_bins_verbose_rebin_and_breakpoint_masking(monkeypatch, capsys):
+    locus = _FakeLocus()
+    locus.n_breakpoints = len(locus.breakpoints)
+
+    monkeypatch.setattr(preprocess_module._util, "VERBOSE", True)
+    monkeypatch.setattr(preprocess_module, "compute_flank_regions_from_bins", lambda *args, **kwargs: [])
+    monkeypatch.setattr(
+        preprocess_module,
+        "extract_locus_bins",
+        lambda *args, **kwargs: pd.DataFrame([
+            {"Chr": "chr1", "Start": 100, "End": 140, "sample1": 2.0},
+            {"Chr": "chr1", "Start": 140, "End": 200, "sample1": 2.2},
+            {"Chr": "chr1", "Start": 200, "End": 260, "sample1": 2.4},
+        ]),
+    )
+    monkeypatch.setattr(
+        preprocess_module,
+        "rebin_locus_intervals",
+        lambda df, locus_arg, max_bins_per_interval, flank_regions, min_rebin_coverage: pd.DataFrame([
+            {"Chr": "chr1", "Start": 100, "End": 200, "sample1": 2.1},
+            {"Chr": "chr1", "Start": 200, "End": 260, "sample1": 2.4},
+        ]),
+    )
+    monkeypatch.setattr(
+        preprocess_module,
+        "assign_bins_to_intervals",
+        lambda locus_df, locus_arg, flank_regions: {
+            "A-C": [0],
+            "C-D": [1],
+            "breakpoint_ranges": [1],
+        },
+    )
+
+    combined_df, mappings, included_loci = preprocess_module.collect_all_locus_bins(
+        pd.DataFrame([
+            {"Chr": "chr1", "Start": 100, "End": 140, "sample1": 2.0},
+            {"Chr": "chr1", "Start": 140, "End": 200, "sample1": 2.2},
+            {"Chr": "chr1", "Start": 200, "End": 260, "sample1": 2.4},
+        ]),
+        _FakeGDTable(locus),
+        None,
+        min_bins_per_interval=0,
+        max_bins_per_interval=2,
+        min_rebin_coverage=0.5,
+    )
+
+    stdout = capsys.readouterr().out
+    assert "Bins after rebinning: 2 (reduced from 3)" in stdout
+    assert "Masking 1 breakpoint-range bin(s)" in stdout
+    assert list(zip(combined_df["Start"], combined_df["End"])) == [(100, 200)]
+    assert [mapping.interval_name for mapping in mappings] == ["A-C"]
+    assert set(included_loci) == {"cluster1"}
+
+
 
 def test_select_highres_interval_replacements_returns_only_improved_intervals():
     undercovered = [("A-C", 5), ("C-D", 8), ("D-E", 3)]
@@ -1247,3 +1449,141 @@ def test_collect_all_locus_bins_errors_when_expanded_highres_rebin_still_underco
 
     with pytest.raises(ValueError, match="including high-res fallback"):
         _collect_with_highres(monkeypatch, highres_df)
+
+
+def test_collect_all_locus_bins_errors_when_highres_query_returns_no_bins(monkeypatch, capsys):
+    locus = _FakeLocus()
+
+    monkeypatch.setattr(preprocess_module, "compute_flank_regions_from_bins", lambda *args, **kwargs: [])
+    monkeypatch.setattr(preprocess_module, "query_highres_bins", lambda *args, **kwargs: pd.DataFrame(columns=_lowres_df().columns))
+
+    with pytest.raises(ValueError, match="fewer than --min-bins-per-interval=3 bins"):
+        preprocess_module.collect_all_locus_bins(
+            _lowres_df(),
+            _FakeGDTable(locus),
+            None,
+            min_bins_per_interval=3,
+            max_bins_per_interval=3,
+            highres_counts_path="highres.tsv.gz",
+            column_medians=np.array([1.0]),
+            lowres_median_bin_size=100.0,
+            filter_params=None,
+            min_rebin_coverage=0.5,
+        )
+
+    assert "[highres] no bins returned from tabix query" in capsys.readouterr().out
+
+
+def test_collect_all_locus_bins_errors_when_highres_fallback_is_unavailable(monkeypatch, capsys):
+    locus = _FakeLocus()
+    highres_df = _highres_df([
+        (100, 110),
+        (180, 190),
+    ])
+
+    monkeypatch.setattr(preprocess_module, "compute_flank_regions_from_bins", lambda *args, **kwargs: [])
+    monkeypatch.setattr(preprocess_module, "query_highres_bins", lambda *args, **kwargs: highres_df.copy())
+    monkeypatch.setattr(preprocess_module, "normalize_highres_bins", lambda raw_df, *args, **kwargs: raw_df.copy())
+
+    with pytest.raises(ValueError, match="including high-res fallback"):
+        preprocess_module.collect_all_locus_bins(
+            _lowres_df(),
+            _FakeGDTable(locus),
+            None,
+            min_bins_per_interval=3,
+            max_bins_per_interval=0,
+            highres_counts_path="highres.tsv.gz",
+            column_medians=np.array([1.0]),
+            lowres_median_bin_size=100.0,
+            filter_params=None,
+            min_rebin_coverage=0.5,
+        )
+
+    assert "fallback rebin is not available because --max-bins-per-interval=0" in capsys.readouterr().out
+
+
+def test_collect_all_locus_bins_uses_filtered_cache_and_skips_unassigned_bins(monkeypatch, capsys):
+    locus = _FakeLocus()
+    observed = {}
+
+    input_df = pd.DataFrame([
+        {"Chr": "chr1", "Start": 0, "End": 50, "sample1": 0.2},
+        {"Chr": "chr1", "Start": 50, "End": 100, "sample1": 2.0},
+        {"Chr": "chr1", "Start": 300, "End": 325, "sample1": 2.0},
+        {"Chr": "chr1", "Start": 325, "End": 350, "sample1": 2.0},
+        {"Chr": "chr1", "Start": 350, "End": 400, "sample1": 2.0},
+    ])
+
+    def fake_compute_bin_quality_mask(sub_df, **kwargs):
+        observed["quality_positions"] = sub_df["Start"].tolist()
+        keep = np.ones(len(sub_df), dtype=bool)
+        keep[0] = False
+        return keep, {"filtered": 1, "par_ignored": 0}
+
+    def fake_compute_flank_regions_from_bins(chrom_bins, locus_arg, locus_size, **kwargs):
+        observed["chrom_bins"] = chrom_bins[["Start", "End"]].values.tolist()
+        observed["flank_filter_params"] = kwargs["filter_params"]
+        return [(0, 100, "left_flank"), (300, 400, "right_flank")]
+
+    def fake_extract_locus_bins(df, locus_arg, exclusion_mask, **kwargs):
+        observed["exclusion_bypass_regions"] = kwargs["exclusion_bypass_regions"]
+        return pd.DataFrame([
+            {"Chr": "chr1", "Start": 100, "End": 150, "sample1": 2.0},
+            {"Chr": "chr1", "Start": 200, "End": 250, "sample1": 2.0},
+            {"Chr": "chr1", "Start": 500, "End": 520, "sample1": 2.0},
+        ])
+
+    def fake_assign_bins_to_intervals(locus_df, locus_arg, flank_regions):
+        observed["combined_bins"] = locus_df[["Start", "End"]].values.tolist()
+        return {
+            "left_flank": [0],
+            "A-C": [1],
+            "C-D": [2],
+            "right_flank": [3],
+            "breakpoint_ranges": [],
+        }
+
+    gd_table = SimpleNamespace(
+        get_all_loci=lambda: {
+            "outside": SimpleNamespace(chrom="chr2", start=100, end=200, is_nahr=True),
+            "skip_non_nahr": SimpleNamespace(chrom="chr1", start=110, end=290, is_nahr=False),
+            "cluster1": locus,
+        }
+    )
+
+    monkeypatch.setattr(preprocess_module, "compute_bin_quality_mask", fake_compute_bin_quality_mask)
+    monkeypatch.setattr(preprocess_module, "compute_flank_regions_from_bins", fake_compute_flank_regions_from_bins)
+    monkeypatch.setattr(preprocess_module, "extract_locus_bins", fake_extract_locus_bins)
+    monkeypatch.setattr(preprocess_module, "assign_bins_to_intervals", fake_assign_bins_to_intervals)
+
+    combined_df, mappings, included_loci = preprocess_module.collect_all_locus_bins(
+        input_df,
+        gd_table,
+        regions=[("chr1", 0, 400)],
+        exclusion_mask=_IntervalMask("chr1", 50, 200),
+        flank_exclusion_mask=_IntervalMask("chr1", 350, 400),
+        exclusion_threshold=0.1,
+        filter_params={"median_min": 1.0, "median_max": 3.0, "mad_max": 0.5},
+        exclusion_bypass_threshold=0.5,
+        min_bins_per_interval=1,
+        max_bins_per_interval=0,
+        min_flank_bases=50,
+        min_flank_bins=1,
+        min_flank_coverage=0.0,
+        ploidy_map={("sample1", "chr1"): 2},
+        par_mask=_IntervalMask("chr1", 300, 350),
+        hard_inclusion_mask=_IntervalMask("chr1", 50, 100),
+    )
+
+    captured = capsys.readouterr()
+    assert observed["quality_positions"] == [0, 50, 350]
+    assert observed["chrom_bins"] == [[50, 100], [350, 400]]
+    assert observed["flank_filter_params"] == {"median_min": 1.5, "median_max": 2.5, "mad_max": 0.3}
+    assert observed["exclusion_bypass_regions"] == [(100, 200)]
+    assert observed["combined_bins"] == [[50, 100], [100, 150], [200, 250], [500, 520]]
+    assert "WARNING: skipped one unassigned bin outside modeled intervals" in captured.out
+    assert "Filtered cache built: 2/5 bins retained across 1 contigs" in captured.out
+    assert "processed_NAHR=1, skipped_non_NAHR=1" in captured.out
+    assert list(zip(combined_df["Start"], combined_df["End"])) == [(50, 100), (100, 150), (200, 250), (500, 520)]
+    assert [mapping.interval_name for mapping in mappings] == ["left_flank", "A-C", "C-D"]
+    assert set(included_loci) == {"cluster1"}

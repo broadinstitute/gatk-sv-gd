@@ -229,6 +229,37 @@ def test_write_posterior_tables_rejects_incompatible_state_tensor_shape(tmp_path
         )
 
 
+def test_write_posterior_tables_rejects_mismatched_3d_state_tensor_shape(tmp_path):
+    combined_data = SimpleNamespace(
+        n_bins=3,
+        n_samples=2,
+        sample_ids=["S1", "S2"],
+        depth=_TensorStub([[1.0, 2.0], [3.0, 4.0], [5.0, 6.0]]),
+        has_baf=False,
+        has_baf_effective_count=False,
+    )
+    mappings = [
+        _make_mapping("A-B", 0, 110, 200),
+        _make_mapping("B-C", 1, 210, 300),
+        _make_mapping("C-D", 2, 310, 400),
+    ]
+
+    with pytest.raises(ValueError, match="State tensor shape does not match bins/samples"):
+        write_posterior_tables(
+            combined_data,
+            {
+                "cn": np.array([[0, 1], [1, 0], [1, 1]]),
+                "sample_var": np.array([0.1, 0.2]),
+                "bin_bias": np.array([1.0, 1.0, 1.0]),
+                "bin_var": np.array([0.0, 0.0, 0.0]),
+                "cn_probs": np.array([[0.5, 0.5], [0.5, 0.5], [0.5, 0.5]]),
+            },
+            {"cn_posterior": np.ones((2, 2, 2), dtype=float) / 2.0},
+            mappings,
+            str(tmp_path),
+        )
+
+
 def test_write_posterior_tables_handles_extra_dim_transposes_and_scalar_expansions(tmp_path):
     combined_data = SimpleNamespace(
         n_bins=2,

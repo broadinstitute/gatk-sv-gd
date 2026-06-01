@@ -584,6 +584,50 @@ def test_process_helpers_rewrite_counts_and_baf_rows(monkeypatch, tmp_path):
     }
 
 
+def test_process_baf_contig_group_handles_passthrough_rows_and_fetch_errors(monkeypatch, tmp_path):
+    baf_rows = {
+        "chr1": [
+            "chr1\t120\t0.6\tS1",
+            "chr1\t125",
+            "chr1\tbad\t0.2\tS1",
+            "chr1\t126\tnot_a_number\tS1",
+            "chr1\t127\t0.4\tS2",
+        ],
+        "chr2": ["chr2\t220\t0.3\tS3"],
+    }
+    monkeypatch.setattr(
+        synthesize_module.pysam,
+        "TabixFile",
+        lambda path: _StubTabixFile(baf_rows, fail_contigs={"chr_missing"}),
+    )
+    monkeypatch.setattr(synthesize_module.pysam, "BGZFile", _StubBGZFile, raising=False)
+
+    chr1_part = tmp_path / "chr1.baf.bgzf"
+    chr2_part = tmp_path / "chr2.baf.bgzf"
+    total_rows, total_modified = _process_baf_contig_group(
+        "baf.bgz",
+        [
+            ("chr1", str(chr1_part)),
+            ("chr2", str(chr2_part)),
+            ("chr_missing", str(tmp_path / "missing.baf.bgzf")),
+        ],
+        {"chr1": [(100, 150, {"S1": ("DEL", 2)})]},
+        pos_col=1,
+        baf_col=2,
+        sample_col=3,
+    )
+
+    assert (total_rows, total_modified) == (6, 1)
+    assert chr1_part.read_text() == (
+        "chr1\t120\t1.000000\tS1\n"
+        "chr1\t125\n"
+        "chr1\tbad\t0.2\tS1\n"
+        "chr1\t126\tnot_a_number\tS1\n"
+        "chr1\t127\t0.4\tS2\n"
+    )
+    assert chr2_part.read_text() == "chr2\t220\t0.3\tS3\n"
+
+
 def test_concat_and_manifest_writers_emit_expected_files(tmp_path):
     part1 = tmp_path / "part1.bgzf"
     part2 = tmp_path / "part2.bgzf"
@@ -1104,6 +1148,103 @@ def test_main_truth_table_without_sample_universe_uses_carrier_only_summary(monk
     assert background_writes == [([], str(output_dir / "background_events.tsv"))]
 
 
+def test_main_without_assignments_still_rewrites_requested_hires_and_baf(monkeypatch, tmp_path, capsys):
+    output_dir = tmp_path / "out"
+    yes_entry = {
+        "GD_ID": "GD1",
+        "NAHR": "yes",
+        "svtype": "DEL",
+        "start_GRCh38": 110,
+        "end_GRCh38": 300,
+        "cluster": "cluster1",
+    }
+    locus = _make_locus()
+    gd_table_stub = SimpleNamespace(loci={"cluster1": locus}, get_all_loci=lambda: {"cluster1": locus})
+    count_calls = []
+    baf_calls = []
+    truth_writes = []
+    background_writes = []
+
+    monkeypatch.setattr(
+        synthesize_module,
+        "parse_args",
+        lambda: SimpleNamespace(
+            lo_res_counts=None,
+            hi_res_counts="hi.rd.txt.gz",
+            baf_table="all.baf.txt.gz",
+            ploidy_table=None,
+            gd_table="gd.tsv",
+            output_dir=str(output_dir),
+            gd_probability=0.0,
+            salted_event_probability=0.0,
+            viable_trisomy_probability=0.0,
+            seed=29,
+            truth_table=None,
+            regions=None,
+            del_multiplier=0.5,
+            dup_multiplier=1.5,
+            threads=4,
+        ),
+    )
+    monkeypatch.setattr(synthesize_module, "setup_logging", lambda *args, **kwargs: None)
+    monkeypatch.setattr(synthesize_module, "GDTable", lambda path: gd_table_stub)
+    monkeypatch.setattr(synthesize_module, "_build_gd_lookup", lambda gd_table: {"GD1": ("chr1", yes_entry)})
+    monkeypatch.setattr(synthesize_module, "_discover_sample_ids", lambda *args: ["S1", "S2"])
+    monkeypatch.setattr(synthesize_module, "assign_gd_to_samples", lambda sample_ids, eligible_entries, rng, gd_probability: {})
+    monkeypatch.setattr(synthesize_module, "_build_assignment_events", lambda assignments, **kwargs: [])
+    monkeypatch.setattr(synthesize_module, "generate_salted_flank_bleed_events", lambda *args, **kwargs: [])
+    monkeypatch.setattr(synthesize_module, "generate_viable_trisomy_events", lambda *args, **kwargs: [])
+    monkeypatch.setattr(synthesize_module, "_build_interval_map_from_events", lambda events: {})
+    monkeypatch.setattr(
+        synthesize_module,
+        "_rewrite_counts_file",
+        lambda input_path, output_path, interval_map, **kwargs: count_calls.append((input_path, output_path, interval_map, kwargs)) or 0,
+    )
+    monkeypatch.setattr(
+        synthesize_module,
+        "_rewrite_baf_file",
+        lambda input_path, output_path, events, **kwargs: baf_calls.append((input_path, output_path, events, kwargs)) or 0,
+    )
+    monkeypatch.setattr(
+        synthesize_module,
+        "_write_truth_table",
+        lambda assignments, output_path: truth_writes.append((assignments, output_path)),
+    )
+    monkeypatch.setattr(
+        synthesize_module,
+        "_write_background_event_table",
+        lambda events, output_path: background_writes.append((events, output_path)),
+    )
+
+    synthesize_module.main()
+
+    captured = capsys.readouterr()
+    assert "No ploidy table provided; assuming diploid (ploidy=2) everywhere" in captured.out
+    assert "Assigned GD events to 0/2 samples" in captured.out
+    assert "High-res output written" in captured.out
+    assert "BAF output written" in captured.out
+    assert "Carriers:        0/2 samples" in captured.out
+    assert "No samples assigned a GD event" in captured.err
+    assert count_calls == [
+        (
+            "hi.rd.txt.gz",
+            str(output_dir / "hi_res_counts.synthesized.rd.txt.gz"),
+            {},
+            {"label": "hi-res", "n_workers": 4},
+        )
+    ]
+    assert baf_calls == [
+        (
+            "all.baf.txt.gz",
+            str(output_dir / "all_samples.synthesized.baf.txt.gz"),
+            [],
+            {"label": "baf", "n_workers": 4},
+        )
+    ]
+    assert truth_writes == [({}, str(output_dir / "truth_table.tsv"))]
+    assert background_writes == [([], str(output_dir / "background_events.tsv"))]
+
+
 def test_rewrite_counts_file_orchestrates_header_workers_and_indexing(monkeypatch, tmp_path):
     process_calls = []
     concat_calls = []
@@ -1296,3 +1437,51 @@ def test_rewrite_baf_file_uses_process_pool_for_parallel_workers(monkeypatch, tm
     assert all(call[3:] == (1, 2, 3) for call in process_calls)
     assert concat_calls[0][2] == "baf"
     assert tabix_calls[0][0] == str(tmp_path / "output_parallel.baf.bgz")
+
+
+def test_rewrite_baf_file_without_explicit_header_omits_first_line(monkeypatch, tmp_path):
+    input_path = tmp_path / "input_no_header.baf.tsv"
+    input_path.write_text("chr1\t100\t0.5\tS1\n")
+
+    process_calls = []
+    concat_calls = []
+    tabix_calls = []
+    monkeypatch.setattr(synthesize_module, "_ensure_baf_tabix_index", lambda path: None)
+    monkeypatch.setattr(synthesize_module, "_detect_baf_columns", lambda path: (-1, ["Chr", "Pos", "BAF", "Sample"]))
+    monkeypatch.setattr(synthesize_module.os.path, "getsize", lambda path: 100)
+    monkeypatch.setattr(
+        synthesize_module.pysam,
+        "TabixFile",
+        lambda path: _StubTabixFile({}, header=["#meta"], contigs=["chr1"]),
+    )
+    monkeypatch.setattr(synthesize_module.pysam, "BGZFile", _StubBGZFile, raising=False)
+    monkeypatch.setattr(
+        synthesize_module,
+        "_process_baf_contig_group",
+        lambda input_path, group, resolved, pos_col, baf_col, sample_col: process_calls.append(
+            (input_path, group, resolved, pos_col, baf_col, sample_col)
+        ) or (1, 0),
+    )
+    monkeypatch.setattr(
+        synthesize_module,
+        "_concat_bgzf_parts",
+        lambda output_path, part_paths, label="": concat_calls.append((output_path, part_paths, label)),
+    )
+    monkeypatch.setattr(
+        synthesize_module.pysam,
+        "tabix_index",
+        lambda path, **kwargs: tabix_calls.append((path, kwargs)),
+    )
+
+    modified = _rewrite_baf_file(
+        str(input_path),
+        str(tmp_path / "output_no_header.baf.bgz"),
+        [],
+        label="baf",
+        n_workers=1,
+    )
+
+    assert modified == 0
+    assert len(process_calls) == 1
+    assert concat_calls[0][2] == "baf"
+    assert tabix_calls[0][0] == str(tmp_path / "output_no_header.baf.bgz")

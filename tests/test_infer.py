@@ -192,6 +192,30 @@ def test_parse_args_allows_explicit_var_length_scale(monkeypatch):
     assert args.var_length_scale == pytest.approx(7500.0)
 
 
+@pytest.mark.parametrize(
+    ("extra_args", "error_fragment"),
+    [
+        (["--baf-temperature", "-1"], "--baf-temperature must be non-negative"),
+        (["--baf-temperature-prior-scale", "0"], "--baf-temperature-prior-scale must be positive"),
+        (["--baf-outlier-rate", "1.0"], "--baf-outlier-rate must be in [0, 1)"),
+        (["--null-state-prior", "1.0"], "--null-state-prior must be in [0, 1)"),
+        (["--var-length-scale", "0"], "--var-length-scale must be positive"),
+        (["--guide-warmup-iter", "-1"], "--guide-warmup-iter must be non-negative"),
+    ],
+)
+def test_parse_args_rejects_invalid_numeric_values(monkeypatch, extra_args, error_fragment):
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["gatk-sv-gd infer", "--preprocessed-dir", "./preprocess", "-o", "./out", *extra_args],
+    )
+
+    with pytest.raises(SystemExit) as excinfo:
+        parse_args()
+
+    assert excinfo.value.code == 2
+
+
 def test_align_normalization_metadata_requires_metadata():
     with pytest.raises(ValueError, match="Normalization metadata is required"):
         _align_normalization_metadata(None, ["S1"])
@@ -532,6 +556,97 @@ def test_main_with_preprocessed_dir_recomputes_normalization_metadata(monkeypatc
     assert records["run_gd_analysis"][1]["normalization_metadata"].equals(records["written_metadata"][0])
 
 
+def test_main_with_preprocessed_dir_recomputes_metadata_from_all_bins_when_no_autosomes(monkeypatch, tmp_path):
+    args = _make_infer_args(
+        preprocessed_dir="prep-dir",
+        input="raw.tsv.gz",
+        output_dir=str(tmp_path),
+    )
+    empty_metadata = pd.DataFrame({"sample": [], "raw_count_median": [], "reference_bin_size": []})
+    raw_df = pd.DataFrame(
+        {
+            "Chr": ["chrX", "chrY"],
+            "Start": [0, 100],
+            "End": [100, 200],
+            "S1": [10.0, 30.0],
+            "S2": [20.0, 40.0],
+        }
+    )
+    rebuilt_metadata = pd.DataFrame(
+        {
+            "sample": ["S1", "S2"],
+            "raw_count_median": [20.0, 30.0],
+            "reference_bin_size": [100.0, 100.0],
+        }
+    )
+    records = {}
+
+    def fake_build_normalization_metadata(sample_cols, column_medians, lowres_median_bin_size):
+        records["rebuilt"] = (list(sample_cols), column_medians.copy(), lowres_median_bin_size)
+        return rebuilt_metadata
+
+    monkeypatch.setattr(infer_module, "parse_args", lambda: args)
+    monkeypatch.setattr(
+        infer_module,
+        "load_preprocessed_data",
+        lambda path: (pd.DataFrame(), ["m1"], pd.DataFrame(), empty_metadata),
+    )
+    monkeypatch.setattr(infer_module, "setup_logging", lambda *args, **kwargs: None)
+    monkeypatch.setattr(infer_module, "read_data", lambda path: raw_df.copy())
+    monkeypatch.setattr(infer_module, "get_sample_columns", lambda df: ["S1", "S2"])
+    monkeypatch.setattr(infer_module, "build_normalization_metadata", fake_build_normalization_metadata)
+    monkeypatch.setattr(infer_module, "write_normalization_metadata", lambda metadata, output_dir: records.setdefault("written", metadata.copy()))
+    monkeypatch.setattr(infer_module, "_setup_pyro", lambda passed_args: None)
+    monkeypatch.setattr(infer_module, "run_gd_analysis", lambda *args, **kwargs: records.setdefault("ran", kwargs))
+
+    infer_module.main()
+
+    assert records["rebuilt"][0] == ["S1", "S2"]
+    assert records["rebuilt"][1].tolist() == pytest.approx([20.0, 30.0])
+    assert records["rebuilt"][2] == pytest.approx(100.0)
+
+
+def test_main_with_preprocessed_dir_rewrites_existing_normalization_metadata(monkeypatch, tmp_path):
+    args = _make_infer_args(
+        preprocessed_dir="prep-dir",
+        input=None,
+        output_dir=str(tmp_path),
+    )
+    normalization_metadata = pd.DataFrame(
+        {
+            "sample": ["S1"],
+            "raw_count_median": [12.0],
+            "reference_bin_size": [100.0],
+        }
+    )
+    records = {}
+
+    monkeypatch.setattr(infer_module, "parse_args", lambda: args)
+    monkeypatch.setattr(
+        infer_module,
+        "load_preprocessed_data",
+        lambda path: (pd.DataFrame(), ["m1"], pd.DataFrame(), normalization_metadata),
+    )
+    monkeypatch.setattr(infer_module, "setup_logging", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        infer_module,
+        "write_normalization_metadata",
+        lambda metadata, output_dir: records.setdefault("written", (metadata.copy(), output_dir)),
+    )
+    monkeypatch.setattr(infer_module, "_setup_pyro", lambda passed_args: records.setdefault("pyro", passed_args))
+    monkeypatch.setattr(
+        infer_module,
+        "run_gd_analysis",
+        lambda *args, **kwargs: records.setdefault("run_gd_analysis", kwargs),
+    )
+
+    infer_module.main()
+
+    assert records["written"][0].equals(normalization_metadata)
+    assert records["written"][1] == str(tmp_path)
+    assert records["run_gd_analysis"]["normalization_metadata"].equals(normalization_metadata)
+
+
 def test_main_without_preprocessed_dir_runs_full_pipeline(monkeypatch, tmp_path):
     args = _make_infer_args(
         input="raw.tsv.gz",
@@ -647,6 +762,96 @@ def test_main_requires_normalization_metadata_for_preprocessed_data_without_inpu
         infer_module.main()
 
 
+def test_main_without_preprocessed_dir_requires_input(monkeypatch, tmp_path):
+    args = _make_infer_args(input=None, gd_table="gd.tsv", output_dir=str(tmp_path))
+
+    monkeypatch.setattr(infer_module, "parse_args", lambda: args)
+    monkeypatch.setattr(infer_module, "setup_logging", lambda *args, **kwargs: None)
+
+    with pytest.raises(SystemExit, match="1"):
+        infer_module.main()
+
+
+def test_main_without_preprocessed_dir_requires_gd_table(monkeypatch, tmp_path):
+    args = _make_infer_args(input="raw.tsv.gz", gd_table=None, output_dir=str(tmp_path))
+
+    monkeypatch.setattr(infer_module, "parse_args", lambda: args)
+    monkeypatch.setattr(infer_module, "setup_logging", lambda *args, **kwargs: None)
+
+    with pytest.raises(SystemExit, match="1"):
+        infer_module.main()
+
+
+def test_main_without_preprocessed_dir_uses_all_bins_when_no_autosomes(monkeypatch, tmp_path, capsys):
+    args = _make_infer_args(
+        input="raw.tsv.gz",
+        gd_table="gd.tsv",
+        output_dir=str(tmp_path),
+        verbose=False,
+        high_res_counts=None,
+        exclusion_intervals=[],
+        hard_inclusion_intervals=[],
+    )
+    raw_df = pd.DataFrame(
+        {
+            "Chr": ["chrX", "chrY"],
+            "Start": [0, 100],
+            "End": [100, 200],
+            "S1": [10.0, 20.0],
+            "S2": [30.0, 50.0],
+        }
+    )
+    normalization_metadata = pd.DataFrame(
+        {
+            "sample": ["S1", "S2"],
+            "raw_count_median": [15.0, 40.0],
+            "reference_bin_size": [100.0, 100.0],
+        }
+    )
+    records = {}
+
+    class FakeGDTable:
+        def __init__(self, path):
+            self.loci = {"locus1": SimpleNamespace(breakpoints=[], n_breakpoints=0)}
+
+    def fake_build_normalization_metadata(sample_cols, column_medians, lowres_median_bin_size):
+        records["normalization_inputs"] = (
+            list(sample_cols),
+            column_medians.copy(),
+            lowres_median_bin_size,
+        )
+        return normalization_metadata
+
+    monkeypatch.setattr(infer_module, "parse_args", lambda: args)
+    monkeypatch.setattr(infer_module, "setup_logging", lambda *args, **kwargs: None)
+    monkeypatch.setattr(infer_module, "GDTable", FakeGDTable)
+    monkeypatch.setattr(infer_module, "read_data", lambda path: raw_df.copy())
+    monkeypatch.setattr(infer_module, "get_sample_columns", lambda df: ["S1", "S2"])
+    monkeypatch.setattr(infer_module, "build_normalization_metadata", fake_build_normalization_metadata)
+    monkeypatch.setattr(infer_module, "write_normalization_metadata", lambda metadata, output_dir: records.setdefault("written_metadata", (metadata.copy(), output_dir)))
+    monkeypatch.setattr(infer_module, "estimate_ploidy", lambda df, output_dir: pd.DataFrame({"sample": ["S1"], "contig": ["chrX"], "ploidy": [2]}))
+    monkeypatch.setattr(infer_module, "build_ploidy_map", lambda df: {("S1", "chrX"): 2})
+    monkeypatch.setattr(infer_module, "filter_low_quality_bins", lambda df, **kwargs: df)
+    monkeypatch.setattr(infer_module, "_setup_pyro", lambda passed_args: records.setdefault("setup_pyro", passed_args))
+    monkeypatch.setattr(
+        infer_module,
+        "run_gd_analysis",
+        lambda *call_args, **call_kwargs: records.setdefault("run_call", (call_args, call_kwargs)),
+    )
+
+    infer_module.main()
+
+    stdout = capsys.readouterr().out
+    assert records["normalization_inputs"][0] == ["S1", "S2"]
+    assert records["normalization_inputs"][1].tolist() == pytest.approx([15.0, 40.0])
+    assert records["normalization_inputs"][2] == pytest.approx(100.0)
+    assert records["run_call"][0][2] is None
+    assert records["run_call"][0][3] is None
+    assert records["run_call"][1]["column_medians"].tolist() == pytest.approx([15.0, 40.0])
+    assert records["run_call"][1]["ploidy_map"] == {("S1", "chrX"): 2}
+    assert "No high-resolution counts file provided (--high-res-counts)" in stdout
+
+
 def test_setup_pyro_disables_validation_for_jit(monkeypatch):
     calls = []
 
@@ -733,4 +938,48 @@ def test_write_training_loss_history_logs_convergence_summary(tmp_path, caplog):
     assert (
         "ELBO convergence summary: final_window_change=1.00e-04 "
         "window=2 target_rtol=0.0002 within_tolerance=True"
+    ) in messages
+
+
+def test_write_training_loss_history_warns_when_history_is_missing(tmp_path, caplog):
+    args = SimpleNamespace(
+        output_dir=str(tmp_path),
+        elbo_window=2,
+        elbo_rtol=2e-4,
+    )
+
+    caplog.set_level(logging.INFO, logger="gatk_sv_gd.infer")
+
+    _write_training_loss_history(SimpleNamespace(loss_history={}), args)
+
+    loss_df = pd.read_csv(tmp_path / "training_loss.tsv", sep="\t")
+    assert loss_df.empty
+    messages = [record.getMessage() for record in caplog.records]
+    assert "Wrote training loss history: epochs=0" in messages
+    assert "Training produced no ELBO history." in messages
+
+
+def test_write_training_loss_history_logs_unavailable_window_change(monkeypatch, tmp_path, caplog):
+    model = SimpleNamespace(
+        loss_history={
+            "epoch": [0, 1],
+            "elbo": [100.0, 99.5],
+        }
+    )
+    args = SimpleNamespace(
+        output_dir=str(tmp_path),
+        elbo_window=5,
+        elbo_rtol=1e-4,
+    )
+
+    monkeypatch.setattr(infer_module, "_windowed_relative_elbo_change", lambda history, window: None)
+    caplog.set_level(logging.INFO, logger="gatk_sv_gd.infer")
+
+    _write_training_loss_history(model, args)
+
+    messages = [record.getMessage() for record in caplog.records]
+    assert "ELBO history summary: initial=100.0000 final=99.5000 best=99.5000" in messages
+    assert (
+        "ELBO convergence summary: final_window_change=unavailable "
+        "window=5 target_rtol=0.0001"
     ) in messages

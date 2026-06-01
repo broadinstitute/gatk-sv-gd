@@ -83,6 +83,7 @@ def test_overlap_helpers_and_classification_cover_canonical_and_atypical_paths()
     assert extract._reciprocal_overlap(10, 20, 15, 30) == pytest.approx(5 / 15)
     assert extract._reciprocal_overlap(10, 10, 15, 30) == pytest.approx(0.0)
     assert extract._fraction_covered(100, 200, 125, 175) == pytest.approx(0.5)
+    assert extract._fraction_covered(100, 100, 125, 175) == pytest.approx(0.0)
 
     gd_entries = [
         {
@@ -130,9 +131,54 @@ def test_overlap_helpers_and_classification_cover_canonical_and_atypical_paths()
     assert is_non_nahr is True
 
 
+def test_classify_variant_returns_no_flags_when_entries_do_not_qualify():
+    gd_entries = [
+        {
+            "GD_ID": "WRONG_TYPE",
+            "svtype": "DUP",
+            "start_GRCh38": 100,
+            "end_GRCh38": 200,
+            "NAHR": "yes",
+        },
+        {
+            "GD_ID": "LOW_NON_NAHR",
+            "svtype": "DEL",
+            "start_GRCh38": 100,
+            "end_GRCh38": 200,
+            "NAHR": "no",
+        },
+        {
+            "GD_ID": "LOW_NAHR",
+            "svtype": "DEL",
+            "start_GRCh38": 100,
+            "end_GRCh38": 200,
+            "NAHR": "yes",
+        },
+    ]
+
+    gd_ids, is_nahr, is_atypical, is_non_nahr = extract._classify_variant(
+        0,
+        20,
+        "DEL",
+        gd_entries,
+        ro_threshold=0.5,
+        atypical_coverage=0.7,
+        non_nahr_overlap=0.5,
+    )
+
+    assert gd_ids == set()
+    assert is_nahr is False
+    assert is_atypical is False
+    assert is_non_nahr is False
+
+
 def test_svtype_and_info_header_helpers():
     record = _RecordStub("chr1", 100, 200, "var1", svtype="DUP")
     assert extract._svtype_of(record) == "DUP"
+
+    tuple_type = _RecordStub("chr1", 100, 200, "var_tuple", svtype=None, alts=None)
+    tuple_type.info["SVTYPE"] = ("DEL",)
+    assert extract._svtype_of(tuple_type) == "DEL"
 
     alt_only = _RecordStub("chr1", 100, 200, "var2", svtype=None, alts=("<DEL>",))
     assert extract._svtype_of(alt_only) == "DEL"
@@ -275,6 +321,79 @@ def test_process_vcfs_merges_duplicate_records_and_sorts_by_header_order(monkeyp
     assert file_two.closed is True
 
 
+def test_process_vcfs_skips_missing_contigs_fetch_errors_and_non_matches(monkeypatch):
+    gd_table = SimpleNamespace(get_all_loci=lambda: {"cluster1": SimpleNamespace(gd_entries=[{"GD_ID": "GD1"}])})
+    header = _HeaderStub(contigs={"chr1": None}, samples=["S1"])
+
+    unsupported = _RecordStub("chr1", 60, 80, "skip_type", svtype=None, alts=("N",))
+    no_match = _RecordStub("chr1", 70, 90, "skip_gd", svtype="DEL")
+    kept = _RecordStub("chr1", 80, 95, "keep", svtype="DUP")
+
+    class _VariantFileWithErrors:
+        def __init__(self):
+            self.header = header
+            self.closed = False
+
+        def fetch(self, chrom, start, end):
+            if (chrom, start, end) == ("chr1", 0, 50):
+                raise ValueError("bad region")
+            if (chrom, start, end) == ("chr1", 50, 100):
+                return iter([unsupported, no_match, kept])
+            return iter(())
+
+        def close(self):
+            self.closed = True
+
+    vcf = _VariantFileWithErrors()
+
+    def fake_classify(var_start, var_end, var_svtype, gd_entries, ro_threshold, atypical_coverage, non_nahr_overlap):
+        if var_start == 70:
+            return set(), False, False, False
+        return {"GD1"}, False, True, False
+
+    monkeypatch.setattr(extract.pysam, "VariantFile", lambda path: vcf)
+    monkeypatch.setattr(
+        extract,
+        "_build_and_merge_query_regions",
+        lambda gd_table: {
+            "chr_missing": [(0, 10, ["cluster1"])],
+            "chr1": [(0, 50, ["cluster1"]), (50, 100, ["cluster1"])],
+        },
+    )
+    monkeypatch.setattr(extract, "_classify_variant", fake_classify)
+
+    annotated, out_header, sample_names = extract._process_vcfs(
+        ["only.vcf.gz"],
+        gd_table,
+        ro_threshold=0.5,
+        atypical_coverage=0.7,
+        non_nahr_overlap=0.01,
+    )
+
+    assert len(annotated) == 1
+    assert annotated[0][3] == "keep"
+    assert annotated[0][6] == {"gd_ids": {"GD1"}, "nahr": False, "atypical": True, "non_nahr": False}
+    assert out_header is not None
+    assert sample_names == ["S1"]
+    assert vcf.closed is True
+
+
+def test_process_vcfs_returns_empty_results_when_no_vcfs_are_provided():
+    gd_table = SimpleNamespace(get_all_loci=lambda: {})
+
+    annotated, out_header, sample_names = extract._process_vcfs(
+        [],
+        gd_table,
+        ro_threshold=0.5,
+        atypical_coverage=0.7,
+        non_nahr_overlap=0.01,
+    )
+
+    assert annotated == []
+    assert out_header is None
+    assert sample_names == []
+
+
 def test_modify_info_write_vcf_carrier_parsing_and_write_bed(monkeypatch, tmp_path):
     modified = extract._modify_info_field(
         "SVTYPE=DEL;GD=OLD;NON_NAHR_GD",
@@ -332,6 +451,45 @@ def test_modify_info_write_vcf_carrier_parsing_and_write_bed(monkeypatch, tmp_pa
     assert "chr1\t100\t190\tvar1\tDEL\tGD1\tS1\t1\tTrue\tFalse\tFalse" in bed_text
 
 
+def test_carriers_from_fields_returns_empty_without_genotypes_and_write_vcf_plain_text(monkeypatch, tmp_path):
+    assert extract._carriers_from_fields(["chr1", "100", "var1"], ["S1"]) == []
+    assert extract._carriers_from_fields(
+        ["chr1", "100", "var1", "N", "<DEL>", ".", "PASS", "SVTYPE=DEL", "DP", "10"],
+        ["S1"],
+    ) == []
+    assert extract._carriers_from_fields(
+        ["chr1", "100", "var1", "N", "<DEL>", ".", "PASS", "SVTYPE=DEL", "DP:GT", "10"],
+        ["S1"],
+    ) == []
+
+    compress_calls = []
+    index_calls = []
+    monkeypatch.setattr(extract.pysam, "tabix_compress", lambda *args, **kwargs: compress_calls.append(args))
+    monkeypatch.setattr(extract.pysam, "tabix_index", lambda *args, **kwargs: index_calls.append(args))
+
+    plain_vcf_path = tmp_path / "gd_variants.vcf"
+    extract._write_vcf(
+        [
+            (
+                "chr1",
+                100,
+                190,
+                "var1",
+                "DEL",
+                "chr1\t100\tvar1\tN\t<DEL>\t.\tPASS\t.",
+                {"gd_ids": {"GD1"}, "nahr": False, "atypical": True, "non_nahr": True},
+            )
+        ],
+        _HeaderStub(samples=["S1"]),
+        str(plain_vcf_path),
+    )
+
+    assert compress_calls == []
+    assert index_calls == []
+    plain_text = plain_vcf_path.read_text()
+    assert "GD=GD1;NAHR_GD_atypical;NON_NAHR_GD" in plain_text
+
+
 def test_main_validates_inputs_and_writes_outputs(monkeypatch, tmp_path, capsys):
     output_dir = tmp_path / "out"
     gd_table_path = tmp_path / "gd.tsv"
@@ -387,6 +545,74 @@ def test_main_validates_inputs_and_writes_outputs(monkeypatch, tmp_path, capsys)
     assert calls["bed"].endswith("gd_variants.bed")
 
 
+def test_parse_args_accepts_vcf_list_and_threshold_overrides(monkeypatch, tmp_path):
+    vcf_list = tmp_path / "vcfs.txt"
+    vcf_list.write_text("a.vcf.gz\nb.vcf.gz\n")
+
+    monkeypatch.setattr(sys, "argv", [
+        "gatk-sv-gd extract",
+        "--vcf-list",
+        str(vcf_list),
+        "--gd-table",
+        "gd.tsv",
+        "--output-dir",
+        "out",
+        "--reciprocal-overlap",
+        "0.4",
+        "--atypical-coverage",
+        "0.8",
+        "--non-nahr-overlap",
+        "0.02",
+    ])
+
+    args = extract._parse_args()
+
+    assert args.vcf_list == str(vcf_list)
+    assert args.vcfs is None
+    assert args.gd_table == "gd.tsv"
+    assert args.output_dir == "out"
+    assert args.reciprocal_overlap == pytest.approx(0.4)
+    assert args.atypical_coverage == pytest.approx(0.8)
+    assert args.non_nahr_overlap == pytest.approx(0.02)
+
+
+def test_main_reads_vcf_list_and_exits_cleanly_when_no_overlaps(monkeypatch, tmp_path, capsys):
+    output_dir = tmp_path / "out"
+    gd_table_path = tmp_path / "gd.tsv"
+    vcf_a = tmp_path / "a.vcf.gz"
+    vcf_b = tmp_path / "b.vcf.gz"
+    vcf_list = tmp_path / "vcfs.txt"
+    gd_table_path.write_text("dummy\n")
+    vcf_a.write_text("dummy\n")
+    vcf_b.write_text("dummy\n")
+    vcf_list.write_text(f"{vcf_a}\n{vcf_b}\n")
+
+    gd_table = SimpleNamespace(
+        df=[1],
+        get_all_loci=lambda: {"cluster1": object()},
+    )
+
+    monkeypatch.setattr(sys, "argv", [
+        "gatk-sv-gd extract",
+        "--vcf-list",
+        str(vcf_list),
+        "--gd-table",
+        str(gd_table_path),
+        "--output-dir",
+        str(output_dir),
+    ])
+    monkeypatch.setattr(extract, "GDTable", lambda path: gd_table)
+    monkeypatch.setattr(extract, "setup_logging", lambda *args, **kwargs: None)
+    monkeypatch.setattr(extract, "_process_vcfs", lambda *args, **kwargs: ([], _HeaderStub(samples=["S1"]), ["S1"]))
+
+    with pytest.raises(SystemExit, match="0"):
+        extract.main()
+
+    captured = capsys.readouterr()
+    assert "Processing 2 VCF(s)" in captured.out
+    assert "No overlapping DEL/DUP records found." in captured.out
+
+
 def test_main_exits_when_required_input_is_missing(monkeypatch, tmp_path):
     missing_vcf = tmp_path / "missing.vcf.gz"
     gd_table_path = tmp_path / "gd.tsv"
@@ -398,6 +624,26 @@ def test_main_exits_when_required_input_is_missing(monkeypatch, tmp_path):
         str(missing_vcf),
         "--gd-table",
         str(gd_table_path),
+        "--output-dir",
+        str(tmp_path / "out"),
+    ])
+    monkeypatch.setattr(extract, "setup_logging", lambda *args, **kwargs: None)
+
+    with pytest.raises(SystemExit, match="1"):
+        extract.main()
+
+
+def test_main_exits_when_gd_table_is_missing(monkeypatch, tmp_path):
+    vcf_path = tmp_path / "sample.vcf.gz"
+    missing_gd_table = tmp_path / "missing.tsv"
+    vcf_path.write_text("dummy\n")
+
+    monkeypatch.setattr(sys, "argv", [
+        "gatk-sv-gd extract",
+        "--vcf",
+        str(vcf_path),
+        "--gd-table",
+        str(missing_gd_table),
         "--output-dir",
         str(tmp_path / "out"),
     ])
