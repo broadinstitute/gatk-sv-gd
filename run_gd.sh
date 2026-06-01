@@ -226,7 +226,6 @@ FILTERED_GD_TABLE="${PREPROCESS_DIR}/gd_table_filtered.tsv"
 CN_POSTERIORS="${INFER_DIR}/cn_posteriors.tsv.gz"
 SAMPLE_POSTERIORS="${INFER_DIR}/sample_posteriors.tsv.gz"
 GD_CALLS="${CALL_DIR}/gd_cnv_calls.tsv.gz"
-VITERBI_PATHS="${CALL_DIR}/viterbi_paths.tsv.gz"
 EVENT_MARGINALS="${CALL_DIR}/event_marginals.tsv.gz"
 PLOIDY_TABLE="${PREPROCESS_DIR}/ploidy_estimates.tsv"
 EVAL_REPORT="${EVAL_DIR}/truth_evaluation_report.tsv"
@@ -369,7 +368,6 @@ PLOT_CMD=(
     -g "${FILTERED_GD_TABLE}"
     -o "${PLOT_DIR}"
     --ploidy-table "${PLOIDY_TABLE}"
-    --viterbi-paths "${VITERBI_PATHS}"
     --event-marginals "${EVENT_MARGINALS}"
 )
 

@@ -43,7 +43,22 @@ def _install_test_stub_modules():
             def __init__(self, *args, **kwargs):
                 raise NotImplementedError("TabixFile stub must be monkeypatched in tests")
 
+        class _StubVariantRecord:
+            pass
+
+        class _StubVariantHeader:
+            pass
+
+        class _StubVariantFile:
+            def __init__(self, *args, **kwargs):
+                raise NotImplementedError("VariantFile stub must be monkeypatched in tests")
+
         pysam.TabixFile = _StubTabixFile
+        pysam.VariantRecord = _StubVariantRecord
+        pysam.VariantHeader = _StubVariantHeader
+        pysam.VariantFile = _StubVariantFile
+        pysam.tabix_compress = lambda *args, **kwargs: None
+        pysam.tabix_index = lambda *args, **kwargs: None
         sys.modules["pysam"] = pysam
 
     if "torch" not in sys.modules:

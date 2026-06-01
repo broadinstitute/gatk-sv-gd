@@ -1,10 +1,4 @@
-"""
-GD CNV calling from model posteriors.
-
-Supports two calling modes:
-- ``viterbi``: smooth segmentation using transition matrices
-- ``posterior-marginal``: direct scoring from pair-state posterior marginals
-"""
+"""GD CNV calling from model posteriors."""
 
 import argparse
 import os
@@ -17,10 +11,7 @@ import pandas as pd
 from gatk_sv_gd import _util
 from gatk_sv_gd._util import setup_logging
 from gatk_sv_gd.models import GDTable
-from gatk_sv_gd.viterbi import (
-    load_transition_matrix,
-    viterbi_call_gd_cnv,
-)
+
 DEFAULT_MIN_POSTERIOR_INTERVAL_CONFIDENCE = 10.
 DEFAULT_MIN_FLANK_NON_EVENT_CONFIDENCE = 10.
 DEFAULT_POSTERIOR_INTERVAL_BIN_CORRELATION = 0.5
@@ -82,7 +73,6 @@ def get_call_confidence(call: dict) -> float:
 
 def determine_best_breakpoints(
     calls: List[dict],
-    calling_mode: str = "viterbi",
     carrier_only: bool = True,
 ) -> Dict[str, Optional[str]]:
     """Pick the best GD_ID per svtype."""
@@ -96,27 +86,15 @@ def determine_best_breakpoints(
             best_by_svtype[svtype] = None
             continue
 
-        if calling_mode == "posterior-marginal":
-            best = max(
-                sv_calls,
-                key=lambda c: (
-                    get_call_confidence(c),
-                    c.get("matched_interval_bp", 0),
-                    c.get("end", 0) - c.get("start", 0),
-                    str(c.get("GD_ID", "")),
-                ),
-            )
-        else:
-            best = max(
-                sv_calls,
-                key=lambda c: (
-                    c.get("matched_interval_bp", 0),
-                    c.get("interval_coverage", c.get("reciprocal_overlap", 0.0)),
-                    get_call_confidence(c),
-                    c.get("end", 0) - c.get("start", 0),
-                    str(c.get("GD_ID", "")),
-                ),
-            )
+        best = max(
+            sv_calls,
+            key=lambda c: (
+                get_call_confidence(c),
+                c.get("matched_interval_bp", 0),
+                c.get("end", 0) - c.get("start", 0),
+                str(c.get("GD_ID", "")),
+            ),
+        )
 
         best_by_svtype[svtype] = best.get("GD_ID")
     return best_by_svtype
@@ -733,54 +711,35 @@ def call_cnvs_from_posteriors(
     cn_posteriors_df: pd.DataFrame,
     bin_mappings_df: pd.DataFrame,
     gd_table: GDTable,
-    transition_matrix: Optional[np.ndarray] = None,
     ploidy_df: Optional[pd.DataFrame] = None,
     verbose: bool = False,
-    min_mean_coverage: float = 0.90,
-    breakpoint_transition_matrix: Optional[np.ndarray] = None,
-    calling_mode: str = "viterbi",
     min_posterior_interval_confidence: float = DEFAULT_MIN_POSTERIOR_INTERVAL_CONFIDENCE,
     min_flank_non_event_confidence: float = DEFAULT_MIN_FLANK_NON_EVENT_CONFIDENCE,
     posterior_interval_bin_correlation: float = DEFAULT_POSTERIOR_INTERVAL_BIN_CORRELATION,
     null_anomaly_threshold: float = DEFAULT_NULL_ANOMALY_THRESHOLD,
-) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+) -> Tuple[pd.DataFrame, pd.DataFrame]:
     """Call GD CNVs from posterior probabilities."""
-    if calling_mode not in {"viterbi", "posterior-marginal"}:
-        raise ValueError(
-            f"Unsupported calling_mode: {calling_mode}. "
-            "Expected 'viterbi' or 'posterior-marginal'."
-        )
     if not 0.0 <= posterior_interval_bin_correlation <= 1.0:
         raise ValueError("posterior_interval_bin_correlation must be in [0, 1].")
     if not 0.0 <= null_anomaly_threshold <= 1.0:
         raise ValueError("null_anomaly_threshold must be in [0, 1].")
-    if calling_mode == "viterbi" and transition_matrix is None:
-        raise ValueError("transition_matrix is required for calling_mode='viterbi'")
 
     print("\n" + "=" * 80)
     print("CALLING CNVs FROM POSTERIORS")
-    if calling_mode == "viterbi":
-        bp_str = " + breakpoint matrix" if breakpoint_transition_matrix is not None else ""
-        print(
-            f"  Calling mode: Viterbi segmentation{bp_str}  "
-            f"(minimum per-interval coverage={min_mean_coverage:.0%})"
-        )
-    else:
-        print(
-            "  Calling mode: posterior-marginal scoring  "
-            "(minimum per-interval QUAL="
-            f"{min_posterior_interval_confidence:.2f}, "
-            "interval bin correlation="
-            f"{posterior_interval_bin_correlation:.2f}, "
-            "minimum flank non-event QUAL="
-            f"{min_flank_non_event_confidence:.2f}, "
-            "null anomaly threshold="
-            f"{null_anomaly_threshold:.2f})"
-        )
+    print(
+        "  Calling mode: posterior-marginal scoring  "
+        "(minimum per-interval QUAL="
+        f"{min_posterior_interval_confidence:.2f}, "
+        "interval bin correlation="
+        f"{posterior_interval_bin_correlation:.2f}, "
+        "minimum flank non-event QUAL="
+        f"{min_flank_non_event_confidence:.2f}, "
+        "null anomaly threshold="
+        f"{null_anomaly_threshold:.2f})"
+    )
     print("=" * 80)
 
     all_results: List[dict] = []
-    all_path_records: List[dict] = []
     all_event_records: List[dict] = []
     sample_ids = cn_posteriors_df["sample"].unique()
 
@@ -874,15 +833,6 @@ def call_cnvs_from_posteriors(
         "pair-state probability array"
     )
 
-    bin_coords_by_idx: Dict[int, Tuple[int, int]] = dict(
-        zip(
-            bin_mappings_df["array_idx"].astype(int),
-            zip(
-                bin_mappings_df["start"].astype(int),
-                bin_mappings_df["end"].astype(int),
-            ),
-        )
-    )
     cluster_rows_by_cluster = {
         str(cluster): group
         for cluster, group in bin_mappings_df.groupby("cluster", sort=False)
@@ -977,122 +927,78 @@ def call_cnvs_from_posteriors(
                 )
             )
 
-            if calling_mode == "viterbi":
-                calls, path_records = viterbi_call_gd_cnv(
-                    locus,
-                    pair_prob_3d[s_idx],
-                    pair_state_labels,
-                    transition_matrix,
-                    interval_bin_arrays,
-                    ploidy=sample_ploidy,
-                    min_mean_coverage=min_mean_coverage,
-                    verbose=False,
-                    sample_id=str(sample_id),
-                    breakpoint_transition_matrix=breakpoint_transition_matrix,
-                    bin_coords=bin_coords_by_idx,
-                    all_cluster_bins=locus_cache["all_cluster_bins"],
+            interval_confidence_lookup_by_svtype = {
+                svtype: _compute_interval_confidence_lookup(
+                    locus_cache["interval_names_for_entries"],
+                    interval_bin_arrays_local,
+                    cluster_event_probs[svtype],
+                    neighbor_bin_correlation=posterior_interval_bin_correlation,
                 )
-                for start, end, cn_state, category, haplotype in path_records:
-                    all_path_records.append(
-                        {
-                            "sample": sample_id,
-                            "cluster": cluster,
-                            "start": start,
-                            "end": end,
-                            "cn_state": cn_state,
-                            "category": category,
-                            "haplotype": haplotype,
-                        }
-                    )
-                confident_by_svtype = determine_best_breakpoints(
-                    calls,
-                    calling_mode="viterbi",
-                    carrier_only=True,
+                for svtype in ("DEL", "DUP")
+            }
+            flank_stats_by_svtype = {
+                svtype: _compute_flank_confidence_stats(
+                    interval_bin_arrays_local,
+                    cluster_event_probs[svtype],
                 )
-                best_by_svtype = determine_best_breakpoints(
-                    calls,
-                    calling_mode="viterbi",
-                    carrier_only=False,
+                for svtype in ("DEL", "DUP")
+            }
+            raw_interval_confidence_lookup_by_svtype = {
+                svtype: _compute_interval_confidence_lookup(
+                    locus_cache["interval_names_for_entries"],
+                    interval_bin_arrays_local,
+                    cluster_event_support_probs[svtype],
+                    neighbor_bin_correlation=posterior_interval_bin_correlation,
                 )
-                _annotate_best_and_confident_calls(
-                    calls,
-                    best_by_svtype=best_by_svtype,
-                    confident_by_svtype=confident_by_svtype,
+                for svtype in ("DEL", "DUP")
+            }
+            raw_flank_stats_by_svtype = {
+                svtype: _compute_flank_confidence_stats(
+                    interval_bin_arrays_local,
+                    cluster_event_support_probs[svtype],
                 )
-            else:
-                interval_confidence_lookup_by_svtype = {
-                    svtype: _compute_interval_confidence_lookup(
-                        locus_cache["interval_names_for_entries"],
-                        interval_bin_arrays_local,
-                        cluster_event_probs[svtype],
-                        neighbor_bin_correlation=posterior_interval_bin_correlation,
-                    )
-                    for svtype in ("DEL", "DUP")
-                }
-                flank_stats_by_svtype = {
-                    svtype: _compute_flank_confidence_stats(
-                        interval_bin_arrays_local,
-                        cluster_event_probs[svtype],
-                    )
-                    for svtype in ("DEL", "DUP")
-                }
-                raw_interval_confidence_lookup_by_svtype = {
-                    svtype: _compute_interval_confidence_lookup(
-                        locus_cache["interval_names_for_entries"],
-                        interval_bin_arrays_local,
-                        cluster_event_support_probs[svtype],
-                        neighbor_bin_correlation=posterior_interval_bin_correlation,
-                    )
-                    for svtype in ("DEL", "DUP")
-                }
-                raw_flank_stats_by_svtype = {
-                    svtype: _compute_flank_confidence_stats(
-                        interval_bin_arrays_local,
-                        cluster_event_support_probs[svtype],
-                    )
-                    for svtype in ("DEL", "DUP")
-                }
-                calls = [
-                    score_call_from_posterior_marginals(
-                        locus=locus,
-                        entry=entry_spec["entry"],
-                        sample_pair_probs=pair_prob_3d[s_idx],
-                        pair_states=pair_state_labels,
-                        interval_bin_arrays=interval_bin_arrays_local,
-                        sample_ploidy=sample_ploidy,
-                        posterior_interval_bin_correlation=posterior_interval_bin_correlation,
-                        event_probabilities=cluster_event_probs[entry_spec["svtype"]],
-                        raw_event_probabilities=cluster_event_support_probs[entry_spec["svtype"]],
-                        entry_spec=entry_spec,
-                        interval_confidence_lookup=interval_confidence_lookup_by_svtype[
-                            entry_spec["svtype"]
-                        ],
-                        flank_non_event_medians=flank_stats_by_svtype[entry_spec["svtype"]][0],
-                        flank_confidences=flank_stats_by_svtype[entry_spec["svtype"]][1],
-                        raw_interval_confidence_lookup=raw_interval_confidence_lookup_by_svtype[
-                            entry_spec["svtype"]
-                        ],
-                        raw_flank_non_event_medians=raw_flank_stats_by_svtype[entry_spec["svtype"]][0],
-                        raw_flank_confidences=raw_flank_stats_by_svtype[entry_spec["svtype"]][1],
-                        cluster_depth=cluster_depth,
-                    )
-                    for entry_spec in locus_cache["posterior_entry_specs"]
-                ]
-                confident_by_svtype = determine_posterior_carrier_breakpoints(
-                    calls,
-                    min_interval_confidence=min_posterior_interval_confidence,
-                    min_flank_non_event_confidence=min_flank_non_event_confidence,
+                for svtype in ("DEL", "DUP")
+            }
+            calls = [
+                score_call_from_posterior_marginals(
+                    locus=locus,
+                    entry=entry_spec["entry"],
+                    sample_pair_probs=pair_prob_3d[s_idx],
+                    pair_states=pair_state_labels,
+                    interval_bin_arrays=interval_bin_arrays_local,
+                    sample_ploidy=sample_ploidy,
+                    posterior_interval_bin_correlation=posterior_interval_bin_correlation,
+                    event_probabilities=cluster_event_probs[entry_spec["svtype"]],
+                    raw_event_probabilities=cluster_event_support_probs[entry_spec["svtype"]],
+                    entry_spec=entry_spec,
+                    interval_confidence_lookup=interval_confidence_lookup_by_svtype[
+                        entry_spec["svtype"]
+                    ],
+                    flank_non_event_medians=flank_stats_by_svtype[entry_spec["svtype"]][0],
+                    flank_confidences=flank_stats_by_svtype[entry_spec["svtype"]][1],
+                    raw_interval_confidence_lookup=raw_interval_confidence_lookup_by_svtype[
+                        entry_spec["svtype"]
+                    ],
+                    raw_flank_non_event_medians=raw_flank_stats_by_svtype[entry_spec["svtype"]][0],
+                    raw_flank_confidences=raw_flank_stats_by_svtype[entry_spec["svtype"]][1],
+                    cluster_depth=cluster_depth,
                 )
-                best_by_svtype = determine_best_breakpoints(
-                    calls,
-                    calling_mode="posterior-marginal",
-                    carrier_only=False,
-                )
-                _annotate_best_and_confident_calls(
-                    calls,
-                    best_by_svtype=best_by_svtype,
-                    confident_by_svtype=confident_by_svtype,
-                )
+                for entry_spec in locus_cache["posterior_entry_specs"]
+            ]
+            confident_by_svtype = determine_posterior_carrier_breakpoints(
+                calls,
+                min_interval_confidence=min_posterior_interval_confidence,
+                min_flank_non_event_confidence=min_flank_non_event_confidence,
+            )
+            best_by_svtype = determine_best_breakpoints(
+                calls,
+                carrier_only=False,
+            )
+            _annotate_best_and_confident_calls(
+                calls,
+                best_by_svtype=best_by_svtype,
+                confident_by_svtype=confident_by_svtype,
+            )
 
             for call in calls:
                 mean_depth = call.get("mean_depth", np.nan)
@@ -1165,21 +1071,13 @@ def call_cnvs_from_posteriors(
                     "raw_qual_score": call.get("raw_qual_score", np.nan),
                     "null_anomaly_score": null_anomaly_score,
                     "is_null_anomalous": bool(null_anomaly_score > null_anomaly_threshold),
-                    "calling_method": calling_mode,
-                    "call_criteria_mean_coverage": (
-                        float(min_mean_coverage)
-                        if calling_mode == "viterbi"
-                        else np.nan
+                    "calling_method": "posterior-marginal",
+                    "call_criteria_mean_coverage": np.nan,
+                    "call_criteria_interval_confidence": float(
+                        min_posterior_interval_confidence
                     ),
-                    "call_criteria_interval_confidence": (
-                        float(min_posterior_interval_confidence)
-                        if calling_mode == "posterior-marginal"
-                        else np.nan
-                    ),
-                    "call_criteria_flank_non_event_confidence": (
-                        float(min_flank_non_event_confidence)
-                        if calling_mode == "posterior-marginal"
-                        else np.nan
+                    "call_criteria_flank_non_event_confidence": float(
+                        min_flank_non_event_confidence
                     ),
                     "call_criteria_null_anomaly_score": float(null_anomaly_threshold),
                 }
@@ -1240,18 +1138,6 @@ def call_cnvs_from_posteriors(
             "call_criteria_null_anomaly_score",
         ],
     )
-    paths_df = pd.DataFrame(
-        all_path_records,
-        columns=[
-            "sample",
-            "cluster",
-            "start",
-            "end",
-            "cn_state",
-            "category",
-            "haplotype",
-        ],
-    )
     event_marginals_df = pd.DataFrame(
         all_event_records,
         columns=[
@@ -1269,7 +1155,7 @@ def call_cnvs_from_posteriors(
             "raw_qual_dup_event",
         ],
     )
-    return calls_df, paths_df, event_marginals_df
+    return calls_df, event_marginals_df
 
 
 def parse_args():
@@ -1303,31 +1189,6 @@ def parse_args():
         "--output-dir", "-o",
         required=True,
         help="Output directory for calls",
-    )
-    parser.add_argument(
-        "--transition-matrix",
-        required=False,
-        help="CN-state transition probability matrix (TSV) for Viterbi calling only. "
-             "Required when --calling-mode=viterbi.",
-    )
-    parser.add_argument(
-        "--breakpoint-transition-matrix",
-        required=False,
-        help="CN-state transition probability matrix (TSV) applied at known "
-             "breakpoint boundaries during Viterbi calling only.",
-    )
-    parser.add_argument(
-        "--min-mean-coverage",
-        type=float,
-        default=0.50,
-        help="Minimum per-interval coverage required for a breakpoint pair "
-             "to participate in the selected contiguous run in Viterbi mode.",
-    )
-    parser.add_argument(
-        "--calling-mode",
-        choices=["viterbi", "posterior-marginal"],
-        default="posterior-marginal",
-        help="Calling strategy to use.",
     )
     parser.add_argument(
         "--min-posterior-interval-confidence",
@@ -1387,7 +1248,6 @@ def main():
     )
 
     print("Output directory configured")
-    print(f"Calling mode: {args.calling_mode}")
 
     print("\nLoading data...")
 
@@ -1407,30 +1267,12 @@ def main():
     ploidy_df = pd.read_csv(args.ploidy_table, sep="\t")
     print(f"    {len(ploidy_df)} sample/contig ploidy records")
 
-    transition_matrix = None
-    breakpoint_transition_matrix = None
-    if args.calling_mode == "viterbi":
-        if not args.transition_matrix:
-            raise ValueError("--transition-matrix is required when --calling-mode=viterbi")
-        print("\n  Loading transition matrix")
-        transition_matrix = load_transition_matrix(args.transition_matrix)
-
-        if args.breakpoint_transition_matrix:
-            print("  Loading breakpoint transition matrix")
-            breakpoint_transition_matrix = load_transition_matrix(
-                args.breakpoint_transition_matrix
-            )
-
-    calls_df, paths_df, event_marginals_df = call_cnvs_from_posteriors(
+    calls_df, event_marginals_df = call_cnvs_from_posteriors(
         cn_posteriors_df,
         bin_mappings_df,
         gd_table,
-        transition_matrix=transition_matrix,
         ploidy_df=ploidy_df,
         verbose=args.verbose,
-        min_mean_coverage=args.min_mean_coverage,
-        breakpoint_transition_matrix=breakpoint_transition_matrix,
-        calling_mode=args.calling_mode,
         min_posterior_interval_confidence=args.min_posterior_interval_confidence,
         min_flank_non_event_confidence=args.min_flank_non_event_confidence,
         posterior_interval_bin_correlation=args.posterior_interval_bin_correlation,
@@ -1441,11 +1283,6 @@ def main():
     calls_df.to_csv(output_file, sep="\t", index=False, compression="gzip")
     print("\n  Saved calls table")
     print(f"    {len(calls_df)} call records")
-
-    paths_file = os.path.join(args.output_dir, "viterbi_paths.tsv.gz")
-    paths_df.to_csv(paths_file, sep="\t", index=False, compression="gzip")
-    print("  Saved Viterbi paths table")
-    print(f"    {len(paths_df)} path records")
 
     event_marginals_file = os.path.join(args.output_dir, "event_marginals.tsv.gz")
     event_marginals_df.to_csv(

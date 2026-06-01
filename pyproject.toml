@@ -22,6 +22,8 @@ dependencies = [
 [project.optional-dependencies]
 dev = [
     "pytest",
+    "coverage[toml]",
+    "pytest-cov",
     "flake8",
 ]
 
@@ -33,3 +35,23 @@ package-dir = {"" = "src"}
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.pytest.ini_options]
+addopts = "--cov=gatk_sv_gd --cov-report=term-missing --cov-fail-under=90"
+filterwarnings = [
+    "ignore:'oneOf' deprecated - use 'one_of':DeprecationWarning:matplotlib\\._fontconfig_pattern",
+    "ignore:'parseString' deprecated - use 'parse_string':DeprecationWarning:matplotlib\\._fontconfig_pattern",
+    "ignore:'resetCache' deprecated - use 'reset_cache':DeprecationWarning:matplotlib\\._fontconfig_pattern",
+    "ignore:'enablePackrat' deprecated - use 'enable_packrat':DeprecationWarning:matplotlib\\._mathtext",
+]
+
+[tool.coverage.run]
+branch = true
+source = ["gatk_sv_gd"]
+
+[tool.coverage.report]
+show_missing = true
+skip_covered = true
+
+[tool.coverage.html]
+directory = "build/coverage-html"

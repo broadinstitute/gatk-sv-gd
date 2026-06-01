@@ -1,4 +1,5 @@
 import sys
+from types import SimpleNamespace
 
 import pandas as pd
 import matplotlib.pyplot as plt
@@ -9,18 +10,59 @@ from matplotlib.collections import LineCollection
 from gatk_sv_gd.models import GDLocus
 from gatk_sv_gd.annotations import FlankCompressor
 from gatk_sv_gd._util import posterior_called_state_to_qual
+from gatk_sv_gd import plot as plot_module
 from gatk_sv_gd.plot import (
-    ViterbiOverlayData,
     _apply_carrier_pdf_x_axis_layout,
+    _aligned_region_sample_vector,
     _build_anomalous_pdf_specs,
     _build_eval_pdf_specs,
+    _build_called_event_mask,
+    _build_carrier_best_match_mask,
+    _build_gd_to_cluster_map,
     _build_raw_region_df,
     _coarsen_pdf_page_signals,
+    _compute_raw_sample_medians,
+    _create_review_category_pdf,
+    create_anomalous_pdf,
+    create_carrier_pdf,
+    create_eval_category_pdfs,
+    _extract_sample_event_probabilities,
+    _get_event_probability_column,
+    _get_confidence_column,
+    _get_confidence_label,
+    _get_locus_gd_entry,
+    _minor_baf_reference_levels,
+    _parse_eval_sample_list,
+    _plot_depth_bars_with_baf,
     _plot_baf_signal_panel,
     _plot_event_marginal_panel,
     _rebin_aligned_region_dfs_for_display,
+    _render_pdf_sample_page,
+    _select_baf_plot_support_columns,
+    _sanitize_plot_label,
+    estimate_lowres_bin_size,
+    main as plot_main,
     parse_args,
+    plot_carrier_summary,
+    plot_confidence_distribution,
+    plot_locus_overview,
+    plot_sample_at_locus,
 )
+
+
+class _StubPdfPages:
+    def __init__(self, path):
+        self.path = path
+        self.saved_figures = []
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        return None
+
+    def savefig(self, fig):
+        self.saved_figures.append(fig)
 
 
 def _make_locus() -> GDLocus:
@@ -69,6 +111,962 @@ def test_parse_args_allows_skipping_locus_plots(monkeypatch):
     args = parse_args()
 
     assert args.skip_locus_plots is True
+
+
+def test_plot_helpers_cover_confidence_labels_masks_and_medians():
+    qual_df = pd.DataFrame({"qual_score": [10.0]})
+    confidence_df = pd.DataFrame({"confidence_score": [5.0]})
+    log_prob_df = pd.DataFrame({"log_prob_score": [1.0]})
+
+    assert _get_confidence_column(qual_df) == "qual_score"
+    assert _get_confidence_column(confidence_df) == "confidence_score"
+    assert _get_confidence_column(log_prob_df) == "log_prob_score"
+    assert _get_confidence_label("qual_score") == "Call QUAL"
+    assert _get_confidence_label("confidence_score") == "Confidence Score"
+    assert _get_confidence_label("log_prob_score") == "Log Probability Score"
+    assert _sanitize_plot_label("chr1:10-20/sample") == "chr1_10_20_sample"
+
+    with pytest.raises(ValueError, match="missing 'qual_score'"):
+        _get_confidence_column(pd.DataFrame({"other": [1]}))
+
+    calls_df = pd.DataFrame(
+        {
+            "is_carrier": [True, True, False],
+            "is_best_match": [True, False, True],
+        }
+    )
+    assert _build_carrier_best_match_mask(calls_df).tolist() == [True, False, False]
+    assert _build_carrier_best_match_mask(pd.DataFrame({"is_carrier": [True, False]})).tolist() == [True, False]
+
+    raw_counts_df = pd.DataFrame(
+        {
+            "Chr": ["chr1", "chr2", "chrX"],
+            "Start": [0, 10, 20],
+            "End": [10, 20, 30],
+            "S1": [2.0, 6.0, 100.0],
+            "S2": [0.0, 0.0, 50.0],
+        }
+    )
+    assert _compute_raw_sample_medians(raw_counts_df) == {"S1": 4.0}
+    assert _compute_raw_sample_medians(None) == {}
+
+
+def test_plot_helpers_cover_eval_parsing_gd_lookup_and_bin_size():
+    assert _parse_eval_sample_list(np.nan) == []
+    assert _parse_eval_sample_list("") == []
+    assert _parse_eval_sample_list(" S1, S2 ,,S3 ") == ["S1", "S2", "S3"]
+
+    locus1 = _make_eval_locus()
+    locus2 = GDLocus(
+        cluster="16p11.2",
+        chrom="chr16",
+        breakpoints=[(29000000, 29000000), (30100000, 30100000)],
+        breakpoint_names=["BP4", "BP5"],
+        gd_entries=[
+            {
+                "GD_ID": "GD2",
+                "svtype": "DUP",
+                "start_GRCh38": 29000000,
+                "end_GRCh38": 30100000,
+            }
+        ],
+        is_nahr=True,
+        is_terminal=False,
+    )
+
+    gd_to_cluster = _build_gd_to_cluster_map({"10q11.2": locus1, "16p11.2": locus2})
+    assert gd_to_cluster == {"GD1": "10q11.2", "GD2": "16p11.2"}
+    assert _get_locus_gd_entry(locus1, "GD1")["svtype"] == "DEL"
+    assert _get_locus_gd_entry(locus1, None) is None
+    assert _get_locus_gd_entry(locus1, "missing") is None
+
+    df = pd.DataFrame({"Start": [0, 10, 25], "End": [10, 25, 55]})
+    assert estimate_lowres_bin_size(df) == 15.0
+
+
+def test_plot_helpers_cover_event_probability_alignment_and_called_masks():
+    assert _get_event_probability_column("DEL") == "prob_del_event"
+    assert _get_event_probability_column("DUP") == "prob_dup_event"
+    with pytest.raises(ValueError, match="Unsupported svtype"):
+        _get_event_probability_column("CNV")
+
+    region_df = pd.DataFrame(
+        {
+            "Cluster": ["c1", "c1", "c1"],
+            "Chr": ["chr1", "chr1", "chr1"],
+            "Start": [100, 200, 300],
+            "End": [150, 250, 350],
+        }
+    )
+    value_df = pd.DataFrame(
+        {
+            "Cluster": ["c1", "c1", "c1"],
+            "Chr": ["chr1", "chr1", "chr1"],
+            "Start": [100, 200, 300],
+            "End": [150, 250, 350],
+            "S1": [0.1, 0.2, 0.3],
+        }
+    )
+    shuffled_value_df = value_df.iloc[[2, 0, 1]].reset_index(drop=True)
+
+    assert np.allclose(_aligned_region_sample_vector(region_df, value_df, "S1"), [0.1, 0.2, 0.3])
+    assert np.allclose(_aligned_region_sample_vector(region_df, shuffled_value_df, "S1"), [0.1, 0.2, 0.3])
+    assert _aligned_region_sample_vector(region_df, None, "S1") is None
+    assert _aligned_region_sample_vector(region_df, value_df, "S9") is None
+    assert np.allclose(_extract_sample_event_probabilities(region_df, value_df, "S1"), [0.1, 0.2, 0.3])
+
+    assert np.allclose(_minor_baf_reference_levels(), [0.1, 0.2, 0.3, 0.4, 0.5])
+    assert _build_called_event_mask(region_df.iloc[0:0], 100, 200) is None
+    assert _build_called_event_mask(region_df, None, 200) is None
+    assert _build_called_event_mask(region_df, 150, None) is None
+    assert _build_called_event_mask(region_df, 150, 320).tolist() == [False, True, True]
+    assert _build_called_event_mask(region_df, 150, 200).tolist() == [False, False, False]
+
+
+def test_plot_helpers_cover_baf_support_column_selection():
+    assert _select_baf_plot_support_columns(
+        pd.DataFrame(columns=["baf_effective_variance", "baf_effective_n_sites"])
+    ) == ("baf_effective_variance", "baf_effective_n_sites")
+    assert _select_baf_plot_support_columns(
+        pd.DataFrame(columns=["baf_variance", "baf_n_sites"])
+    ) == ("baf_variance", "baf_n_sites")
+    assert _select_baf_plot_support_columns(pd.DataFrame(columns=["baf_n_sites"])) == (None, "baf_n_sites")
+    assert _select_baf_plot_support_columns(pd.DataFrame(columns=["other"])) == (None, None)
+
+
+def test_plot_depth_bars_with_baf_handles_missing_and_split_baf_cases():
+    fig, axes = plt.subplots(1, 2)
+    try:
+        x_positions = np.array([1.0, 2.0, 3.0], dtype=float)
+        bar_widths = np.array([0.8, 0.8, 0.8], dtype=float)
+        depth_values = np.array([2.0, 4.0, 6.0], dtype=float)
+
+        _plot_depth_bars_with_baf(axes[0], x_positions, bar_widths, depth_values)
+        assert len(axes[0].patches) == 3
+
+        _plot_depth_bars_with_baf(
+            axes[1],
+            x_positions,
+            bar_widths,
+            depth_values,
+            minor_baf_values=np.array([0.25, np.nan, 0.5], dtype=float),
+            baf_site_counts=np.array([10, 0, 8], dtype=float),
+        )
+        assert len(axes[1].patches) == 5
+    finally:
+        plt.close(fig)
+
+
+def test_plot_event_marginal_panel_handles_empty_invalid_and_mismatched_inputs():
+    locus = _make_locus()
+    x_positions = np.array([46050000.0, 48190000.0], dtype=float)
+    bar_widths = np.array([0.001, 0.001], dtype=float)
+    xform = FlankCompressor(46005406, 49845537, locus.start, locus.end, flank_scale=0.2)
+
+    fig, axes = plt.subplots(1, 3)
+    try:
+        _plot_event_marginal_panel(
+            axes[0],
+            x_positions,
+            bar_widths,
+            None,
+            xform,
+            locus,
+            locus.chrom,
+            "DEL",
+        )
+        assert axes[0].texts[0].get_text() == "No event marginals available"
+        assert axes[0].get_ylabel() == "Called-state QUAL"
+
+        _plot_event_marginal_panel(
+            axes[1],
+            x_positions,
+            bar_widths,
+            np.array([np.nan, np.nan]),
+            xform,
+            locus,
+            locus.chrom,
+            "DUP",
+            show_trace=False,
+        )
+        assert axes[1].texts[0].get_text() == "No finite event marginals"
+        assert axes[1].get_ylabel() == "QUAL(DUP on ≥1 hap)"
+
+        with pytest.raises(ValueError, match="called_event_mask must align"):
+            _plot_event_marginal_panel(
+                axes[2],
+                x_positions,
+                bar_widths,
+                np.array([0.8, 0.2]),
+                xform,
+                locus,
+                locus.chrom,
+                "DEL",
+                called_event_mask=np.array([True]),
+            )
+    finally:
+        plt.close(fig)
+
+
+def test_create_review_category_pdf_returns_early_without_pages(monkeypatch):
+    opened_paths = []
+    monkeypatch.setattr(plot_module, "PdfPages", lambda path: opened_paths.append(path) or _StubPdfPages(path))
+
+    _create_review_category_pdf(
+        category_name="empty",
+        page_specs=[],
+        pdf_path="out.pdf",
+        calls_df=pd.DataFrame(),
+        depth_df=pd.DataFrame(),
+        loci_by_cluster={},
+        gtf=None,
+        segdup=None,
+        event_del_df=None,
+        event_dup_df=None,
+        minor_baf_df=None,
+        baf_variance_df=None,
+        baf_sites_df=None,
+        gaps=None,
+        raw_counts_df=None,
+        lowres_median_bin_size=None,
+        highres_path=None,
+        flank_scale=0.2,
+        min_gene_label_spacing=0.05,
+        event_values_are_qual=False,
+        baf_temperature_by_sample=None,
+    )
+
+    assert opened_paths == []
+
+
+def test_create_review_category_pdf_builds_cluster_pages_and_raw_region(monkeypatch, tmp_path):
+    render_calls = []
+    monkeypatch.setattr(plot_module, "PdfPages", _StubPdfPages)
+    monkeypatch.setattr(
+        plot_module,
+        "_render_pdf_sample_page",
+        lambda pdf, sample_id, cluster, locus, region_df, cluster_calls_df, confidence_column, *args, **kwargs: render_calls.append(
+            {
+                "pdf": pdf,
+                "sample": sample_id,
+                "cluster": cluster,
+                "locus": locus.cluster,
+                "region_rows": len(region_df),
+                "cluster_call_rows": len(cluster_calls_df),
+                "confidence_column": confidence_column,
+                "raw_region_present": args[4] is not None,
+                "target_gd_id": kwargs.get("target_gd_id"),
+                "title_suffix": kwargs.get("title_suffix"),
+            }
+        ) or True,
+    )
+    monkeypatch.setattr(
+        plot_module,
+        "_build_raw_region_df",
+        lambda *args, **kwargs: pd.DataFrame(
+            {
+                "Cluster": ["10q11.2", "10q11.2"],
+                "Chr": ["chr10", "chr10"],
+                "Start": [46005406, 48181660],
+                "End": [48181660, 49845537],
+                "S1": [2.0, 2.1],
+            }
+        ),
+    )
+    monkeypatch.setattr(plot_module, "_rebin_region_df", lambda df, locus: df)
+
+    locus = _make_eval_locus()
+    page_specs = [{"cluster": "10q11.2", "sample": "S1", "gd_id": "GD1", "title_suffix": "TP: GD1"}]
+    calls_df = pd.DataFrame(
+        {
+            "cluster": ["10q11.2"],
+            "sample": ["S1"],
+            "GD_ID": ["GD1"],
+            "qual_score": [25.0],
+        }
+    )
+    depth_df = pd.DataFrame(
+        {
+            "Cluster": ["10q11.2", "10q11.2"],
+            "Chr": ["chr10", "chr10"],
+            "Start": [46005406, 48181660],
+            "End": [48181660, 49845537],
+            "S1": [2.0, 1.1],
+        }
+    )
+    raw_counts_df = pd.DataFrame(
+        {
+            "Chr": ["chr1", "chr2"],
+            "Start": [0, 10],
+            "End": [10, 20],
+            "S1": [10.0, 12.0],
+        }
+    )
+    baf_df = depth_df.copy()
+    baf_df["S1"] = [0.4, 0.3]
+    event_df = depth_df.copy()
+    event_df["S1"] = [0.8, 0.9]
+
+    _create_review_category_pdf(
+        "true_positives",
+        page_specs,
+        str(tmp_path / "review.pdf"),
+        calls_df,
+        depth_df,
+        {"10q11.2": locus},
+        None,
+        None,
+        event_df,
+        event_df,
+        baf_df,
+        baf_df,
+        baf_df,
+        None,
+        raw_counts_df,
+        None,
+        None,
+        0.2,
+        0.05,
+        False,
+        {"S1": 20.0},
+    )
+
+    assert len(render_calls) == 1
+    assert render_calls[0]["sample"] == "S1"
+    assert render_calls[0]["cluster"] == "10q11.2"
+    assert render_calls[0]["locus"] == "10q11.2"
+    assert render_calls[0]["region_rows"] == 2
+    assert render_calls[0]["cluster_call_rows"] == 1
+    assert render_calls[0]["confidence_column"] == "qual_score"
+    assert render_calls[0]["raw_region_present"] is True
+    assert render_calls[0]["target_gd_id"] == "GD1"
+    assert render_calls[0]["title_suffix"] == "TP: GD1"
+
+
+def test_render_pdf_sample_page_handles_missing_sample_and_target_entry_path():
+    locus = _make_eval_locus()
+    xform = FlankCompressor(46005406, 49845537, locus.start, locus.end, flank_scale=0.2)
+    region_df = pd.DataFrame(
+        {
+            "Cluster": ["10q11.2", "10q11.2"],
+            "Chr": ["chr10", "chr10"],
+            "Start": [46005406, 48181660],
+            "End": [48181660, 49845537],
+            "S1": [2.0, 1.2],
+        }
+    )
+
+    assert _render_pdf_sample_page(
+        _StubPdfPages("unused.pdf"),
+        "MISSING",
+        "10q11.2",
+        locus,
+        region_df,
+        pd.DataFrame(columns=["sample", "cluster", "GD_ID", "svtype", "start", "end", "is_best_match", "qual_score", "mean_depth"]),
+        "qual_score",
+        None,
+        None,
+        0.05,
+        xform,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+    ) is False
+
+    pdf = _StubPdfPages("page.pdf")
+    result = _render_pdf_sample_page(
+        pdf,
+        "S1",
+        "10q11.2",
+        locus,
+        region_df,
+        pd.DataFrame(columns=["sample", "cluster", "GD_ID", "svtype", "start", "end", "is_best_match", "qual_score", "mean_depth"]),
+        "qual_score",
+        None,
+        None,
+        0.05,
+        xform,
+        region_df.copy(),
+        region_df.assign(S1=[0.4, 0.3]),
+        region_df.assign(S1=[0.01, 0.02]),
+        region_df.assign(S1=[10, 12]),
+        region_df.assign(S1=[0.8, 0.9]),
+        None,
+        None,
+        event_values_are_qual=False,
+        target_gd_id="GD1",
+        title_suffix="Target GD",
+    )
+
+    assert result is True
+    assert len(pdf.saved_figures) == 1
+
+
+def test_plot_locus_overview_skips_invalid_loci(capsys, tmp_path):
+    no_bp_locus = _make_eval_locus()
+    no_bp_locus.breakpoints = []
+    plot_locus_overview(
+        no_bp_locus,
+        pd.DataFrame(),
+        pd.DataFrame(),
+        None,
+        None,
+        str(tmp_path),
+    )
+
+    plot_locus_overview(
+        _make_eval_locus(),
+        pd.DataFrame(columns=["cluster", "sample", "is_carrier"]),
+        pd.DataFrame(columns=["Cluster", "Chr", "Start", "End", "S1"]),
+        None,
+        None,
+        str(tmp_path),
+    )
+
+    out = capsys.readouterr().out
+    assert "Warning: no breakpoints defined for one locus; skipping" in out
+    assert "Warning: no depth data found for one locus; skipping plot" in out
+
+
+def test_plot_locus_overview_draws_raw_and_processed_columns(monkeypatch, tmp_path):
+    locus = _make_eval_locus()
+    draw_calls = []
+    timing_calls = []
+    saved_paths = []
+
+    class _DummyFigure:
+        def subplots_adjust(self, **kwargs):
+            return None
+
+        def savefig(self, path, **kwargs):
+            saved_paths.append(path)
+
+    def fake_subplots(n_rows, n_cols, **kwargs):
+        axes = np.empty((n_rows, n_cols), dtype=object)
+        axes[:] = object()
+        return _DummyFigure(), axes
+
+    monkeypatch.setattr(plot_module.plt, "subplots", fake_subplots)
+    monkeypatch.setattr(plot_module.plt, "tight_layout", lambda *args, **kwargs: None)
+    monkeypatch.setattr(plot_module.plt, "close", lambda *args, **kwargs: None)
+    monkeypatch.setattr(plot_module, "get_sample_columns", lambda df: ["S1", "S2"])
+    monkeypatch.setattr(plot_module, "_build_ploidy_lookup", lambda df: {("S1", "chr10"): 2, ("S2", "chr10"): 3})
+    monkeypatch.setattr(plot_module, "_sort_samples_by_ploidy", lambda samples, chrom, lookup: list(samples))
+    monkeypatch.setattr(
+        plot_module,
+        "_build_raw_region_df",
+        lambda *args, **kwargs: pd.DataFrame(
+            {
+                "Cluster": ["10q11.2"],
+                "Chr": ["chr10"],
+                "Start": [46005406],
+                "End": [49845537],
+                "S1": [2.1],
+                "S2": [1.9],
+            }
+        ),
+    )
+    monkeypatch.setattr(plot_module, "_rebin_region_df", lambda df, locus: df)
+    monkeypatch.setattr(
+        plot_module,
+        "_draw_overview_column",
+        lambda axes, region_df, locus, calls_df, region_start, region_end, carrier_cols, non_carrier_cols, all_ploidies, ploidy_lookup, sample_cols, carriers, gtf, segdup, **kwargs: draw_calls.append(
+            {
+                "title": kwargs["col_title"],
+                "carrier_cols": carrier_cols,
+                "non_carrier_cols": non_carrier_cols,
+                "all_ploidies": all_ploidies,
+                "sample_cols": sample_cols,
+                "carriers": carriers,
+                "rows": len(axes),
+            }
+        ),
+    )
+    monkeypatch.setattr(plot_module, "_print_timing", lambda label, start: timing_calls.append(label))
+
+    calls_df = pd.DataFrame(
+        {
+            "cluster": ["10q11.2"],
+            "sample": ["S1"],
+            "is_carrier": [True],
+        }
+    )
+    depth_df = pd.DataFrame(
+        {
+            "Cluster": ["10q11.2", "10q11.2"],
+            "Chr": ["chr10", "chr10"],
+            "Start": [46005406, 48181660],
+            "End": [48181660, 49845537],
+            "S1": [2.0, 1.2],
+            "S2": [2.1, 2.0],
+        }
+    )
+
+    plot_locus_overview(
+        locus,
+        calls_df,
+        depth_df,
+        None,
+        None,
+        str(tmp_path),
+        raw_counts_df=pd.DataFrame({"Chr": ["chr1"], "Start": [0], "End": [10], "S1": [10.0], "S2": [12.0]}),
+        raw_sample_medians={"S1": 10.0, "S2": 12.0},
+        lowres_median_bin_size=100000.0,
+    )
+
+    assert [call["title"] for call in draw_calls] == [
+        "Raw normalised — 10q11.2 (chr10:46,005,406-50,651,802)",
+        "Processed — 10q11.2 (chr10:46,005,406-50,651,802)",
+    ]
+    assert draw_calls[0]["carrier_cols"] == ["S1"]
+    assert draw_calls[0]["non_carrier_cols"] == ["S2"]
+    assert draw_calls[0]["all_ploidies"] == [2, 3]
+    assert draw_calls[0]["sample_cols"] == ["S1", "S2"]
+    assert draw_calls[0]["carriers"] == {"S1"}
+    assert draw_calls[0]["rows"] == 6
+    assert saved_paths == [str(tmp_path / "locus_plots" / "10q11.2_overview.png")]
+    assert any(label.endswith("overview total") for label in timing_calls)
+
+
+def test_plot_sample_at_locus_skips_missing_sample_and_saves_carrier_plot(monkeypatch, tmp_path):
+    locus = _make_eval_locus()
+    annotation_titles = []
+    saved_paths = []
+    monkeypatch.setattr(
+        plot_module,
+        "draw_annotations_panel",
+        lambda ax, locus, region_start, region_end, chrom, title, gtf, segdup, **kwargs: annotation_titles.append(title),
+    )
+    monkeypatch.setattr(plot_module.plt, "savefig", lambda path, **kwargs: saved_paths.append(path))
+
+    calls_df = pd.DataFrame(
+        {
+            "cluster": ["10q11.2"],
+            "sample": ["S1"],
+            "start": [46005406],
+            "end": [49845537],
+            "svtype": ["DEL"],
+            "is_carrier": [True],
+            "is_best_match": [True],
+            "matched_haplotype": [1],
+            "hap_cn_state": [1],
+        }
+    )
+    depth_df = pd.DataFrame(
+        {
+            "Cluster": ["10q11.2", "10q11.2"],
+            "Chr": ["chr10", "chr10"],
+            "Start": [46005406, 48181660],
+            "End": [48181660, 49845537],
+            "S1": [2.0, 1.0],
+        }
+    )
+
+    plot_sample_at_locus("missing", locus, calls_df, depth_df, None, None, str(tmp_path))
+    plot_sample_at_locus("S1", locus, calls_df, depth_df, None, None, str(tmp_path))
+
+    assert annotation_titles == ["S1 at 10q11.2 [CARRIER]"]
+    assert saved_paths == [str(tmp_path / "sample_plots" / "10q11.2" / "S1.png")]
+
+
+def test_plot_summary_helpers_cover_empty_and_nonempty_paths(monkeypatch, tmp_path, capsys):
+    saved_paths = []
+    monkeypatch.setattr(plot_module.plt, "savefig", lambda path, **kwargs: saved_paths.append(path))
+
+    empty_calls = pd.DataFrame(
+        columns=["is_carrier", "cluster", "svtype", "sample", "qual_score", "mean_depth"]
+    )
+    plot_carrier_summary(empty_calls, str(tmp_path))
+    plot_confidence_distribution(empty_calls, str(tmp_path))
+    out = capsys.readouterr().out
+    assert "No carriers to plot." in out
+    assert "No calls to plot confidence distribution." in out
+
+    calls_df = pd.DataFrame(
+        {
+            "is_carrier": [True, True, False],
+            "cluster": ["10q11.2", "16p11.2", "10q11.2"],
+            "svtype": ["DEL", "DUP", "DEL"],
+            "sample": ["S1", "S2", "S3"],
+            "qual_score": [25.0, 30.0, 5.0],
+            "mean_depth": [1.0, 3.0, 2.0],
+        }
+    )
+    plot_carrier_summary(calls_df, str(tmp_path))
+    plot_confidence_distribution(calls_df, str(tmp_path))
+
+    assert saved_paths == [
+        str(tmp_path / "carrier_summary.png"),
+        str(tmp_path / "confidence_distribution.png"),
+    ]
+
+
+def test_create_carrier_pdf_handles_empty_and_nonempty_carrier_sets(monkeypatch, tmp_path, capsys):
+    locus = _make_eval_locus()
+    monkeypatch.setattr(plot_module, "PdfPages", _StubPdfPages)
+
+    empty_calls = pd.DataFrame(
+        {
+            "cluster": ["10q11.2"],
+            "sample": ["S1"],
+            "is_carrier": [False],
+            "is_best_match": [False],
+            "qual_score": [5.0],
+        }
+    )
+    create_carrier_pdf(empty_calls, pd.DataFrame(), {"10q11.2": locus}, None, None, str(tmp_path))
+    assert "No confident carrier calls were emitted by the call step." in capsys.readouterr().out
+
+    render_calls = []
+    monkeypatch.setattr(
+        plot_module,
+        "_render_pdf_sample_page",
+        lambda pdf, sample_id, cluster, locus, region_df, cluster_calls_df, confidence_column, *args, **kwargs: render_calls.append(
+            (sample_id, cluster, len(region_df), len(cluster_calls_df), confidence_column, args[4] is not None)
+        ) or True,
+    )
+    monkeypatch.setattr(
+        plot_module,
+        "_build_raw_region_df",
+        lambda *args, **kwargs: pd.DataFrame(
+            {
+                "Cluster": ["10q11.2"],
+                "Chr": ["chr10"],
+                "Start": [46005406],
+                "End": [49845537],
+                "S1": [2.0],
+            }
+        ),
+    )
+    monkeypatch.setattr(plot_module, "_rebin_region_df", lambda df, locus: df)
+
+    calls_df = pd.DataFrame(
+        {
+            "cluster": ["10q11.2"],
+            "sample": ["S1"],
+            "is_carrier": [True],
+            "is_best_match": [True],
+            "qual_score": [25.0],
+            "svtype": ["DEL"],
+        }
+    )
+    depth_df = pd.DataFrame(
+        {
+            "Cluster": ["10q11.2"],
+            "Chr": ["chr10"],
+            "Start": [46005406],
+            "End": [49845537],
+            "S1": [1.1],
+        }
+    )
+    raw_counts_df = pd.DataFrame(
+        {
+            "Chr": ["chr1", "chr2"],
+            "Start": [0, 10],
+            "End": [10, 20],
+            "S1": [10.0, 12.0],
+        }
+    )
+
+    create_carrier_pdf(
+        calls_df,
+        depth_df,
+        {"10q11.2": locus},
+        None,
+        None,
+        str(tmp_path),
+        raw_counts_df=raw_counts_df,
+    )
+
+    assert render_calls == [("S1", "10q11.2", 1, 1, "qual_score", True)]
+
+
+def test_eval_and_anomalous_pdf_wrappers_delegate_to_review_builder(monkeypatch, tmp_path):
+    review_calls = []
+    monkeypatch.setattr(
+        plot_module,
+        "_build_eval_pdf_specs",
+        lambda *args, **kwargs: {
+            "true_positives": [{"sample": "S1"}],
+            "false_positives": [],
+            "false_negatives": [{"sample": "S2"}],
+            "anomalous_discrepancies": [{"sample": "S3"}],
+        },
+    )
+    monkeypatch.setattr(
+        plot_module,
+        "_build_anomalous_pdf_specs",
+        lambda *args, **kwargs: [{"sample": "S9"}],
+    )
+    monkeypatch.setattr(
+        plot_module,
+        "_create_review_category_pdf",
+        lambda category_name, page_specs, pdf_path, *args, **kwargs: review_calls.append((category_name, page_specs, pdf_path)),
+    )
+
+    create_eval_category_pdfs(
+        pd.DataFrame(),
+        pd.DataFrame(),
+        pd.DataFrame(),
+        {},
+        None,
+        None,
+        str(tmp_path),
+    )
+    create_anomalous_pdf(
+        pd.DataFrame(),
+        pd.DataFrame(),
+        {},
+        None,
+        None,
+        str(tmp_path),
+    )
+
+    assert review_calls == [
+        ("true_positives", [{"sample": "S1"}], str(tmp_path / "true_positives.pdf")),
+        ("false_positives", [], str(tmp_path / "false_positives.pdf")),
+        ("false_negatives", [{"sample": "S2"}], str(tmp_path / "false_negatives.pdf")),
+        ("anomalous_discrepancies", [{"sample": "S3"}], str(tmp_path / "anomalous_discrepancies.pdf")),
+        ("anomalous_discrepancies", [{"sample": "S9"}], str(tmp_path / "anomalous_discrepancies.pdf")),
+    ]
+
+
+def test_plot_main_routes_eval_mode_and_highres_validation(monkeypatch, tmp_path, capsys):
+    locus = _make_eval_locus()
+    out_dir = tmp_path / "out"
+    summary_calls = []
+    eval_calls = []
+    carrier_calls = []
+    anomalous_calls = []
+    locus_calls = []
+    monkeypatch.setattr(plot_module, "setup_logging", lambda *args, **kwargs: None)
+    monkeypatch.setattr(plot_module.os.path, "exists", lambda path: False)
+    monkeypatch.setattr(plot_module, "GDTable", lambda path: SimpleNamespace(loci={"10q11.2": locus}))
+    monkeypatch.setattr(plot_module, "plot_carrier_summary", lambda calls_df, output_dir: summary_calls.append(("carrier", len(calls_df), output_dir)))
+    monkeypatch.setattr(plot_module, "plot_confidence_distribution", lambda calls_df, output_dir: summary_calls.append(("confidence", len(calls_df), output_dir)))
+    monkeypatch.setattr(plot_module, "create_eval_category_pdfs", lambda *args, **kwargs: eval_calls.append((args[1], args[2], args[3])))
+    monkeypatch.setattr(plot_module, "create_carrier_pdf", lambda *args, **kwargs: carrier_calls.append(True))
+    monkeypatch.setattr(plot_module, "create_anomalous_pdf", lambda *args, **kwargs: anomalous_calls.append(True))
+    monkeypatch.setattr(plot_module, "plot_locus_overview", lambda *args, **kwargs: locus_calls.append(True))
+
+    def fake_read_csv(path, sep="\t", compression=None):
+        if path == "calls.tsv":
+            raise pd.errors.EmptyDataError("empty")
+        if path == "cn.tsv":
+            return pd.DataFrame(
+                {
+                    "cluster": ["10q11.2"],
+                    "chr": ["chr10"],
+                    "start": [46005406],
+                    "end": [49845537],
+                    "sample": ["S1"],
+                    "depth": [2.0],
+                    "minor_baf_median": [0.4],
+                    "baf_n_sites": [10],
+                }
+            )
+        if path == "ploidy.tsv":
+            return pd.DataFrame({"sample": ["S1"], "contig": ["chr10"], "ploidy": [2]})
+        if path == "eval.tsv":
+            return pd.DataFrame({"GD_ID": ["GD1"], "TP_samples": ["S1"], "FP_samples": [""], "FN_samples": [""]})
+        raise AssertionError(path)
+
+    monkeypatch.setattr(plot_module.pd, "read_csv", fake_read_csv)
+    monkeypatch.setattr(
+        plot_module,
+        "parse_args",
+        lambda: SimpleNamespace(
+            calls="calls.tsv",
+            cn_posteriors="cn.tsv",
+            sample_posteriors=None,
+            gd_table="gd.tsv",
+            ploidy_table="ploidy.tsv",
+            gtf=None,
+            segdup_bed=None,
+            gaps_bed=None,
+            raw_counts=None,
+            high_res_counts=None,
+            output_dir=str(out_dir),
+            padding=50000,
+            plot_all_samples=False,
+            skip_locus_plots=True,
+            sample=None,
+            min_gene_label_spacing=0.05,
+            loci=["10q11.2"],
+            flank_scale=0.2,
+            event_marginals=None,
+            eval_report="eval.tsv",
+        ),
+    )
+
+    plot_main()
+
+    stdout = capsys.readouterr().out
+    assert "Calls file is empty; continuing with a no-calls DataFrame" in stdout
+    assert "Skipping locus overview plots (--skip-locus-plots)" in stdout
+    assert summary_calls == [
+        ("carrier", 0, str(out_dir)),
+        ("confidence", 0, str(out_dir)),
+    ]
+    assert len(eval_calls) == 1
+    assert carrier_calls == []
+    assert anomalous_calls == []
+    assert locus_calls == []
+
+    monkeypatch.setattr(
+        plot_module,
+        "parse_args",
+        lambda: SimpleNamespace(
+            calls="calls.tsv",
+            cn_posteriors="cn.tsv",
+            sample_posteriors=None,
+            gd_table="gd.tsv",
+            ploidy_table=None,
+            gtf=None,
+            segdup_bed=None,
+            gaps_bed=None,
+            raw_counts=None,
+            high_res_counts="hires.tsv.gz",
+            output_dir=str(out_dir),
+            padding=50000,
+            plot_all_samples=False,
+            skip_locus_plots=True,
+            sample=None,
+            min_gene_label_spacing=0.05,
+            loci=None,
+            flank_scale=0.2,
+            event_marginals=None,
+            eval_report=None,
+        ),
+    )
+
+    with pytest.raises(SystemExit) as excinfo:
+        plot_main()
+    assert excinfo.value.code == 1
+
+
+def test_plot_main_routes_carrier_mode_with_sibling_inputs(monkeypatch, tmp_path, capsys):
+    locus = _make_eval_locus()
+    summary_calls = []
+    overview_calls = []
+    sample_calls = []
+    carrier_pdf_calls = []
+    anomalous_pdf_calls = []
+
+    def fake_read_csv(path, sep="\t", compression=None):
+        if path == "calls.tsv":
+            return pd.DataFrame(
+                {
+                    "cluster": ["10q11.2"],
+                    "sample": ["S1"],
+                    "GD_ID": ["GD1"],
+                    "svtype": ["DEL"],
+                    "is_carrier": [True],
+                    "is_best_match": [True],
+                    "is_null_anomalous": [False],
+                    "qual_score": [20.0],
+                    "mean_depth": [1.2],
+                    "start": [46005406],
+                    "end": [49845537],
+                }
+            )
+        if path == "cn.tsv":
+            return pd.DataFrame(
+                {
+                    "cluster": ["10q11.2", "10q11.2", "10q11.2"],
+                    "chr": ["chr10", "chr10", "chr10"],
+                    "start": [46005406, 46005406, 48181660],
+                    "end": [48181660, 48181660, 49845537],
+                    "sample": ["S1", "S1", "S1"],
+                    "depth": [2.0, 2.0, 1.1],
+                    "minor_baf_median": [0.4, 0.4, 0.3],
+                    "baf_n_sites": [10, 10, 12],
+                    "baf_variance": [0.01, 0.01, 0.02],
+                }
+            )
+        if path.endswith("sample_posteriors.tsv.gz"):
+            return pd.DataFrame({"sample": ["S1"], "baf_temperature_map": [2.5]})
+        if path == "raw.tsv":
+            return pd.DataFrame({"#Chr": ["chr1", "chr2"], "Start": [0, 10], "End": [10, 20], "S1": [10.0, 12.0]})
+        if path.endswith("event_marginals.tsv.gz"):
+            return pd.DataFrame(
+                {
+                    "cluster": ["10q11.2", "10q11.2"],
+                    "chrom": ["chr10", "chr10"],
+                    "start": [46005406, 48181660],
+                    "end": [48181660, 49845537],
+                    "sample": ["S1", "S1"],
+                    "qual_del_event": [15.0, 30.0],
+                    "qual_dup_event": [-15.0, -30.0],
+                }
+            )
+        raise AssertionError(path)
+
+    monkeypatch.setattr(plot_module, "setup_logging", lambda *args, **kwargs: None)
+    monkeypatch.setattr(plot_module.pd, "read_csv", fake_read_csv)
+    monkeypatch.setattr(plot_module.os.path, "exists", lambda path: path.endswith("sample_posteriors.tsv.gz") or path.endswith("event_marginals.tsv.gz"))
+    monkeypatch.setattr(plot_module, "GDTable", lambda path: SimpleNamespace(loci={"10q11.2": locus}))
+    monkeypatch.setattr(plot_module, "GTFParser", lambda path: "gtf")
+    monkeypatch.setattr(plot_module, "SegDupAnnotation", lambda path: "segdup")
+    monkeypatch.setattr(plot_module, "GapsAnnotation", lambda path: "gaps")
+    monkeypatch.setattr(plot_module, "plot_carrier_summary", lambda calls_df, output_dir: summary_calls.append(("carrier", len(calls_df), output_dir)))
+    monkeypatch.setattr(plot_module, "plot_confidence_distribution", lambda calls_df, output_dir: summary_calls.append(("confidence", len(calls_df), output_dir)))
+    monkeypatch.setattr(plot_module, "plot_locus_overview", lambda *args, **kwargs: overview_calls.append((args, kwargs)))
+    monkeypatch.setattr(plot_module, "plot_sample_at_locus", lambda *args, **kwargs: sample_calls.append((args, kwargs)))
+    monkeypatch.setattr(plot_module, "create_carrier_pdf", lambda *args, **kwargs: carrier_pdf_calls.append((args, kwargs)))
+    monkeypatch.setattr(plot_module, "create_anomalous_pdf", lambda *args, **kwargs: anomalous_pdf_calls.append((args, kwargs)))
+
+    monkeypatch.setattr(
+        plot_module,
+        "parse_args",
+        lambda: SimpleNamespace(
+            calls="calls.tsv",
+            cn_posteriors="cn.tsv",
+            sample_posteriors=None,
+            gd_table="gd.tsv",
+            ploidy_table=None,
+            gtf="genes.gtf",
+            segdup_bed="segdup.bed",
+            gaps_bed="gaps.bed",
+            raw_counts="raw.tsv",
+            high_res_counts=None,
+            output_dir=str(tmp_path),
+            padding=50000,
+            plot_all_samples=False,
+            skip_locus_plots=False,
+            sample="S1",
+            min_gene_label_spacing=0.05,
+            loci=None,
+            flank_scale=0.2,
+            event_marginals=None,
+            eval_report=None,
+        ),
+    )
+
+    plot_main()
+
+    stdout = capsys.readouterr().out
+    assert "NOTE: dropped 1 duplicate bin-sample rows before pivoting" in stdout
+    assert "Loaded BAF variance scale MAP values for 1 samples" in stdout
+    assert "Loading event marginals" in stdout
+    assert summary_calls == [
+        ("carrier", 1, str(tmp_path)),
+        ("confidence", 1, str(tmp_path)),
+    ]
+    assert len(overview_calls) == 1
+    assert len(sample_calls) == 1
+    assert len(carrier_pdf_calls) == 1
+    assert len(anomalous_pdf_calls) == 1
+    assert carrier_pdf_calls[0][1]["event_values_are_qual"] is True
+    assert carrier_pdf_calls[0][1]["minor_baf_df"] is not None
+    assert carrier_pdf_calls[0][1]["baf_variance_df"] is not None
+    assert carrier_pdf_calls[0][1]["baf_sites_df"] is not None
+    assert carrier_pdf_calls[0][1]["raw_counts_df"] is not None
+    assert carrier_pdf_calls[0][1]["baf_temperature_by_sample"] == {"S1": 2.5}
 
 
 def test_build_eval_pdf_specs_rejects_missing_eval_sample_columns():
@@ -181,21 +1179,6 @@ def test_build_anomalous_pdf_specs_works_without_eval_report_rows():
     )
 
     assert [spec["sample"] for spec in specs] == ["S1"]
-
-
-def test_viterbi_overlay_data_rejects_legacy_schema():
-    paths_df = pd.DataFrame(
-        {
-            "sample": ["S1"],
-            "cluster": ["10q11.2"],
-            "start": [1],
-            "end": [2],
-            "mean_cn": [2.0],
-        }
-    )
-
-    with pytest.raises(ValueError, match="cn_state"):
-        ViterbiOverlayData(paths_df)
 
 
 def test_build_raw_region_df_keeps_lowres_when_processed_counts_do_not_exceed_it():

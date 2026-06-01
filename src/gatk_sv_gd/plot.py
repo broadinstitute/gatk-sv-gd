@@ -99,113 +99,6 @@ def _print_timing(label: str, start_time: float) -> None:
     if PLOT_TIMING_ENABLED:
         print(f"    [timing] plotting stage: {perf_counter() - start_time:.3f}s")
 
-# =============================================================================
-# Viterbi overlay data container
-# =============================================================================
-
-
-def _merge_segments(segments: List[dict]) -> List[dict]:
-    """Merge consecutive segments with the same CN state into single spans.
-
-    Input segments must be sorted by ``start``.  Adjacent segments whose
-    ``cn_state`` values match are fused: the merged segment inherits the
-    earliest ``start`` and latest ``end``.  This guarantees every bin is
-    covered by exactly one output segment with no gaps or overlaps between
-    same-CN-state runs.
-    """
-    if not segments:
-        return []
-    merged: List[dict] = [dict(segments[0])]
-    for seg in segments[1:]:
-        prev = merged[-1]
-        if seg["cn_state"] == prev["cn_state"]:
-            prev["end"] = seg["end"]
-        else:
-            merged.append(dict(seg))
-    return merged
-
-
-class ViterbiOverlayData:
-    """Pre-loaded Viterbi paths produced by the calling step.
-
-    Loads the ``viterbi_paths.tsv.gz`` file written by ``call.py`` so that
-    the exact same path computed during calling is drawn on carrier plots.
-
-    Supports the new per-haplotype format (``haplotype`` column):
-      - haplotype=0: total CN segments
-      - haplotype=1: haplotype 1 segments (diploid only)
-      - haplotype=2: haplotype 2 segments (diploid only)
-    """
-
-    def __init__(self, paths_df: pd.DataFrame):
-        required_columns = {
-            "sample",
-            "cluster",
-            "haplotype",
-            "start",
-            "end",
-            "cn_state",
-            "category",
-        }
-        missing_columns = sorted(required_columns.difference(paths_df.columns))
-        if missing_columns:
-            raise ValueError(
-                "viterbi_paths.tsv.gz is missing required columns: "
-                f"{missing_columns}. Re-run the current call command to "
-                "regenerate viterbi paths with the modern schema."
-            )
-
-        # Index by (sample, cluster, haplotype) for O(1) lookup.
-        # Merge consecutive records with the same category into single
-        # segments so that each bin is covered by exactly one segment with
-        # no gaps or overlaps.
-        self._paths: Dict[Tuple[str, str, int], List[dict]] = {}
-        for (sample, cluster, hap), grp in paths_df.groupby(
-            ["sample", "cluster", "haplotype"]
-        ):
-            rows = grp.sort_values("start")
-            merged = _merge_segments([
-                {
-                    "start": int(row["start"]),
-                    "end": int(row["end"]),
-                    "cn_state": int(row["cn_state"]),
-                    "category": str(row["category"]),
-                }
-                for _, row in rows.iterrows()
-            ])
-            self._paths[(str(sample), str(cluster), int(hap))] = merged
-
-    def get_path(
-        self,
-        sample_id: str,
-        cluster: str,
-        haplotype: int = 0,
-    ) -> Optional[List[dict]]:
-        """Look up the pre-computed Viterbi category segments for one
-        sample/cluster/haplotype.
-
-        Args:
-            sample_id: Sample identifier.
-            cluster: Cluster name.
-            haplotype: 0 for total CN (default), 1 or 2 for per-haplotype.
-
-        Returns a list of segment dicts with keys ``start``, ``end``,
-        ``cn_state`` (int), and ``category`` (DEL/REF/DUP), or *None*
-        if no path was saved for this combination.
-        """
-        return self._paths.get((str(sample_id), str(cluster), haplotype))
-
-    def has_haplotype_paths(
-        self,
-        sample_id: str,
-        cluster: str,
-    ) -> bool:
-        """Return True if per-haplotype paths are available for this sample."""
-        return any(
-            self.get_path(sample_id, cluster, haplotype) is not None
-            for haplotype in (1, 2)
-        )
-
 
 def _get_confidence_column(calls_df: pd.DataFrame) -> str:
     """Return the preferred confidence column present in the calls table."""
@@ -441,7 +334,6 @@ def _create_review_category_pdf(
     flank_scale: float,
     min_gene_label_spacing: float,
     event_values_are_qual: bool,
-    viterbi_data: Optional[ViterbiOverlayData],
     baf_temperature_by_sample: Optional[Dict[str, float]],
 ) -> None:
     """Render one review-category PDF from precomputed page specs."""
@@ -558,7 +450,6 @@ def _create_review_category_pdf(
                     event_del_region_df,
                     event_dup_region_df,
                     gaps,
-                    viterbi_data,
                     baf_temperature_by_sample=baf_temperature_by_sample,
                     event_values_are_qual=event_values_are_qual,
                     target_gd_id=spec.get("gd_id"),
@@ -593,7 +484,6 @@ def _render_pdf_sample_page(
     event_del_region_df: Optional[pd.DataFrame],
     event_dup_region_df: Optional[pd.DataFrame],
     gaps: Optional[GapsAnnotation],
-    viterbi_data: Optional[ViterbiOverlayData],
     baf_temperature_by_sample: Optional[Dict[str, float]] = None,
     event_values_are_qual: bool = False,
     target_gd_id: Optional[str] = None,
@@ -760,38 +650,6 @@ def _render_pdf_sample_page(
         ax.plot(xform(raw_mids), norm_raw, color="darkorange", linewidth=0.6,
                 alpha=0.7, zorder=4, label="Raw depth")
 
-    if viterbi_data is not None:
-        vit_segs = viterbi_data.get_path(sample_id, cluster)
-        _plot_viterbi_trace(
-            ax,
-            vit_segs,
-            xform,
-            color="magenta",
-            label="Viterbi CN",
-            linewidth=2.0,
-            alpha=0.85,
-            zorder=5,
-        )
-
-        if viterbi_data.has_haplotype_paths(sample_id, cluster):
-            hap_styles = [
-                (1, "red", "Hap 1", -0.04),
-                (2, "blue", "Hap 2", 0.04),
-            ]
-            for hap_id, hap_color, hap_label, hap_offset in hap_styles:
-                hap_segs = viterbi_data.get_path(sample_id, cluster, hap_id)
-                _plot_viterbi_trace(
-                    ax,
-                    hap_segs,
-                    xform,
-                    color=hap_color,
-                    label=hap_label,
-                    linewidth=1.6,
-                    alpha=0.8,
-                    zorder=6,
-                    vertical_offset=hap_offset,
-                )
-
     ax.axhline(2.0, color="green", linestyle="-", alpha=0.4, linewidth=1.5,
                label="Reference CN=2", zorder=0)
     ax.axhline(1.0, color="orange", linestyle=":", alpha=0.4, linewidth=1, zorder=0)
@@ -900,102 +758,6 @@ def _apply_carrier_pdf_x_axis_layout(
             labeltop=False,
             labelbottom=False,
         )
-
-
-def _sorted_viterbi_segments(segments: Optional[List[dict]]) -> List[dict]:
-    """Return Viterbi segments sorted left-to-right with stable tie breaks."""
-    if not segments:
-        return []
-    return sorted(
-        segments,
-        key=lambda seg: (
-            int(seg["start"]),
-            int(seg["end"]),
-            int(seg["cn_state"]),
-        ),
-    )
-
-
-def _build_viterbi_trace_coords(
-    segments: Optional[List[dict]],
-    xform,
-    vertical_offset: float = 0.0,
-) -> Tuple[List[float], List[float]]:
-    """Build a monotonic step trace for Viterbi segments.
-
-    Adjacent segments are drawn as clean vertical steps. Any genomic gaps
-    between segments are bridged horizontally using the previous state so the
-    trace stays visually continuous across masked bins.
-    """
-    sorted_segments = _sorted_viterbi_segments(segments)
-    if not sorted_segments:
-        return [], []
-
-    trace_x: List[float] = []
-    trace_y: List[float] = []
-    prev_end: Optional[int] = None
-    prev_cn: Optional[float] = None
-
-    for seg in sorted_segments:
-        seg_start = int(seg["start"])
-        seg_end = int(seg["end"])
-        seg_cn = float(seg["cn_state"]) + vertical_offset
-        start_x = xform(seg_start)
-        end_x = xform(seg_end)
-
-        if not trace_x:
-            trace_x.extend([start_x, end_x])
-            trace_y.extend([seg_cn, seg_cn])
-        else:
-            if prev_end is not None and seg_start > prev_end:
-                trace_x.append(start_x)
-                trace_y.append(prev_cn)
-
-            if prev_cn != seg_cn:
-                trace_x.append(start_x)
-                trace_y.append(seg_cn)
-
-            trace_x.append(end_x)
-            trace_y.append(seg_cn)
-
-        prev_end = seg_end
-        prev_cn = seg_cn
-
-    return trace_x, trace_y
-
-
-def _plot_viterbi_trace(
-    ax,
-    segments: Optional[List[dict]],
-    xform,
-    color: str,
-    label: str,
-    linewidth: float,
-    alpha: float,
-    zorder: int,
-    vertical_offset: float = 0.0,
-    rasterized: bool = False,
-) -> None:
-    """Plot one Viterbi step trace using the shared carrier-plot code path."""
-    trace_x, trace_y = _build_viterbi_trace_coords(
-        segments,
-        xform,
-        vertical_offset=vertical_offset,
-    )
-    if not trace_x:
-        return
-    ax.plot(
-        trace_x,
-        trace_y,
-        color=color,
-        linewidth=linewidth,
-        alpha=alpha,
-        zorder=zorder,
-        label=label,
-        solid_joinstyle="round",
-        solid_capstyle="round",
-        rasterized=rasterized,
-    )
 
 
 # =============================================================================
@@ -2383,7 +2145,6 @@ def create_carrier_pdf(
     flank_scale: float = 0.20,
     lowres_median_bin_size: Optional[float] = None,
     highres_path: Optional[str] = None,
-    viterbi_data: Optional[ViterbiOverlayData] = None,
     baf_temperature_by_sample: Optional[Dict[str, float]] = None,
 ):
     """Create a PDF with plots for confident calls emitted by the call step."""
@@ -2496,7 +2257,6 @@ def create_carrier_pdf(
                     event_del_region_df,
                     event_dup_region_df,
                     gaps,
-                    viterbi_data,
                     baf_temperature_by_sample=baf_temperature_by_sample,
                     event_values_are_qual=event_values_are_qual,
                 )
@@ -2535,7 +2295,6 @@ def create_eval_category_pdfs(
     flank_scale: float = 0.20,
     lowres_median_bin_size: Optional[float] = None,
     highres_path: Optional[str] = None,
-    viterbi_data: Optional[ViterbiOverlayData] = None,
     baf_temperature_by_sample: Optional[Dict[str, float]] = None,
 ):
     """Create eval-category review PDFs when an eval report is provided."""
@@ -2573,7 +2332,6 @@ def create_eval_category_pdfs(
             flank_scale,
             min_gene_label_spacing,
             event_values_are_qual,
-            viterbi_data,
             baf_temperature_by_sample,
         )
 
@@ -2599,7 +2357,6 @@ def create_anomalous_pdf(
     flank_scale: float = 0.20,
     lowres_median_bin_size: Optional[float] = None,
     highres_path: Optional[str] = None,
-    viterbi_data: Optional[ViterbiOverlayData] = None,
     baf_temperature_by_sample: Optional[Dict[str, float]] = None,
 ):
     """Create an anomalous-sample review PDF from flagged call rows."""
@@ -2625,7 +2382,6 @@ def create_anomalous_pdf(
         flank_scale,
         min_gene_label_spacing,
         event_values_are_qual,
-        viterbi_data,
         baf_temperature_by_sample,
     )
 
@@ -2753,13 +2509,6 @@ def parse_args():
              "display width, leaving 60%% for the locus body (when both "
              "flanks are present).  Smaller values compress flanks more.  "
              "Use 0 to hide flanks entirely.",
-    )
-    parser.add_argument(
-        "--viterbi-paths",
-        required=False,
-        help="Viterbi paths file (viterbi_paths.tsv.gz) produced by "
-             "gd_cnv_call.py.  When provided, the Viterbi CN segmentation "
-             "is overlaid on carrier depth plots.",
     )
     parser.add_argument(
         "--event-marginals",
@@ -2981,16 +2730,6 @@ def main():
 
     ploidy_lookup = _build_ploidy_lookup(ploidy_df)
 
-    # Load Viterbi overlay data if paths file provided
-    viterbi_data: Optional[ViterbiOverlayData] = None
-    if args.viterbi_paths:
-        print("\nLoading Viterbi paths")
-        paths_df = pd.read_csv(
-            args.viterbi_paths, sep="\t", compression="infer",
-        )
-        viterbi_data = ViterbiOverlayData(paths_df)
-        print(f"  {len(paths_df)} path records loaded")
-
     event_marginals_df: Optional[pd.DataFrame] = None
     event_del_df: Optional[pd.DataFrame] = None
     event_dup_df: Optional[pd.DataFrame] = None
@@ -3124,7 +2863,6 @@ def main():
             flank_scale=args.flank_scale,
             lowres_median_bin_size=lowres_median_bin_size,
             highres_path=highres_path,
-            viterbi_data=viterbi_data,
             baf_temperature_by_sample=baf_temperature_by_sample,
         )
     else:
@@ -3146,7 +2884,6 @@ def main():
             flank_scale=args.flank_scale,
             lowres_median_bin_size=lowres_median_bin_size,
             highres_path=highres_path,
-            viterbi_data=viterbi_data,
             baf_temperature_by_sample=baf_temperature_by_sample,
         )
         print("\nCreating anomalous PDF...")
@@ -3171,7 +2908,6 @@ def main():
             flank_scale=args.flank_scale,
             lowres_median_bin_size=lowres_median_bin_size,
             highres_path=highres_path,
-            viterbi_data=viterbi_data,
             baf_temperature_by_sample=baf_temperature_by_sample,
         )
 

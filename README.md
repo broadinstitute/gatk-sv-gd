@@ -202,7 +202,6 @@ gatk-sv-gd plot \
   --sample-posteriors inference/sample_posteriors.tsv.gz \
   --gd-table preprocessed/gd_table_filtered.tsv \
   --ploidy-table preprocessed/ploidy_estimates.tsv \
-  --viterbi-paths calls/viterbi_paths.tsv.gz \
   --event-marginals calls/event_marginals.tsv.gz \
   --gtf genes.gtf.gz \
   --segdup-bed segdups.bed.gz \
@@ -443,11 +442,6 @@ body intervals and available flanks pass configurable confidence thresholds:
 --min-flank-non-event-confidence
 ```
 
-The `viterbi` caller smooths per-bin posterior evidence with a user-provided
-transition matrix and compares the resulting segments against the expected
-breakpoint pattern. An optional breakpoint-specific transition matrix can make
-state changes more likely at annotated breakpoint boundaries.
-
 ### Validation and Falsification
 
 The intended validation loop is:
@@ -529,7 +523,6 @@ Routine per-sample, per-bin, and progress-style messages are suppressed.
 | File | Description |
 | --- | --- |
 | `gd_cnv_calls.tsv.gz` | Sample/GD_ID call table with coordinates, event type, breakpoint labels, interval evidence, carrier flag, best-match flag, null anomaly annotations, calling method, and confidence/QUAL scores. |
-| `viterbi_paths.tsv.gz` | Per-sample, per-cluster CN path segments. In posterior-marginal mode this file may be empty but is still written for interface consistency. |
 | `event_marginals.tsv.gz` | Per-bin event marginal probabilities and QUAL scores for deletion and duplication evidence. |
 | `call_log.txt` | Command and calling log. |
 
@@ -601,11 +594,36 @@ The evaluator accepts two truth-table formats:
 
 ## Development
 
+Install development dependencies, including coverage tooling, with:
+
+```bash
+python -m pip install -e '.[dev]'
+```
+
 Run tests from the repository root with the source tree on `PYTHONPATH`:
 
 ```bash
 PYTHONPATH=src pytest
 ```
+
+If you are working in the project virtual environment, the equivalent command
+is:
+
+```bash
+.venv/bin/python -m pytest
+```
+
+Coverage reporting is enabled by default through `pytest-cov`, so either test
+command prints a terminal coverage summary for `gatk_sv_gd` and enforces the
+current minimum coverage threshold.
+
+To generate the HTML coverage report after a test run, use:
+
+```bash
+python -m coverage html
+```
+
+The HTML report is written to `build/coverage-html/index.html`.
 
 With runtime dependencies installed, run CLI smoke tests without installing the
 console script with:

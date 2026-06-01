@@ -21,7 +21,6 @@ from gatk_sv_gd.annotations import FlankCompressor
 from gatk_sv_gd._util import get_logger, setup_logging
 from gatk_sv_gd.models import GDTable
 from gatk_sv_gd.plot import (
-    ViterbiOverlayData,
     _render_pdf_sample_page,
     _select_baf_plot_support_columns,
 )
@@ -56,7 +55,6 @@ _OPTIONAL_ARTIFACTS = (
     ("sample_posteriors", ("infer", "sample_posteriors.tsv.gz")),
     ("bin_posteriors", ("infer", "bin_posteriors.tsv.gz")),
     ("event_marginals", ("call", "event_marginals.tsv.gz")),
-    ("viterbi_paths", ("call", "viterbi_paths.tsv.gz")),
     ("eval_report", ("eval", "truth_evaluation_report.tsv")),
     ("carrier_summary_png", ("plot", "carrier_summary.png")),
     ("confidence_distribution_png", ("plot", "confidence_distribution.png")),
@@ -210,7 +208,6 @@ class PlotRunContext:
     baf_sites_by_cluster: Dict[str, pd.DataFrame]
     event_del_by_cluster: Dict[str, pd.DataFrame]
     event_dup_by_cluster: Dict[str, pd.DataFrame]
-    viterbi_data: Optional[ViterbiOverlayData]
     baf_temperature_by_sample: Dict[str, float]
     unavailable_reason: Optional[str] = None
 
@@ -489,7 +486,6 @@ def _load_plot_run_context(run: RunData) -> PlotRunContext:
             baf_sites_by_cluster={},
             event_del_by_cluster={},
             event_dup_by_cluster={},
-            viterbi_data=None,
             baf_temperature_by_sample={},
             unavailable_reason=reason,
         )
@@ -568,14 +564,6 @@ def _load_plot_run_context(run: RunData) -> PlotRunContext:
                     ).reset_index()
                 )
 
-    viterbi_data = None
-    viterbi_paths_path = run.work_dir / "call" / "viterbi_paths.tsv.gz"
-    if viterbi_paths_path.exists():
-        try:
-            viterbi_data = ViterbiOverlayData(_read_tsv(viterbi_paths_path))
-        except ValueError:
-            viterbi_data = None
-
     try:
         gd_table = GDTable(str(run.work_dir / "preprocess" / "gd_table_filtered.tsv"))
     except Exception as exc:
@@ -589,7 +577,6 @@ def _load_plot_run_context(run: RunData) -> PlotRunContext:
         baf_sites_by_cluster=_group_plot_frames_by_cluster(baf_sites_df),
         event_del_by_cluster=event_del_by_cluster,
         event_dup_by_cluster=event_dup_by_cluster,
-        viterbi_data=viterbi_data,
         baf_temperature_by_sample=baf_temperature_by_sample,
     )
 
@@ -1686,7 +1673,6 @@ def _add_case_plot_page(
         plot_context.event_del_by_cluster.get(cluster),
         plot_context.event_dup_by_cluster.get(cluster),
         None,
-        plot_context.viterbi_data,
         baf_temperature_by_sample=plot_context.baf_temperature_by_sample,
         target_gd_id=str(case.get("GD_ID")),
         title_suffix="Aggregate case report",

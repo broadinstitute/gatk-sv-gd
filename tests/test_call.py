@@ -535,7 +535,6 @@ def test_call_cnvs_requires_ploidy_table():
             bin_mappings_df,
             gd_table,
             ploidy_df=None,
-            calling_mode="posterior-marginal",
         )
 
 
@@ -551,7 +550,6 @@ def test_call_cnvs_rejects_missing_ploidy_pairs():
             bin_mappings_df,
             gd_table,
             ploidy_df=ploidy_df,
-            calling_mode="posterior-marginal",
         )
 
 
@@ -571,7 +569,6 @@ def test_call_cnvs_rejects_posterior_mapping_row_mismatch():
             bin_mappings_df,
             gd_table,
             ploidy_df=ploidy_df,
-            calling_mode="posterior-marginal",
         )
 
 
@@ -583,12 +580,11 @@ def test_call_cnvs_from_posteriors_uses_null_mass_as_neutral_event_evidence():
         {"sample": ["S1"], "contig": ["chr1"], "ploidy": [2]}
     )
 
-    _, _, event_marginals_df = call_cnvs_from_posteriors(
+    _, event_marginals_df = call_cnvs_from_posteriors(
         cn_posteriors_df,
         bin_mappings_df,
         gd_table,
         ploidy_df=ploidy_df,
-        calling_mode="posterior-marginal",
     )
 
     event_row = event_marginals_df.iloc[0]
@@ -642,12 +638,11 @@ def test_call_cnvs_from_posteriors_event_qual_is_pignistic_and_raw_qual_is_infor
         {"sample": ["S1"], "contig": ["chrX"], "ploidy": [1]}
     )
 
-    _, _, event_marginals_df = call_cnvs_from_posteriors(
+    _, event_marginals_df = call_cnvs_from_posteriors(
         cn_posteriors_df,
         bin_mappings_df,
         gd_table,
         ploidy_df=ploidy_df,
-        calling_mode="posterior-marginal",
     )
 
     event_row = event_marginals_df.iloc[0]
@@ -730,12 +725,11 @@ def test_call_cnvs_marks_best_match_without_confident_carrier(monkeypatch):
         _fake_score_call_from_posterior_marginals,
     )
 
-    calls_df, _, _ = call_cnvs_from_posteriors(
+    calls_df, _ = call_cnvs_from_posteriors(
         cn_posteriors_df,
         bin_mappings_df,
         gd_table,
         ploidy_df=ploidy_df,
-        calling_mode="posterior-marginal",
         min_posterior_interval_confidence=60.0,
         min_flank_non_event_confidence=60.0,
     )
