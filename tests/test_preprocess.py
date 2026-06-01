@@ -60,6 +60,46 @@ class _IntervalMask:
         return overlap / lengths
 
 
+def test_region_parsing_helpers_cover_valid_and_invalid_inputs():
+    assert preprocess_module._parse_region("chr1") == ("chr1", None, None)
+    assert preprocess_module._parse_region("chr2:1,000-2,500") == ("chr2", 1000, 2500)
+
+    with pytest.raises(ValueError, match="expected chrom:start-end"):
+        preprocess_module._parse_region("chr1:100")
+
+    with pytest.raises(ValueError, match="Invalid region coordinates"):
+        preprocess_module._parse_region("chr1:start-end")
+
+    assert preprocess_module._is_chr_x(" chrX ") is True
+    assert preprocess_module._is_chr_x("X") is True
+    assert preprocess_module._is_chr_x("chr1") is False
+    assert preprocess_module._is_chr_y(" chrY ") is True
+    assert preprocess_module._is_chr_y("Y") is True
+    assert preprocess_module._is_chr_y("chr2") is False
+    assert preprocess_module._flatten_multi_args([["a", "b"], ["c"], []]) == ["a", "b", "c"]
+
+
+def test_locus_overlaps_regions_matches_whole_chromosome_and_interval_overlap():
+    locus = _FakeLocus()
+
+    assert preprocess_module._locus_overlaps_regions(
+        locus,
+        [("chr1", None, None)],
+    ) is True
+    assert preprocess_module._locus_overlaps_regions(
+        locus,
+        [("chr1", 250, 400)],
+    ) is True
+    assert preprocess_module._locus_overlaps_regions(
+        locus,
+        [("chr1", 300, 400)],
+    ) is False
+    assert preprocess_module._locus_overlaps_regions(
+        locus,
+        [("chr2", 0, 500)],
+    ) is False
+
+
 def _install_collect_highres_stubs(monkeypatch, highres_df):
     filter_max_values = []
     original_filter = preprocess_module._filter_and_prepare_locus_bins

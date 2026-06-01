@@ -7,10 +7,13 @@ import pytest
 
 from gatk_sv_gd.depth import (
     CNVModel,
+    build_diploid_pair_states,
     _center_state_log_likelihood_table_numpy,
     _count_anchored_reference_variance_numpy,
     _depth_variance_scale_numpy,
     _lognormal_location_from_mean,
+    pair_state_minor_baf,
+    pair_state_total_cn,
     _select_state_log_likelihood_torch,
     _spatial_aggregate_variance_scale_numpy,
     _safe_scaled_baf_variance_torch,
@@ -31,6 +34,30 @@ class _FakeTensor:
 
     def numpy(self):
         return self._values
+
+
+def test_diploid_pair_state_helpers_return_canonical_states_and_expected_metrics():
+    pair_states = build_diploid_pair_states(max_hap_cn=2)
+
+    assert pair_states == [
+        (0, 0),
+        (0, 1),
+        (0, 2),
+        (1, 1),
+        (1, 2),
+        (2, 2),
+    ]
+    assert all(h1 <= h2 for h1, h2 in pair_states)
+
+    assert pair_state_minor_baf(pair_states).tolist() == pytest.approx([
+        0.0,
+        0.0,
+        0.0,
+        0.5,
+        1.0 / 3.0,
+        0.5,
+    ])
+    assert pair_state_total_cn(pair_states).tolist() == [0, 1, 2, 2, 3, 4]
 
 
 def test_windowed_relative_elbo_change_uses_two_latest_windows():

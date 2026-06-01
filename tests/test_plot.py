@@ -20,6 +20,7 @@ from gatk_sv_gd.plot import (
     _build_carrier_best_match_mask,
     _build_gd_to_cluster_map,
     _build_raw_region_df,
+    _allocate_segment_bin_targets,
     _coarsen_pdf_page_signals,
     _compute_raw_sample_medians,
     _create_review_category_pdf,
@@ -1337,6 +1338,108 @@ def test_build_raw_region_df_coarsens_highres_before_normalization(monkeypatch):
     assert len(result) == 3
 
 
+def test_build_raw_region_df_returns_none_without_valid_sample_medians():
+    locus = _make_locus()
+    raw_counts_df = pd.DataFrame(
+        {
+            "Chr": ["chr10"],
+            "Start": [46005406],
+            "End": [49845537],
+            "sample_1": [20.0],
+        }
+    )
+
+    result = _build_raw_region_df(
+        locus,
+        46005406,
+        49845537,
+        raw_counts_df,
+        ["sample_1"],
+        {"sample_1": 0.0},
+        100000.0,
+    )
+
+    assert result is None
+
+
+def test_build_raw_region_df_falls_back_to_partial_highres_substitution(monkeypatch):
+    locus = _make_locus()
+    region_start = 45900000
+    region_end = 50700000
+    raw_counts_df = pd.DataFrame(
+        {
+            "Chr": ["chr10"] * 4,
+            "Start": [45900000, 46050000, 48100000, 49900000],
+            "End": [46050000, 48100000, 49900000, 50700000],
+            "sample_1": [20.0, 22.0, 18.0, 24.0],
+        }
+    )
+    processed_region_df = pd.DataFrame(
+        {
+            "Chr": ["chr10"] * 4,
+            "Start": [46005406, 47000000, 48181660, 49845537],
+            "End": [47000000, 48181660, 49845537, 50651802],
+            "sample_1": [2.0, 2.1, 1.9, 2.0],
+        }
+    )
+    observed_queries = []
+
+    def make_highres_df(chrom, starts, ends, values):
+        return pd.DataFrame(
+            {
+                "Chr": [chrom] * len(starts),
+                "Start": starts,
+                "End": ends,
+                "source_file": ["highres"] * len(starts),
+                "sample_1": values,
+            },
+            index=[f"{chrom}:{start}-{end}" for start, end in zip(starts, ends)],
+        )
+
+    def fake_query_highres_bins(highres_path, chrom, start, end, sample_cols, max_bins=None):
+        observed_queries.append((start, end))
+        if (start, end) == (region_start, region_end):
+            return pd.DataFrame(columns=["Chr", "Start", "End", "source_file", "sample_1"])
+        if (start, end) == (region_start, locus.start):
+            return make_highres_df(chrom, [region_start], [locus.start], [10.0])
+        if (start, end) == (locus.start, locus.breakpoints[1][0]):
+            return make_highres_df(chrom, [locus.start, 47000000], [47000000, locus.breakpoints[1][0]], [11.0, 12.0])
+        return pd.DataFrame(columns=["Chr", "Start", "End", "source_file", "sample_1"])
+
+    def fake_normalize_highres_bins(highres_df, sample_cols, column_medians, lowres_median_bin_size):
+        df = highres_df.copy()
+        df["sample_1"] = df["sample_1"] / 10.0
+        return df
+
+    monkeypatch.setattr("gatk_sv_gd.plot.query_highres_bins", fake_query_highres_bins)
+    monkeypatch.setattr("gatk_sv_gd.plot.normalize_highres_bins", fake_normalize_highres_bins)
+
+    result = _build_raw_region_df(
+        locus,
+        region_start,
+        region_end,
+        raw_counts_df,
+        ["sample_1"],
+        {"sample_1": 20.0},
+        1000000.0,
+        processed_region_df=processed_region_df,
+        highres_path="/tmp/highres.tsv.gz",
+    )
+
+    assert observed_queries == [
+        (region_start, region_end),
+        (locus.start, locus.breakpoints[1][0]),
+        (locus.breakpoints[1][0], locus.breakpoints[2][0]),
+        (locus.breakpoints[2][0], locus.end),
+        (region_start, locus.start),
+        (locus.end, region_end),
+    ]
+    assert result is not None
+    assert result["Start"].tolist() == [45900000, 46005406, 47000000, 49900000]
+    assert result["End"].tolist() == [46005406, 47000000, 48181660, 50700000]
+    assert result["sample_1"].tolist() == pytest.approx([1.0, 1.1, 1.2, 2.4])
+
+
 def test_plot_baf_signal_panel_draws_confidence_intervals_for_valid_points():
     locus = _make_locus()
     x_positions = pd.Series([46050000, 48190000, 49800000], dtype=float).to_numpy()
@@ -1461,6 +1564,86 @@ def test_coarsen_pdf_page_signals_aggregates_baf_intervals_with_site_weights():
     assert plot_baf_variance.tolist() == pytest.approx([0.008125, 0.060625])
     assert plot_baf_sites.tolist() == pytest.approx([8.0, 4.0])
     assert plot_event_probs is None
+
+
+def test_coarsen_pdf_page_signals_returns_inputs_when_already_within_budget():
+    locus = _make_locus()
+    region_df = pd.DataFrame(
+        {
+            "Cluster": [locus.cluster] * 2,
+            "Chr": [locus.chrom] * 2,
+            "Start": [46005406, 48181660],
+            "End": [48181660, 49845537],
+        }
+    )
+    sample_depth = np.array([2.0, 1.5], dtype=float)
+    minor_baf = np.array([0.2, 0.3], dtype=float)
+    baf_variance = np.array([0.01, 0.02], dtype=float)
+    baf_sites = np.array([10.0, 12.0], dtype=float)
+    event_probs = np.array([0.7, 0.8], dtype=float)
+
+    result = _coarsen_pdf_page_signals(
+        locus,
+        region_df,
+        sample_depth,
+        minor_baf,
+        baf_variance,
+        baf_sites,
+        event_probs,
+        max_total_bins=3,
+    )
+
+    assert result[0] is region_df
+    assert result[1] is sample_depth
+    assert result[2] is minor_baf
+    assert result[3] is baf_variance
+    assert result[4] is baf_sites
+    assert result[5] is event_probs
+
+
+def test_coarsen_pdf_page_signals_handles_unweighted_grouped_values():
+    locus = GDLocus(
+        cluster="body-only",
+        chrom="chr1",
+        breakpoints=[(100, 100), (200, 200)],
+        breakpoint_names=["A", "B"],
+        gd_entries=[],
+        is_nahr=False,
+        is_terminal=False,
+    )
+    region_df = pd.DataFrame(
+        {
+            "Cluster": [locus.cluster] * 4,
+            "Chr": [locus.chrom] * 4,
+            "Start": [110, 130, 150, 170],
+            "End": [130, 150, 170, 190],
+        }
+    )
+
+    plot_region_df, plot_depth, plot_minor_baf, plot_baf_variance, plot_baf_sites, plot_event_probs = _coarsen_pdf_page_signals(
+        locus,
+        region_df,
+        np.array([2.0, 4.0, 6.0, 8.0], dtype=float),
+        np.array([0.1, np.nan, 0.3, 0.5], dtype=float),
+        np.array([0.04, 0.09, np.nan, 0.16], dtype=float),
+        None,
+        np.array([0.2, 0.4, 0.6, 0.8], dtype=float),
+        max_total_bins=2,
+    )
+
+    assert plot_region_df["Start"].tolist() == [110, 150]
+    assert plot_region_df["End"].tolist() == [150, 190]
+    assert plot_depth.tolist() == pytest.approx([3.0, 7.0])
+    assert plot_minor_baf.tolist() == pytest.approx([0.1, 0.4])
+    assert plot_baf_variance.tolist() == pytest.approx([0.0325, 0.16])
+    assert plot_baf_sites is None
+    assert plot_event_probs.tolist() == pytest.approx([0.3, 0.7])
+
+
+def test_allocate_segment_bin_targets_covers_empty_residual_and_shrink_paths():
+    assert _allocate_segment_bin_targets([0, 0, 0], 5) == [0, 0, 0]
+    assert _allocate_segment_bin_targets([5, 4, 1], 7) == [3, 3, 1]
+    assert _allocate_segment_bin_targets([10, 10, 10], 2) == [1, 1, 1]
 
 
 def test_plot_baf_signal_panel_omits_baf_temperature_title():
@@ -1637,3 +1820,45 @@ def test_rebin_aligned_region_dfs_for_display_caps_total_bins_and_preserves_alig
     assert rebinned_region[["Cluster", "Chr", "Start", "End"]].equals(
         rebinned_event[["Cluster", "Chr", "Start", "End"]]
     )
+
+
+def test_rebin_aligned_region_dfs_for_display_falls_back_for_misaligned_frames(monkeypatch):
+    locus = GDLocus(
+        cluster="1q21",
+        chrom="chr1",
+        breakpoints=[(100, 100), (200, 200), (300, 300), (400, 400)],
+        breakpoint_names=["1", "2", "3", "4"],
+        gd_entries=[],
+        is_nahr=True,
+        is_terminal=False,
+    )
+    region_df = pd.DataFrame(
+        {
+            "Cluster": [locus.cluster] * 6,
+            "Chr": [locus.chrom] * 6,
+            "Start": [50, 90, 120, 220, 320, 420],
+            "End": [90, 120, 220, 320, 420, 520],
+            "sample_1": [1.0, 2.0, 3.0, 4.0, 5.0, 6.0],
+        }
+    )
+    shorter_df = region_df.iloc[:4].copy()
+    shifted_df = region_df.copy()
+    shifted_df.loc[0, "Start"] = 51
+    fallback_calls = []
+
+    monkeypatch.setattr(
+        plot_module,
+        "_rebin_region_df",
+        lambda df, locus, max_bins_per_region=100: fallback_calls.append((len(df), max_bins_per_region)) or df.iloc[[0]].copy(),
+    )
+
+    rebinned_region, rebinned_frames = _rebin_aligned_region_dfs_for_display(
+        locus,
+        region_df,
+        [shorter_df, shifted_df, None],
+        max_total_bins=3,
+    )
+
+    assert len(rebinned_region) == 3
+    assert [None if frame is None else len(frame) for frame in rebinned_frames] == [1, 1, None]
+    assert fallback_calls == [(4, 1), (6, 1)]

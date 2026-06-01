@@ -229,6 +229,145 @@ def test_write_posterior_tables_rejects_incompatible_state_tensor_shape(tmp_path
         )
 
 
+def test_write_posterior_tables_handles_extra_dim_transposes_and_scalar_expansions(tmp_path):
+    combined_data = SimpleNamespace(
+        n_bins=2,
+        n_samples=3,
+        sample_ids=["S1", "S2", "S3"],
+        depth=_TensorStub([[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]]),
+        has_baf=True,
+        has_baf_effective_count=False,
+        baf_median=_TensorStub([[0.40, 0.41, 0.42], [0.30, 0.31, 0.32]]),
+        minor_baf_median=_TensorStub([[0.10, 0.11, 0.12], [0.20, 0.21, 0.22]]),
+        baf_variance=_TensorStub([[0.01, 0.02, 0.03], [0.04, 0.05, 0.06]]),
+        baf_n_sites=_TensorStub([[5, 6, 7], [8, 9, 10]]),
+    )
+    mappings = [
+        _make_mapping("A-B", 0, 110, 200),
+        _make_mapping("B-C", 1, 210, 300),
+    ]
+    map_estimates = {
+        "cn": np.array([[0, 1, 0], [1, 0, 1]]),
+        "pair_state": np.array([[0, 1], [1, 0], [0, 1]]),
+        "sample_var": np.array([0.1, 0.2, 0.3]),
+        "baf_temperature": np.array([2.5]),
+        "length_scale_var": np.array([300.0]),
+        "bin_bias": np.array([1.1, 0.9]),
+        "bin_var": np.array([0.01, 0.02]),
+        "cn_probs": np.array([0.6, 0.4]),
+        "pair_state_probs": np.array([[0.7, 0.3], [0.4, 0.6]]),
+        "null_state_prior": 0.05,
+    }
+    cn_posterior = {
+        "cn_posterior": np.array([[0.9, 0.8, 0.7], [0.1, 0.2, 0.3]]),
+        "pair_state_posterior": np.array(
+            [[
+                [[0.95, 0.85, 0.75], [0.05, 0.15, 0.25]],
+                [[0.30, 0.20, 0.10], [0.70, 0.80, 0.90]],
+            ]]
+        ),
+        "pair_state_labels": [(0, 0), (1, 1)],
+    }
+
+    write_posterior_tables(
+        combined_data,
+        map_estimates,
+        cn_posterior,
+        mappings,
+        str(tmp_path),
+    )
+
+    cn_df = pd.read_csv(tmp_path / "cn_posteriors.tsv.gz", sep="\t")
+    sample_df = pd.read_csv(tmp_path / "sample_posteriors.tsv.gz", sep="\t")
+    bin_df = pd.read_csv(tmp_path / "bin_posteriors.tsv.gz", sep="\t")
+
+    first_row = cn_df[(cn_df["start"] == 110) & (cn_df["sample"] == "S1")].iloc[0]
+    second_row = cn_df[(cn_df["start"] == 210) & (cn_df["sample"] == "S3")].iloc[0]
+    assert first_row["prob_cn_0"] == pytest.approx(0.9)
+    assert second_row["prob_cn_0"] == pytest.approx(0.3)
+    assert first_row["prob_null"] == pytest.approx(0.0)
+    assert second_row["pair_state_map"] == 1
+    assert first_row["prob_pair_0_0"] == pytest.approx(0.95)
+    assert second_row["prob_pair_1_1"] == pytest.approx(0.90)
+    assert "baf_effective_variance" not in cn_df.columns
+    assert "baf_effective_n_sites" not in cn_df.columns
+
+    assert sample_df["baf_temperature_map"].tolist() == pytest.approx([2.5, 2.5, 2.5])
+    assert sample_df["length_scale_var_map"].tolist() == pytest.approx([300.0, 300.0, 300.0])
+
+    assert bin_df["cn_prior_0"].tolist() == pytest.approx([0.6, 0.4])
+    assert bin_df["pair_prior_0_0"].tolist() == pytest.approx([0.7, 0.4])
+    assert bin_df["pair_prior_1_1"].tolist() == pytest.approx([0.3, 0.6])
+    assert bin_df["null_prior"].tolist() == pytest.approx([0.05, 0.05])
+
+
+@pytest.mark.parametrize(
+    ("map_estimates", "cn_posterior", "message"),
+    [
+        (
+            {
+                "cn": np.array([0, 1]),
+                "sample_var": np.array([0.1, 0.2]),
+                "bin_bias": np.array([1.0, 1.0]),
+                "bin_var": np.array([0.0, 0.0]),
+                "cn_probs": np.array([[0.5, 0.5], [0.5, 0.5]]),
+            },
+            {"cn_posterior": np.array([[[0.6], [0.4]], [[0.3], [0.7]]])},
+            "Expected 2D bin/sample matrix",
+        ),
+        (
+            {
+                "cn": np.array([[0, 1], [1, 0]]),
+                "sample_var": np.array([0.1, 0.2]),
+                "bin_bias": np.array([1.0, 1.0]),
+                "bin_var": np.array([0.0, 0.0]),
+                "cn_probs": np.array([[[0.5, 0.5], [0.5, 0.5]], [[0.4, 0.6], [0.6, 0.4]]]),
+            },
+            {"cn_posterior": np.array([[[0.6], [0.4]], [[0.3], [0.7]]])},
+            "Expected 2D bin/state matrix",
+        ),
+        (
+            {
+                "cn": np.array([[0, 1], [1, 0]]),
+                "sample_var": np.array([0.1, 0.2]),
+                "bin_bias": np.array([1.0, 1.0]),
+                "bin_var": np.array([0.0, 0.0]),
+                "cn_probs": np.array([[0.5], [0.5]]),
+            },
+            {"cn_posterior": np.array([[[[0.5, 0.5], [0.5, 0.5]], [[0.4, 0.6], [0.6, 0.4]]], [[[0.5, 0.5], [0.5, 0.5]], [[0.4, 0.6], [0.6, 0.4]]]])},
+            "Expected 3D state tensor",
+        ),
+    ],
+)
+def test_write_posterior_tables_rejects_incompatible_matrix_shapes(
+    tmp_path,
+    map_estimates,
+    cn_posterior,
+    message,
+):
+    combined_data = SimpleNamespace(
+        n_bins=2,
+        n_samples=2,
+        sample_ids=["S1", "S2"],
+        depth=_TensorStub([[1.0, 2.0], [3.0, 4.0]]),
+        has_baf=False,
+        has_baf_effective_count=False,
+    )
+    mappings = [
+        _make_mapping("A-B", 0, 110, 200),
+        _make_mapping("B-C", 1, 210, 300),
+    ]
+
+    with pytest.raises(ValueError, match=message):
+        write_posterior_tables(
+            combined_data,
+            map_estimates,
+            cn_posterior,
+            mappings,
+            str(tmp_path),
+        )
+
+
 def test_write_locus_metadata_and_estimate_ploidy_round_trip(tmp_path):
     locus = _make_locus()
     mappings = [
