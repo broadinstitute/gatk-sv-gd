@@ -39,6 +39,7 @@ from gatk_sv_gd.plot import (
     _plot_event_marginal_panel,
     _rebin_aligned_region_dfs_for_display,
     _render_pdf_sample_page,
+    _rebin_region_df,
     _select_baf_plot_support_columns,
     _sanitize_plot_label,
     estimate_lowres_bin_size,
@@ -66,6 +67,14 @@ class _StubPdfPages:
         self.saved_figures.append(fig)
 
 
+class _RecordingAxis:
+    def __init__(self):
+        self.calls = []
+
+    def bar(self, *args, **kwargs):
+        self.calls.append((args, kwargs))
+
+
 def _make_locus() -> GDLocus:
     return GDLocus(
         cluster="10q11.2",
@@ -76,6 +85,78 @@ def _make_locus() -> GDLocus:
         is_nahr=True,
         is_terminal=False,
     )
+
+
+@pytest.mark.parametrize(
+    ("minor_baf_values", "baf_site_counts"),
+    [
+        (None, None),
+        ([np.nan, 0.2], [1, 0]),
+    ],
+)
+def test_plot_depth_bars_with_baf_falls_back_to_single_depth_series(
+    minor_baf_values,
+    baf_site_counts,
+):
+    ax = _RecordingAxis()
+
+    _plot_depth_bars_with_baf(
+        ax,
+        np.array([10.0, 20.0]),
+        np.array([4.0, 6.0]),
+        np.array([2.0, 3.0]),
+        minor_baf_values=minor_baf_values,
+        baf_site_counts=baf_site_counts,
+        zorder=7,
+        rasterized=True,
+    )
+
+    assert len(ax.calls) == 1
+    args, kwargs = ax.calls[0]
+    assert np.array_equal(args[0], np.array([10.0, 20.0]))
+    assert np.array_equal(args[1], np.array([2.0, 3.0]))
+    assert np.array_equal(kwargs["width"], np.array([3.6, 5.4]))
+    assert kwargs["color"] == "steelblue"
+    assert kwargs["label"] == "Normalized depth"
+    assert kwargs["zorder"] == 7
+    assert kwargs["rasterized"] is True
+
+
+def test_plot_depth_bars_with_baf_splits_valid_bins_and_keeps_invalid_depth_gray():
+    ax = _RecordingAxis()
+
+    _plot_depth_bars_with_baf(
+        ax,
+        np.array([10.0, 20.0, 30.0]),
+        np.array([10.0, 10.0, 10.0]),
+        np.array([4.0, 6.0, 8.0]),
+        minor_baf_values=np.array([0.25, 0.8, np.nan]),
+        baf_site_counts=np.array([5, 2, 0]),
+    )
+
+    assert len(ax.calls) == 3
+
+    invalid_args, invalid_kwargs = ax.calls[0]
+    assert np.array_equal(invalid_args[0], np.array([30.0]))
+    assert np.array_equal(invalid_args[1], np.array([8.0]))
+    assert np.array_equal(invalid_kwargs["width"], np.array([9.0]))
+    assert invalid_kwargs["color"] == "gray"
+    assert invalid_kwargs["label"] == "Depth (no BAF)"
+
+    minor_args, minor_kwargs = ax.calls[1]
+    assert np.array_equal(minor_args[0], np.array([10.0, 20.0]))
+    assert np.allclose(minor_args[1], np.array([1.0, 3.0]))
+    assert np.array_equal(minor_kwargs["width"], np.array([9.0, 9.0]))
+    assert minor_kwargs["color"] == "#F4A261"
+    assert minor_kwargs["label"] == "Minor-allele depth"
+
+    major_args, major_kwargs = ax.calls[2]
+    assert np.array_equal(major_args[0], np.array([10.0, 20.0]))
+    assert np.allclose(major_args[1], np.array([3.0, 3.0]))
+    assert np.allclose(major_kwargs["bottom"], np.array([1.0, 3.0]))
+    assert np.array_equal(major_kwargs["width"], np.array([9.0, 9.0]))
+    assert major_kwargs["color"] == "#4C78A8"
+    assert major_kwargs["label"] == "Major-allele depth"
 
 
 def _make_eval_locus() -> GDLocus:
@@ -1528,6 +1609,63 @@ def test_plot_baf_signal_panel_uses_fixed_minor_baf_reference_lines():
         plt.close(fig)
 
 
+def test_plot_baf_signal_panel_reports_missing_baf_signal_when_inputs_absent():
+    locus = _make_locus()
+    x_positions = pd.Series([46050000, 48190000], dtype=float).to_numpy()
+    bar_widths = pd.Series([0.001, 0.001], dtype=float).to_numpy()
+    xform = FlankCompressor(46005406, 49845537, locus.start, locus.end, flank_scale=0.2)
+
+    fig, ax = plt.subplots()
+    try:
+        _plot_baf_signal_panel(
+            ax,
+            x_positions,
+            bar_widths,
+            None,
+            None,
+            xform,
+            locus,
+            locus.chrom,
+        )
+
+        assert [text.get_text() for text in ax.texts] == ["No BAF signal available"]
+        assert ax.get_xlabel() == f"Position on {locus.chrom}"
+        assert ax.get_ylabel() == "Minor BAF"
+        assert len(ax.patches) == 0
+    finally:
+        plt.close(fig)
+
+
+def test_plot_baf_signal_panel_reports_no_supported_bins_when_all_values_invalid():
+    locus = _make_locus()
+    x_positions = pd.Series([46050000, 48190000], dtype=float).to_numpy()
+    bar_widths = pd.Series([0.001, 0.001], dtype=float).to_numpy()
+    minor_baf_values = pd.Series([np.nan, 0.4], dtype=float).to_numpy()
+    baf_site_counts = pd.Series([1, 0], dtype=int).to_numpy()
+    xform = FlankCompressor(46005406, 49845537, locus.start, locus.end, flank_scale=0.2)
+
+    fig, ax = plt.subplots()
+    try:
+        _plot_baf_signal_panel(
+            ax,
+            x_positions,
+            bar_widths,
+            minor_baf_values,
+            baf_site_counts,
+            xform,
+            locus,
+            locus.chrom,
+            show_xlabel=False,
+        )
+
+        assert [text.get_text() for text in ax.texts] == ["No BAF-supported bins"]
+        assert ax.get_xlabel() == ""
+        assert ax.get_ylabel() == "Minor BAF"
+        assert len(ax.patches) == 0
+    finally:
+        plt.close(fig)
+
+
 def test_coarsen_pdf_page_signals_aggregates_baf_intervals_with_site_weights():
     locus = GDLocus(
         cluster="left-flank-only",
@@ -1638,6 +1776,45 @@ def test_coarsen_pdf_page_signals_handles_unweighted_grouped_values():
     assert plot_baf_variance.tolist() == pytest.approx([0.0325, 0.16])
     assert plot_baf_sites is None
     assert plot_event_probs.tolist() == pytest.approx([0.3, 0.7])
+
+
+def test_coarsen_pdf_page_signals_emits_nan_baf_summaries_when_group_sites_are_invalid():
+    locus = GDLocus(
+        cluster="body-only",
+        chrom="chr1",
+        breakpoints=[(100, 100), (200, 200)],
+        breakpoint_names=["A", "B"],
+        gd_entries=[],
+        is_nahr=False,
+        is_terminal=False,
+    )
+    region_df = pd.DataFrame(
+        {
+            "Cluster": [locus.cluster] * 4,
+            "Chr": [locus.chrom] * 4,
+            "Start": [110, 130, 150, 170],
+            "End": [130, 150, 170, 190],
+        }
+    )
+
+    plot_region_df, plot_depth, plot_minor_baf, plot_baf_variance, plot_baf_sites, plot_event_probs = _coarsen_pdf_page_signals(
+        locus,
+        region_df,
+        np.array([2.0, 4.0, 6.0, 8.0], dtype=float),
+        np.array([0.1, 0.2, 0.3, 0.4], dtype=float),
+        np.array([0.04, 0.09, 0.16, 0.25], dtype=float),
+        np.array([0.0, np.nan, 0.0, np.nan], dtype=float),
+        np.array([np.nan, 0.2, 0.4, np.nan], dtype=float),
+        max_total_bins=2,
+    )
+
+    assert plot_region_df["Start"].tolist() == [110, 150]
+    assert plot_region_df["End"].tolist() == [150, 190]
+    assert plot_depth.tolist() == pytest.approx([3.0, 7.0])
+    assert np.isnan(plot_minor_baf).tolist() == [True, True]
+    assert np.isnan(plot_baf_variance).tolist() == [True, True]
+    assert plot_baf_sites.tolist() == pytest.approx([0.0, 0.0])
+    assert plot_event_probs.tolist() == pytest.approx([0.2, 0.4])
 
 
 def test_allocate_segment_bin_targets_covers_empty_residual_and_shrink_paths():
@@ -1862,3 +2039,45 @@ def test_rebin_aligned_region_dfs_for_display_falls_back_for_misaligned_frames(m
     assert len(rebinned_region) == 3
     assert [None if frame is None else len(frame) for frame in rebinned_frames] == [1, 1, None]
     assert fallback_calls == [(4, 1), (6, 1)]
+
+
+def test_rebin_region_df_returns_none_or_empty_input_unchanged():
+    empty_df = pd.DataFrame(columns=["Chr", "Start", "End", "sample_1"])
+    locus = GDLocus(
+        cluster="1q21",
+        chrom="chr1",
+        breakpoints=[(100, 100), (150, 150), (200, 200), (250, 250)],
+        breakpoint_names=["1", "2", "3", "4"],
+        gd_entries=[],
+        is_nahr=True,
+        is_terminal=False,
+    )
+
+    assert _rebin_region_df(None, locus) is None
+    assert _rebin_region_df(empty_df, locus).equals(empty_df)
+
+
+def test_rebin_region_df_rebins_left_body_and_right_segments_independently():
+    locus = GDLocus(
+        cluster="1q21",
+        chrom="chr1",
+        breakpoints=[(100, 100), (150, 150), (200, 200), (250, 250)],
+        breakpoint_names=["1", "2", "3", "4"],
+        gd_entries=[],
+        is_nahr=True,
+        is_terminal=False,
+    )
+    df = pd.DataFrame(
+        {
+            "Chr": ["chr1"] * 9,
+            "Start": [0, 10, 20, 110, 120, 130, 260, 270, 280],
+            "End": [10, 20, 30, 120, 130, 140, 270, 280, 290],
+            "sample_1": [1.0, 2.0, 3.0, 10.0, 20.0, 30.0, 4.0, 5.0, 6.0],
+        }
+    )
+
+    rebinned = _rebin_region_df(df, locus, max_bins_per_region=2)
+
+    assert rebinned["Start"].tolist() == [0, 20, 110, 130, 260, 280]
+    assert rebinned["End"].tolist() == [20, 30, 130, 140, 280, 290]
+    assert rebinned["sample_1"].tolist() == pytest.approx([1.5, 3.0, 15.0, 30.0, 4.5, 6.0])

@@ -1,10 +1,15 @@
 import pandas as pd
 import numpy as np
+import pytest
 
 from gatk_sv_gd.bins import compute_flank_regions_from_bins
 from gatk_sv_gd.bins import filter_low_quality_bins
 from gatk_sv_gd.bins import get_flank_filter_params
 from gatk_sv_gd.bins import rebin_locus_intervals
+from gatk_sv_gd.bins import _allocate_bins_across_segments
+from gatk_sv_gd.bins import _compute_quality_stats_single_chrom
+from gatk_sv_gd.bins import _ploidy_adjust_depths_single_chrom
+from gatk_sv_gd.bins import _split_region_into_supported_segments
 from gatk_sv_gd.models import GDLocus
 
 
@@ -156,3 +161,89 @@ def test_get_flank_filter_params_preserves_stricter_inputs():
     base = {"median_min": 1.8, "median_max": 2.2, "mad_max": 0.1}
 
     assert get_flank_filter_params(base, "chr1") == base
+
+
+def test_split_region_into_supported_segments_clamps_and_preserves_internal_gaps():
+    region_df = pd.DataFrame(
+        {
+            "Chr": ["chr1"] * 5,
+            "Start": [90, 100, 140, 170, 220],
+            "End": [100, 120, 160, 200, 240],
+            "sample_1": [1.0, 2.0, 3.0, 4.0, 5.0],
+        }
+    )
+
+    segments = _split_region_into_supported_segments(
+        region_df,
+        clamp_start=95,
+        clamp_end=210,
+    )
+
+    assert [(start, end, len(segment_df)) for segment_df, start, end in segments] == [
+        (95, 120, 2),
+        (140, 160, 1),
+        (170, 200, 1),
+    ]
+    assert segments[0][0]["Start"].tolist() == [90, 100]
+    assert segments[1][0]["Start"].tolist() == [140]
+    assert segments[2][0]["Start"].tolist() == [170]
+
+
+def test_allocate_bins_across_segments_preserves_each_fragment_and_favors_larger_ones():
+    segments = [
+        (pd.DataFrame({"Start": [0], "End": [10]}), 0, 10),
+        (pd.DataFrame({"Start": [20, 30, 40], "End": [30, 40, 50]}), 20, 50),
+        (pd.DataFrame({"Start": [60, 70], "End": [70, 80]}), 60, 80),
+    ]
+
+    assert _allocate_bins_across_segments([], max_bins_per_interval=3) == []
+    assert _allocate_bins_across_segments(segments, max_bins_per_interval=2) == [1, 1, 1]
+    assert _allocate_bins_across_segments(segments, max_bins_per_interval=5) == [1, 2, 2]
+
+
+def test_ploidy_adjust_depths_single_chrom_scales_non_diploid_samples_only():
+    depths = np.array(
+        [
+            [1.0, 2.0, 3.0],
+            [4.0, 5.0, 6.0],
+        ]
+    )
+    adjusted = _ploidy_adjust_depths_single_chrom(
+        depths,
+        "chrX",
+        ["s1", "s2", "s3"],
+        {("s1", "chrX"): 1, ("s2", "chrX"): 0, ("s3", "chrX"): 2},
+    )
+
+    assert np.allclose(adjusted, np.array([[2.0, 2.0, 3.0], [8.0, 5.0, 6.0]]))
+    assert np.allclose(depths, np.array([[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]]))
+
+
+def test_compute_quality_stats_single_chrom_excludes_ploidy_zero_samples_and_marks_empty_rows():
+    depths = np.array(
+        [
+            [1.0, 10.0, 3.0],
+            [2.0, 20.0, 4.0],
+        ]
+    )
+    medians, mads, informative_counts = _compute_quality_stats_single_chrom(
+        depths,
+        "chrX",
+        ["s1", "s2", "s3"],
+        {("s1", "chrX"): 1, ("s2", "chrX"): 0, ("s3", "chrX"): 2},
+    )
+
+    assert medians.tolist() == pytest.approx([2.5, 4.0])
+    assert mads.tolist() == pytest.approx([0.5, 0.0])
+    assert informative_counts.tolist() == [2, 2]
+
+    empty_medians, empty_mads, empty_counts = _compute_quality_stats_single_chrom(
+        np.array([[1.0, 2.0]], dtype=float),
+        "chrY",
+        ["s1", "s2"],
+        {("s1", "chrY"): 0, ("s2", "chrY"): 0},
+    )
+
+    assert np.isnan(empty_medians).tolist() == [True]
+    assert np.isnan(empty_mads).tolist() == [True]
+    assert empty_counts.tolist() == [0]

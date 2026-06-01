@@ -9,17 +9,209 @@ from gatk_sv_gd._util import (
     posterior_probability_to_qual,
 )
 from gatk_sv_gd.call import (
+    _effective_independent_bin_count,
+    _aggregate_interval_qual,
     _get_mean_null_probability_for_call,
     _build_posterior_entry_spec,
     _compute_flank_confidence_stats,
     _compute_interval_confidence_lookup,
+    build_event_pair_mask,
+    build_flank_non_event_pair_mask,
     call_cnvs_from_posteriors,
     compute_informative_event_support_probabilities,
     compute_event_marginal_probabilities,
+    determine_best_breakpoints,
+    determine_posterior_carrier_breakpoints,
+    get_call_confidence,
+    get_locus_interval_bins,
+    get_pair_state_columns,
     parse_args,
     score_call_from_posterior_marginals,
 )
 from gatk_sv_gd.models import GDLocus
+
+
+def test_effective_independent_bin_count_handles_edges_and_validation():
+    assert _effective_independent_bin_count(0, 0.5) == 0.0
+    assert _effective_independent_bin_count(1, 0.75) == 1.0
+    assert _effective_independent_bin_count(5, 0.0) == 5.0
+    assert _effective_independent_bin_count(5, 1.0) == 1.0
+    assert _effective_independent_bin_count(4, 0.5) == pytest.approx(4.0 / 2.5)
+
+    with pytest.raises(ValueError, match="n_bins must be non-negative"):
+        _effective_independent_bin_count(-1, 0.5)
+
+    with pytest.raises(ValueError, match="neighbor_bin_correlation"):
+        _effective_independent_bin_count(3, 1.1)
+
+
+def test_pair_state_event_and_flank_masks_follow_svtype_and_ploidy():
+    pair_states = [(0, 0), (0, 1), (1, 1), (1, 2), (2, 2)]
+
+    assert build_event_pair_mask(pair_states, "DEL", sample_ploidy=2).tolist() == [True, True, False, False, False]
+    assert build_event_pair_mask(pair_states, "DUP", sample_ploidy=2).tolist() == [False, False, False, True, True]
+    assert build_flank_non_event_pair_mask(pair_states, "DEL", sample_ploidy=2).tolist() == [False, False, True, True, True]
+    assert build_flank_non_event_pair_mask(pair_states, "DUP", sample_ploidy=2).tolist() == [True, True, True, False, False]
+
+    with pytest.raises(ValueError, match="Unsupported svtype"):
+        build_event_pair_mask(pair_states, "CNV", sample_ploidy=2)
+
+    with pytest.raises(ValueError, match="Unsupported svtype"):
+        build_flank_non_event_pair_mask(pair_states, "CNV", sample_ploidy=2)
+
+
+def test_call_helpers_aggregate_interval_quals_and_prefer_confidence_scores():
+    assert _aggregate_interval_qual(np.array([], dtype=float), 0.5) == 0.0
+    assert _aggregate_interval_qual(np.array([10.0, 20.0], dtype=float), 0.5) == pytest.approx(20.0)
+
+    bin_mappings_df = pd.DataFrame(
+        {
+            "cluster": ["c1", "c1", "c2"],
+            "interval": ["left_flank", "body", "body"],
+            "array_idx": [0, 1, 2],
+        }
+    )
+    assert get_locus_interval_bins(bin_mappings_df, "c1") == {
+        "body": [1],
+        "left_flank": [0],
+    }
+
+    assert get_call_confidence({"confidence_score": 12.0, "log_prob_score": 5.0}) == 12.0
+    assert get_call_confidence({"confidence_score": np.nan, "log_prob_score": 5.0}) == 5.0
+    assert np.isnan(get_call_confidence({"confidence_score": np.nan, "log_prob_score": np.nan}))
+
+
+def test_call_helpers_select_best_and_confident_breakpoints():
+    calls = [
+        {"svtype": "DEL", "GD_ID": "del_low", "confidence_score": 8.0, "matched_interval_bp": 1, "start": 100, "end": 150, "is_carrier": True},
+        {"svtype": "DEL", "GD_ID": "del_best", "confidence_score": 12.0, "matched_interval_bp": 1, "start": 100, "end": 200, "is_carrier": True},
+        {"svtype": "DEL", "GD_ID": "del_noncarrier", "confidence_score": 20.0, "matched_interval_bp": 5, "start": 100, "end": 300, "is_carrier": False},
+        {"svtype": "DUP", "GD_ID": "dup_best", "log_prob_score": 6.0, "matched_interval_bp": 2, "start": 300, "end": 500, "is_carrier": True},
+    ]
+
+    assert determine_best_breakpoints(calls, carrier_only=True) == {
+        "DEL": "del_best",
+        "DUP": "dup_best",
+    }
+    assert determine_best_breakpoints(calls, carrier_only=False) == {
+        "DEL": "del_noncarrier",
+        "DUP": "dup_best",
+    }
+
+    posterior_calls = [
+        {
+            "svtype": "DEL",
+            "GD_ID": "del_pass_small",
+            "interval_confidences": [12.0, 11.0],
+            "left_flank_non_event_median": 15.0,
+            "right_flank_non_event_median": 15.0,
+            "matched_interval_bp": 1,
+            "start": 100,
+            "end": 200,
+            "n_bins": 2,
+            "confidence_score": 12.0,
+        },
+        {
+            "svtype": "DEL",
+            "GD_ID": "del_fail_flank",
+            "interval_confidences": [20.0],
+            "left_flank_non_event_median": 5.0,
+            "right_flank_non_event_median": 20.0,
+            "matched_interval_bp": 10,
+            "start": 100,
+            "end": 400,
+            "n_bins": 10,
+            "confidence_score": 20.0,
+        },
+        {
+            "svtype": "DUP",
+            "GD_ID": "dup_pass_large",
+            "interval_confidences": [15.0],
+            "left_flank_non_event_median": np.nan,
+            "right_flank_non_event_median": 15.0,
+            "matched_interval_bp": 2,
+            "start": 300,
+            "end": 700,
+            "n_bins": 4,
+            "confidence_score": 15.0,
+        },
+    ]
+
+    assert determine_posterior_carrier_breakpoints(
+        posterior_calls,
+        min_interval_confidence=10.0,
+        min_flank_non_event_confidence=10.0,
+    ) == {
+        "DEL": "del_pass_small",
+        "DUP": "dup_pass_large",
+    }
+
+
+def test_get_pair_state_columns_canonicalizes_and_rejects_invalid_labels():
+    cn_posteriors_df = pd.DataFrame(
+        columns=["cluster", "prob_pair_2_0", "prob_pair_1_1", "prob_pair_1_2"]
+    )
+    pair_cols, canonical_labels = get_pair_state_columns(cn_posteriors_df)
+    assert pair_cols == ["prob_pair_2_0", "prob_pair_1_1", "prob_pair_1_2"]
+    assert canonical_labels == [(0, 2), (1, 1), (1, 2)]
+
+    with pytest.raises(ValueError, match="missing pair-state posterior columns"):
+        get_pair_state_columns(pd.DataFrame(columns=["cluster"]))
+
+    with pytest.raises(ValueError, match="Unrecognized pair-state column name"):
+        get_pair_state_columns(pd.DataFrame(columns=["prob_pair_bad"]))
+
+    with pytest.raises(ValueError, match="Duplicate canonical pair-state labels"):
+        get_pair_state_columns(pd.DataFrame(columns=["prob_pair_0_2", "prob_pair_2_0"]))
+
+
+def test_compute_event_marginal_probabilities_accepts_scalar_null_mass_and_validates_shape():
+    pair_states = [(0, 1), (1, 1), (1, 2)]
+    pair_prob_matrix = np.array(
+        [
+            [0.6, 0.3, 0.1],
+            [0.1, 0.7, 0.2],
+        ],
+        dtype=float,
+    )
+
+    observed = compute_event_marginal_probabilities(
+        pair_prob_matrix,
+        pair_states,
+        sample_ploidy=2,
+        null_probability=2.0,
+    )
+
+    assert observed["DEL"].tolist() == pytest.approx([1.0, 0.6])
+    assert observed["DUP"].tolist() == pytest.approx([0.6, 0.7])
+
+    with pytest.raises(ValueError, match="null_probability must have shape"):
+        compute_event_marginal_probabilities(
+            pair_prob_matrix,
+            pair_states,
+            sample_ploidy=2,
+            null_probability=np.array([0.1, 0.2, 0.3], dtype=float),
+        )
+
+
+def test_compute_informative_event_support_probabilities_defaults_to_neutral_without_mass():
+    pair_states = [(0, 1), (1, 1), (1, 2)]
+    pair_prob_matrix = np.array(
+        [
+            [0.0, 0.0, 0.0],
+            [0.2, 0.0, 0.0],
+        ],
+        dtype=float,
+    )
+
+    observed = compute_informative_event_support_probabilities(
+        pair_prob_matrix,
+        pair_states,
+        sample_ploidy=2,
+    )
+
+    assert observed["DEL"].tolist() == pytest.approx([0.5, 1.0])
+    assert observed["DUP"].tolist() == pytest.approx([0.5, 0.0])
 
 
 def test_posterior_probability_to_qual_phred_scales_and_caps():
