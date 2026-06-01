@@ -242,11 +242,11 @@ The package optimizes a hierarchical Bayesian network implemented via the Pyro p
 
 ```
 
-For a genomic bin $b$ and sample $s$, the latent copy state $z_{b,s}$ is drawn from a shared bin-specific prior. The observed read depth is modeled conditionally as:
+For a genomic bin $b$ and sample $s$, the latent copy state $z_{b,s}$ is drawn from a shared bin-specific prior. Let $d_{b,s}$ denote the observed read depth. It is modeled conditionally as:
 
-$$\mathbb{E}[\text{depth}_{b,s}] = \text{total\_cn}[z_{b,s}] \times \text{bin\_bias}_b$$
+$$\mathbb{E}[d_{b,s}] = c(z_{b,s}) \times \beta_b$$
 
-$$\text{depth}_{b,s} \sim \mathcal{N}\left(\mathbb{E}[\text{depth}_{b,s}],\ \sigma^2_{b,s}\right)$$
+$$d_{b,s} \sim \mathcal{N}\left(\mathbb{E}[d_{b,s}],\ \sigma^2_{b,s}\right)$$
 
 The conditional variance $\sigma^2_{b,s}$ relies on a count-anchored spatial model that links sampling noise to an empirical baseline:
 
