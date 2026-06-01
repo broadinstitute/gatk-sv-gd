@@ -170,6 +170,109 @@ def _collect_with_highres(monkeypatch, highres_df):
     return result, filter_max_values
 
 
+def test_build_roi_intervals_from_mappings_merges_overlaps_per_chromosome():
+    mappings = [
+        preprocess_module.LocusBinMapping(
+            cluster="c1",
+            locus=None,
+            interval_name="a",
+            array_idx=0,
+            chrom="chr1",
+            start=100,
+            end=150,
+        ),
+        preprocess_module.LocusBinMapping(
+            cluster="c1",
+            locus=None,
+            interval_name="b",
+            array_idx=1,
+            chrom="chr1",
+            start=140,
+            end=200,
+        ),
+        preprocess_module.LocusBinMapping(
+            cluster="c2",
+            locus=None,
+            interval_name="c",
+            array_idx=2,
+            chrom="chr1",
+            start=250,
+            end=300,
+        ),
+        preprocess_module.LocusBinMapping(
+            cluster="c3",
+            locus=None,
+            interval_name="d",
+            array_idx=3,
+            chrom="chr2",
+            start=50,
+            end=75,
+        ),
+    ]
+
+    assert preprocess_module._build_roi_intervals_from_mappings(mappings) == {
+        "chr1": [(100, 200), (250, 300)],
+        "chr2": [(50, 75)],
+    }
+
+
+def test_detect_baf_columns_handles_headerless_headered_empty_and_invalid_inputs(tmp_path):
+    empty_path = tmp_path / "empty.tsv"
+    empty_path.write_text("")
+    assert preprocess_module._detect_baf_columns(str(empty_path)) == (None, ["Chr", "Pos", "BAF", "Sample"])
+
+    headerless_path = tmp_path / "headerless.tsv"
+    headerless_path.write_text("chr1\t10\t0.25\tsample1\n")
+    assert preprocess_module._detect_baf_columns(str(headerless_path)) == (None, ["Chr", "Pos", "BAF", "Sample"])
+
+    headered_path = tmp_path / "headered.tsv.gz"
+    headered_path.write_bytes(b"")
+    import gzip
+    with gzip.open(headered_path, "wt") as handle:
+        handle.write("Chr\tPos\tBAF\tSample\textra\nchr1\t10\t0.25\ts1\tfoo\n")
+    assert preprocess_module._detect_baf_columns(str(headered_path)) == (0, ["Chr", "Pos", "BAF", "Sample"])
+
+    invalid_path = tmp_path / "invalid.tsv"
+    invalid_path.write_text("chr1\t10\t0.25\n")
+    with pytest.raises(ValueError, match="at least 4 tab-delimited columns"):
+        preprocess_module._detect_baf_columns(str(invalid_path))
+
+
+def test_iter_roi_baf_records_skips_invalid_rows_and_fetch_errors(monkeypatch):
+    class FakeTabixFile:
+        def __init__(self, path):
+            self.path = path
+
+        def fetch(self, chrom, start, end):
+            if chrom == "chr2":
+                raise ValueError("missing contig")
+            return iter([
+                "Chr\tPos\tBAF\tSample",
+                "chr1\t110\t0.25\ts1",
+                "chr1\t120\tnot_a_float\ts1",
+                "chr1\t130\t1.5\ts1",
+                "chr1\t140\t0.75\ts2",
+                "chr1\t150",
+            ])
+
+        def close(self):
+            return None
+
+    monkeypatch.setattr(preprocess_module.pysam, "TabixFile", FakeTabixFile)
+
+    records = list(preprocess_module._iter_roi_baf_records(
+        "fake.tsv.gz",
+        {"chr1": [(100, 200)], "chr2": [(0, 50)]},
+        header=0,
+        column_names=["Chr", "Pos", "BAF", "Sample"],
+    ))
+
+    assert records == [
+        ("chr1", 110, "110", 0.25, "0.25", "s1"),
+        ("chr1", 140, "140", 0.75, "0.75", "s2"),
+    ]
+
+
 def test_validate_supported_loci_rejects_chr_y(tmp_path):
     gd_path = tmp_path / "gd_table.tsv"
     gd_path.write_text(

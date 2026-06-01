@@ -3,11 +3,14 @@ import numpy as np
 import pytest
 
 from gatk_sv_gd.bins import compute_flank_regions_from_bins
+from gatk_sv_gd.bins import compute_bin_quality_mask
 from gatk_sv_gd.bins import filter_low_quality_bins
 from gatk_sv_gd.bins import get_flank_filter_params
 from gatk_sv_gd.bins import rebin_locus_intervals
 from gatk_sv_gd.bins import _allocate_bins_across_segments
 from gatk_sv_gd.bins import _compute_quality_stats_single_chrom
+from gatk_sv_gd.bins import _mask_overlap_bool
+from gatk_sv_gd.bins import _ploidy_adjust_depths
 from gatk_sv_gd.bins import _ploidy_adjust_depths_single_chrom
 from gatk_sv_gd.bins import _split_region_into_supported_segments
 from gatk_sv_gd.models import GDLocus
@@ -18,6 +21,16 @@ class DummyParMask:
         if chrom != "chrX":
             return np.zeros(len(starts))
         return np.ones(len(starts))
+
+
+class DummyOverlapMask:
+    def get_overlap_fractions_batch(self, chrom, starts, ends):
+        starts = np.asarray(starts)
+        ends = np.asarray(ends)
+        if chrom != "chr1":
+            return np.zeros(len(starts))
+        overlap = np.maximum(0, np.minimum(ends, 25) - np.maximum(starts, 15))
+        return overlap / np.maximum(1, ends - starts)
 
 
 def test_fragmented_flank_rebinning_preserves_masked_gap():
@@ -50,6 +63,103 @@ def test_fragmented_flank_rebinning_preserves_masked_gap():
     observed = list(zip(rebinned["Start"].tolist(), rebinned["End"].tolist()))
     assert observed == [(200, 240), (280, 320)]
     assert all(not (start < 280 and end > 240) for start, end in observed)
+
+
+def test_mask_overlap_bool_handles_none_empty_and_positive_overlap_cases():
+    starts = np.array([0, 10, 20, 30])
+    ends = np.array([10, 20, 30, 40])
+
+    assert _mask_overlap_bool(None, "chr1", starts, ends).tolist() == [False, False, False, False]
+    assert _mask_overlap_bool(DummyOverlapMask(), "chr1", np.array([], dtype=int), np.array([], dtype=int)).tolist() == []
+    assert _mask_overlap_bool(DummyOverlapMask(), "chr1", starts, ends).tolist() == [False, True, True, False]
+    assert _mask_overlap_bool(DummyOverlapMask(), "chr2", starts, ends).tolist() == [False, False, False, False]
+
+
+def test_ploidy_adjust_depths_scales_each_sample_by_chromosome_specific_ploidy():
+    depths = np.array(
+        [
+            [1.0, 10.0],
+            [2.0, 20.0],
+            [3.0, 30.0],
+            [4.0, 40.0],
+        ]
+    )
+    df = pd.DataFrame({"Chr": ["chr1", "chrX", "chr1", "chrX"]})
+
+    adjusted = _ploidy_adjust_depths(
+        depths,
+        df,
+        ["s1", "s2"],
+        {
+            ("s1", "chr1"): 1,
+            ("s1", "chrX"): 2,
+            ("s2", "chr1"): 4,
+            ("s2", "chrX"): 0,
+        },
+    )
+
+    assert np.allclose(
+        adjusted,
+        np.array(
+            [
+                [2.0, 5.0],
+                [2.0, 20.0],
+                [6.0, 15.0],
+                [4.0, 40.0],
+            ]
+        ),
+    )
+    assert np.allclose(
+        depths,
+        np.array(
+            [
+                [1.0, 10.0],
+                [2.0, 20.0],
+                [3.0, 30.0],
+                [4.0, 40.0],
+            ]
+        ),
+    )
+
+
+def test_compute_bin_quality_mask_covers_empty_par_hard_include_and_no_informative_cases():
+    empty_mask, empty_stats = compute_bin_quality_mask(
+        pd.DataFrame(columns=["Chr", "Start", "End", "s1"]),
+        median_min=1.0,
+        median_max=3.0,
+        mad_max=0.2,
+    )
+
+    assert empty_mask.tolist() == []
+    assert empty_stats == {"filtered": 0, "par_ignored": 0, "no_informative": 0}
+
+    df = pd.DataFrame(
+        {
+            "Chr": ["chr1", "chrX", "chrY", "chr1"],
+            "Start": [10, 100, 50, 30],
+            "End": [20, 120, 60, 40],
+            "s1": [0.1, 0.1, 1.0, 2.0],
+            "s2": [4.0, 4.0, 2.0, 2.1],
+        }
+    )
+
+    keep_mask, stats = compute_bin_quality_mask(
+        df,
+        median_min=1.0,
+        median_max=3.0,
+        mad_max=0.2,
+        ploidy_map={("s1", "chrY"): 0, ("s2", "chrY"): 0},
+        par_mask=DummyParMask(),
+        hard_inclusion_mask=DummyOverlapMask(),
+    )
+
+    assert keep_mask.tolist() == [True, True, False, True]
+    assert stats == {
+        "filtered": 1,
+        "par_ignored": 1,
+        "hard_included": 1,
+        "no_informative": 1,
+    }
 
 
 def test_flank_selection_uses_all_filtered_bins():

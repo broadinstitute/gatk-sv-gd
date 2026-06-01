@@ -12,6 +12,8 @@ from gatk_sv_gd.depth import (
     _count_anchored_reference_variance_numpy,
     _depth_variance_scale_numpy,
     _lognormal_location_from_mean,
+    _size_modifier_numpy,
+    _variance_expected_depth_numpy,
     pair_state_minor_baf,
     pair_state_total_cn,
     _select_state_log_likelihood_torch,
@@ -506,6 +508,34 @@ def test_count_anchored_reference_variance_numpy_matches_poisson_scale():
     assert variance.shape == (1, 2)
     assert variance[0, 0] == pytest.approx(0.002)
     assert variance[0, 1] == pytest.approx(0.001)
+
+
+def test_count_anchored_reference_variance_numpy_skips_rescaling_without_positive_bin_factor():
+    variance = _count_anchored_reference_variance_numpy(
+        np.asarray([2000.0, 4000.0], dtype=np.float32),
+        reference_bin_size=10000.0,
+        bin_size_factor=0.0,
+    )
+
+    assert variance.shape == (1, 2)
+    assert variance[0].tolist() == pytest.approx([0.002, 0.001])
+
+
+def test_variance_expected_depth_numpy_applies_floor_only_when_positive():
+    expected_depth = np.asarray([0.01, 0.2, 2.0], dtype=np.float32)
+
+    unchanged = _variance_expected_depth_numpy(expected_depth, min_expected_depth=0.0)
+    floored = _variance_expected_depth_numpy(expected_depth, min_expected_depth=0.1)
+
+    assert unchanged.tolist() == pytest.approx([0.01, 0.2, 2.0])
+    assert floored.tolist() == pytest.approx([0.1, 0.2, 2.0])
+
+
+def test_size_modifier_numpy_uses_active_bin_factor_or_unity():
+    interval_sizes = np.asarray([100.0, 200.0, 400.0], dtype=np.float32)
+
+    assert _size_modifier_numpy(interval_sizes, bin_size_factor=200.0).tolist() == pytest.approx([2.0, 1.0, 0.5])
+    assert _size_modifier_numpy(interval_sizes, bin_size_factor=0.0).tolist() == pytest.approx([1.0, 1.0, 1.0])
 
 
 def test_init_adds_length_scale_var_site_for_count_anchored_models(monkeypatch):
