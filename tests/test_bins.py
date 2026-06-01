@@ -7,6 +7,8 @@ from gatk_sv_gd.bins import compute_flank_regions_from_bins
 from gatk_sv_gd.bins import compute_bin_quality_mask
 from gatk_sv_gd.bins import compute_interval_cn_stats
 from gatk_sv_gd.bins import call_gd_cnv
+from gatk_sv_gd.bins import determine_best_breakpoints
+from gatk_sv_gd.bins import read_data
 from gatk_sv_gd.bins import filter_low_quality_bins
 from gatk_sv_gd.bins import extract_locus_bins
 from gatk_sv_gd.bins import get_flank_filter_params
@@ -420,6 +422,98 @@ def test_call_gd_cnv_distinguishes_supported_spanning_and_unsupported_events():
     assert np.isnan(by_id["del_unsupported"]["log_prob_score"])
     assert not bool(by_id["del_unsupported"]["is_carrier"])
     assert by_id["del_unsupported"]["n_bins"] == 0
+
+
+def test_determine_best_breakpoints_handles_none_single_and_multiple_carriers():
+    class FakeLocus:
+        def get_intervals(self):
+            return [
+                (100, 200, "A"),
+                (200, 300, "B"),
+                (300, 400, "C"),
+            ]
+
+    interval_stats = {
+        "A": {"n_bins": 3, "cn_probs": np.asarray([0.55, 0.30, 0.15, 0.0, 0.0, 0.0])},
+        "B": {"n_bins": 2, "cn_probs": np.asarray([0.05, 0.10, 0.85, 0.0, 0.0, 0.0])},
+        "C": {"n_bins": 4, "cn_probs": np.asarray([0.02, 0.03, 0.15, 0.30, 0.25, 0.25])},
+    }
+    calls = [
+        {"GD_ID": "del_best", "svtype": "DEL", "is_carrier": True, "intervals": ["A"], "start": 100, "end": 200},
+        {"GD_ID": "del_worse", "svtype": "DEL", "is_carrier": True, "intervals": ["A", "B"], "start": 100, "end": 300},
+        {"GD_ID": "dup_only", "svtype": "DUP", "is_carrier": True, "intervals": ["C"], "start": 300, "end": 400},
+        {"GD_ID": "dup_noncarrier", "svtype": "DUP", "is_carrier": False, "intervals": ["B"], "start": 200, "end": 300},
+    ]
+
+    best = determine_best_breakpoints(FakeLocus(), interval_stats, calls)
+
+    assert best == {"DEL": "del_best", "DUP": "dup_only"}
+
+
+def test_determine_best_breakpoints_prefers_larger_variant_on_exact_tie():
+    class FakeLocus:
+        def get_intervals(self):
+            return [
+                (100, 200, "A"),
+                (200, 300, "B"),
+            ]
+
+    interval_stats = {
+        "A": {"n_bins": 1, "cn_probs": np.asarray([0.4, 0.4, 0.2, 0.0, 0.0, 0.0])},
+        "B": {"n_bins": 1, "cn_probs": np.asarray([0.4, 0.4, 0.2, 0.0, 0.0, 0.0])},
+    }
+    calls = [
+        {"GD_ID": "short", "svtype": "DEL", "is_carrier": True, "intervals": ["A"], "start": 100, "end": 200},
+        {"GD_ID": "long", "svtype": "DEL", "is_carrier": True, "intervals": ["B"], "start": 100, "end": 300},
+    ]
+
+    best = determine_best_breakpoints(FakeLocus(), interval_stats, calls)
+
+    assert best == {"DEL": "long", "DUP": None}
+
+
+def test_determine_best_breakpoints_scores_multiple_dup_carriers_by_affected_and_unaffected_intervals():
+    class FakeLocus:
+        def get_intervals(self):
+            return [
+                (100, 200, "A"),
+                (200, 300, "B"),
+                (300, 400, "C"),
+            ]
+
+    interval_stats = {
+        "A": {"n_bins": 2, "cn_probs": np.asarray([0.1, 0.2, 0.65, 0.03, 0.01, 0.01])},
+        "B": {"n_bins": 3, "cn_probs": np.asarray([0.02, 0.03, 0.10, 0.35, 0.25, 0.25])},
+        "C": {"n_bins": 2, "cn_probs": np.asarray([0.05, 0.10, 0.80, 0.03, 0.01, 0.01])},
+    }
+    calls = [
+        {"GD_ID": "dup_best", "svtype": "DUP", "is_carrier": True, "intervals": ["B"], "start": 200, "end": 300},
+        {"GD_ID": "dup_worse", "svtype": "DUP", "is_carrier": True, "intervals": ["A", "B"], "start": 100, "end": 300},
+    ]
+
+    best = determine_best_breakpoints(FakeLocus(), interval_stats, calls)
+
+    assert best == {"DEL": None, "DUP": "dup_best"}
+
+
+def test_read_data_renames_chr_builds_bin_index_and_sets_source_file(tmp_path):
+    source_dir = tmp_path / "panel_run" / "counts"
+    source_dir.mkdir(parents=True)
+    input_path = source_dir / "bins.tsv.gz"
+    pd.DataFrame(
+        {
+            "#Chr": ["chr1", "chr2"],
+            "Start": [100, 200],
+            "End": [150, 260],
+            "sample1": [1.0, 2.0],
+        }
+    ).to_csv(input_path, sep="\t", index=False, compression="gzip")
+
+    loaded = read_data(str(input_path))
+
+    assert loaded.index.tolist() == ["chr1:100-150", "chr2:200-260"]
+    assert loaded["Chr"].tolist() == ["chr1", "chr2"]
+    assert loaded["source_file"].tolist() == ["panel_run", "panel_run"]
 
 
 def test_filter_low_quality_bins_excludes_ploidy_zero_samples():

@@ -1,4 +1,5 @@
 import csv
+import sys
 from types import SimpleNamespace
 
 import numpy as np
@@ -28,6 +29,7 @@ from gatk_sv_gd.synthesize import (
     _matches_canonical_breakpoint_pair,
     _matches_canonical_gd_interval,
     _parse_region,
+    parse_args,
     _process_baf_contig_group,
     _process_contig_group,
     _read_baf_sample_ids,
@@ -151,6 +153,66 @@ def test_parse_region_and_interval_helpers():
 
     assert _intervals_overlap(10, 20, 15, 25) is True
     assert _intervals_overlap(10, 20, 20, 30) is False
+
+
+def test_parse_args_accepts_expected_synthesize_cli_options(monkeypatch):
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "gatk-sv-gd",
+            "--lo-res-counts",
+            "lo.rd.txt.gz",
+            "--hi-res-counts",
+            "hi.rd.txt.gz",
+            "--baf-table",
+            "all.baf.txt.gz",
+            "--ploidy-table",
+            "ploidy.tsv",
+            "--gd-table",
+            "gd.tsv",
+            "--output-dir",
+            "out",
+            "--gd-probability",
+            "0.25",
+            "--salted-event-probability",
+            "0.15",
+            "--viable-trisomy-probability",
+            "0.05",
+            "--seed",
+            "123",
+            "--truth-table",
+            "truth.tsv",
+            "--region",
+            "chr1:100-200",
+            "--region",
+            "chrX",
+            "--del-multiplier",
+            "0.4",
+            "--dup-multiplier",
+            "1.6",
+            "--threads",
+            "3",
+        ],
+    )
+
+    args = parse_args()
+
+    assert args.lo_res_counts == "lo.rd.txt.gz"
+    assert args.hi_res_counts == "hi.rd.txt.gz"
+    assert args.baf_table == "all.baf.txt.gz"
+    assert args.ploidy_table == "ploidy.tsv"
+    assert args.gd_table == "gd.tsv"
+    assert args.output_dir == "out"
+    assert args.gd_probability == pytest.approx(0.25)
+    assert args.salted_event_probability == pytest.approx(0.15)
+    assert args.viable_trisomy_probability == pytest.approx(0.05)
+    assert args.seed == 123
+    assert args.truth_table == "truth.tsv"
+    assert args.regions == ["chr1:100-200", "chrX"]
+    assert args.del_multiplier == pytest.approx(0.4)
+    assert args.dup_multiplier == pytest.approx(1.6)
+    assert args.threads == 3
 
 
 def test_sample_ploidy_and_event_multiplier_resolution():
@@ -761,6 +823,287 @@ def test_main_reuses_truth_table_and_rewrites_requested_outputs(monkeypatch, tmp
     )]
 
 
+def test_main_without_truth_table_filters_regions_and_rewrites_lowres(monkeypatch, tmp_path, capsys):
+    output_dir = tmp_path / "out"
+    yes_entry = {
+        "GD_ID": "GD1",
+        "NAHR": "yes",
+        "svtype": "DEL",
+        "start_GRCh38": 110,
+        "end_GRCh38": 300,
+        "cluster": "cluster1",
+    }
+    non_nahr_entry = {
+        "GD_ID": "GD2",
+        "NAHR": "no",
+        "svtype": "DUP",
+        "start_GRCh38": 500,
+        "end_GRCh38": 700,
+        "cluster": "cluster2",
+    }
+    locus = _make_locus()
+    gd_table_stub = SimpleNamespace(
+        loci={"cluster1": locus, "cluster2": SimpleNamespace(is_nahr=False, gd_entries=[non_nahr_entry], chrom="chr2")},
+        get_all_loci=lambda: {"cluster1": locus, "cluster2": SimpleNamespace(is_nahr=False, gd_entries=[non_nahr_entry], chrom="chr2")},
+    )
+
+    monkeypatch.setattr(
+        synthesize_module,
+        "parse_args",
+        lambda: SimpleNamespace(
+            lo_res_counts="lo.rd.txt.gz",
+            hi_res_counts=None,
+            baf_table=None,
+            ploidy_table="ploidy.tsv",
+            gd_table="gd.tsv",
+            output_dir=str(output_dir),
+            gd_probability=0.5,
+            salted_event_probability=0.0,
+            viable_trisomy_probability=0.0,
+            seed=17,
+            truth_table=None,
+            regions=["chr1:100-320"],
+            del_multiplier=0.4,
+            dup_multiplier=1.6,
+            threads=2,
+        ),
+    )
+    monkeypatch.setattr(synthesize_module, "setup_logging", lambda *args, **kwargs: None)
+    monkeypatch.setattr(synthesize_module, "GDTable", lambda path: gd_table_stub)
+    monkeypatch.setattr(
+        synthesize_module,
+        "_build_gd_lookup",
+        lambda gd_table: {"GD1": ("chr1", yes_entry), "GD2": ("chr2", non_nahr_entry)},
+    )
+    monkeypatch.setattr(synthesize_module, "_discover_sample_ids", lambda *args: ["S1", "S2"])
+    monkeypatch.setattr(synthesize_module, "_load_ploidy_lookup", lambda path: {("S1", "chr1"): 2})
+    monkeypatch.setattr(
+        synthesize_module,
+        "assign_gd_to_samples",
+        lambda sample_ids, eligible_entries, rng, gd_probability: {"S1": ("chr1", yes_entry)},
+    )
+    monkeypatch.setattr(
+        synthesize_module,
+        "_build_assignment_events",
+        lambda assignments, **kwargs: [{"sample_id": "S1", "chrom": "chr1", "start": 110, "end": 300, "multiplier": 0.4}],
+    )
+    monkeypatch.setattr(synthesize_module, "generate_salted_flank_bleed_events", lambda *args, **kwargs: [])
+    monkeypatch.setattr(synthesize_module, "generate_viable_trisomy_events", lambda *args, **kwargs: [])
+    monkeypatch.setattr(
+        synthesize_module,
+        "_build_interval_map_from_events",
+        lambda events: {("chr1", 110, 300): [("S1", 0.4)]},
+    )
+
+    counts_calls = []
+    truth_writes = []
+    background_writes = []
+    monkeypatch.setattr(
+        synthesize_module,
+        "_rewrite_counts_file",
+        lambda input_path, output_path, interval_map, **kwargs: counts_calls.append((input_path, output_path, interval_map, kwargs)) or 1,
+    )
+    monkeypatch.setattr(
+        synthesize_module,
+        "_write_truth_table",
+        lambda assignments, output_path: truth_writes.append((assignments, output_path)),
+    )
+    monkeypatch.setattr(
+        synthesize_module,
+        "_write_background_event_table",
+        lambda events, output_path: background_writes.append((events, output_path)),
+    )
+
+    synthesize_module.main()
+
+    stdout = capsys.readouterr().out
+    assert "Region filters applied: 1" in stdout
+    assert "2 eligible GD entries (1 DEL, 1 DUP)" in stdout
+    assert "Loading ploidy table" in stdout
+    assert "Assigned GD events to 1/2 samples" in stdout
+    assert "Low-res output written" in stdout
+    assert "Carriers:        1/2 samples" in stdout
+    assert "Salted events:   0" in stdout
+    assert "Trisomy events:  0" in stdout
+    assert counts_calls == [
+        (
+            "lo.rd.txt.gz",
+            str(output_dir / "lo_res_counts.synthesized.rd.txt.gz"),
+            {("chr1", 110, 300): [("S1", 0.4)]},
+            {"label": "lo-res", "n_workers": 2},
+        )
+    ]
+    assert truth_writes == [({"S1": ("chr1", yes_entry)}, str(output_dir / "truth_table.tsv"))]
+    assert background_writes == [([], str(output_dir / "background_events.tsv"))]
+
+
+def test_main_exits_when_region_filter_removes_all_entries(monkeypatch, tmp_path):
+    locus = _make_locus()
+    gd_table_stub = SimpleNamespace(loci={"cluster1": locus}, get_all_loci=lambda: {"cluster1": locus})
+
+    monkeypatch.setattr(
+        synthesize_module,
+        "parse_args",
+        lambda: SimpleNamespace(
+            lo_res_counts="lo.rd.txt.gz",
+            hi_res_counts=None,
+            baf_table=None,
+            ploidy_table="ploidy.tsv",
+            gd_table="gd.tsv",
+            output_dir=str(tmp_path / "out"),
+            gd_probability=0.5,
+            salted_event_probability=0.0,
+            viable_trisomy_probability=0.0,
+            seed=3,
+            truth_table=None,
+            regions=["chr9:1-10"],
+            del_multiplier=0.5,
+            dup_multiplier=1.5,
+            threads=1,
+        ),
+    )
+    monkeypatch.setattr(synthesize_module, "setup_logging", lambda *args, **kwargs: None)
+    monkeypatch.setattr(synthesize_module, "GDTable", lambda path: gd_table_stub)
+    monkeypatch.setattr(
+        synthesize_module,
+        "_build_gd_lookup",
+        lambda gd_table: {"GD1": ("chr1", {"GD_ID": "GD1", "NAHR": "yes", "svtype": "DEL", "start_GRCh38": 110, "end_GRCh38": 300, "cluster": "cluster1"})},
+    )
+
+    with pytest.raises(SystemExit) as excinfo:
+        synthesize_module.main()
+
+    assert excinfo.value.code == 1
+
+
+def test_main_exits_when_sample_universe_cannot_be_discovered(monkeypatch, tmp_path, capsys):
+    locus = _make_locus()
+    gd_table_stub = SimpleNamespace(loci={"cluster1": locus}, get_all_loci=lambda: {"cluster1": locus})
+
+    monkeypatch.setattr(
+        synthesize_module,
+        "parse_args",
+        lambda: SimpleNamespace(
+            lo_res_counts="lo.rd.txt.gz",
+            hi_res_counts=None,
+            baf_table=None,
+            ploidy_table=None,
+            gd_table="gd.tsv",
+            output_dir=str(tmp_path / "out"),
+            gd_probability=0.5,
+            salted_event_probability=0.0,
+            viable_trisomy_probability=0.0,
+            seed=19,
+            truth_table=None,
+            regions=None,
+            del_multiplier=0.5,
+            dup_multiplier=1.5,
+            threads=1,
+        ),
+    )
+    monkeypatch.setattr(synthesize_module, "setup_logging", lambda *args, **kwargs: None)
+    monkeypatch.setattr(synthesize_module, "GDTable", lambda path: gd_table_stub)
+    monkeypatch.setattr(
+        synthesize_module,
+        "_build_gd_lookup",
+        lambda gd_table: {"GD1": ("chr1", {"GD_ID": "GD1", "NAHR": "yes", "svtype": "DEL", "start_GRCh38": 110, "end_GRCh38": 300, "cluster": "cluster1"})},
+    )
+    monkeypatch.setattr(synthesize_module, "_discover_sample_ids", lambda *args: [])
+
+    with pytest.raises(SystemExit) as excinfo:
+        synthesize_module.main()
+
+    captured = capsys.readouterr()
+    assert excinfo.value.code == 1
+    assert "Unable to discover sample IDs from input tables" in captured.err
+
+
+def test_main_truth_table_without_sample_universe_uses_carrier_only_summary(monkeypatch, tmp_path, capsys):
+    output_dir = tmp_path / "out"
+    yes_entry = {
+        "GD_ID": "GD1",
+        "NAHR": "yes",
+        "svtype": "DEL",
+        "start_GRCh38": 110,
+        "end_GRCh38": 300,
+        "cluster": "cluster1",
+    }
+    locus = _make_locus()
+    gd_table_stub = SimpleNamespace(loci={"cluster1": locus}, get_all_loci=lambda: {"cluster1": locus})
+    count_calls = []
+    truth_writes = []
+    background_writes = []
+
+    monkeypatch.setattr(
+        synthesize_module,
+        "parse_args",
+        lambda: SimpleNamespace(
+            lo_res_counts="lo.rd.txt.gz",
+            hi_res_counts=None,
+            baf_table=None,
+            ploidy_table=None,
+            gd_table="gd.tsv",
+            output_dir=str(output_dir),
+            gd_probability=0.5,
+            salted_event_probability=0.0,
+            viable_trisomy_probability=0.0,
+            seed=23,
+            truth_table="truth.tsv",
+            regions=None,
+            del_multiplier=0.5,
+            dup_multiplier=1.5,
+            threads=2,
+        ),
+    )
+    monkeypatch.setattr(synthesize_module, "setup_logging", lambda *args, **kwargs: None)
+    monkeypatch.setattr(synthesize_module, "GDTable", lambda path: gd_table_stub)
+    monkeypatch.setattr(synthesize_module, "_build_gd_lookup", lambda gd_table: {"GD1": ("chr1", yes_entry)})
+    monkeypatch.setattr(synthesize_module, "_discover_sample_ids", lambda *args: [])
+    monkeypatch.setattr(synthesize_module, "_load_truth_assignments", lambda path, lookup: {"S1": ("chr1", yes_entry)})
+    monkeypatch.setattr(
+        synthesize_module,
+        "_build_assignment_events",
+        lambda assignments, **kwargs: [{"sample_id": "S1", "chrom": "chr1", "start": 110, "end": 300, "multiplier": 0.5}],
+    )
+    monkeypatch.setattr(synthesize_module, "generate_salted_flank_bleed_events", lambda *args, **kwargs: [])
+    monkeypatch.setattr(synthesize_module, "generate_viable_trisomy_events", lambda *args, **kwargs: [])
+    monkeypatch.setattr(synthesize_module, "_build_interval_map_from_events", lambda events: {("chr1", 110, 300): [("S1", 0.5)]})
+    monkeypatch.setattr(
+        synthesize_module,
+        "_rewrite_counts_file",
+        lambda input_path, output_path, interval_map, **kwargs: count_calls.append((input_path, output_path, interval_map, kwargs)) or 1,
+    )
+    monkeypatch.setattr(
+        synthesize_module,
+        "_write_truth_table",
+        lambda assignments, output_path: truth_writes.append((assignments, output_path)),
+    )
+    monkeypatch.setattr(
+        synthesize_module,
+        "_write_background_event_table",
+        lambda events, output_path: background_writes.append((events, output_path)),
+    )
+
+    synthesize_module.main()
+
+    stdout = capsys.readouterr().out
+    assert "No sample universe detected from inputs; proceeding with truth-table carriers only" in stdout
+    assert "No ploidy table provided; assuming diploid (ploidy=2) everywhere" in stdout
+    assert "Reused 1 carrier assignments from truth table" in stdout
+    assert "Low-res output written" in stdout
+    assert "Carriers:        1 samples" in stdout
+    assert count_calls == [
+        (
+            "lo.rd.txt.gz",
+            str(output_dir / "lo_res_counts.synthesized.rd.txt.gz"),
+            {("chr1", 110, 300): [("S1", 0.5)]},
+            {"label": "lo-res", "n_workers": 2},
+        )
+    ]
+    assert truth_writes == [({"S1": ("chr1", yes_entry)}, str(output_dir / "truth_table.tsv"))]
+    assert background_writes == [([], str(output_dir / "background_events.tsv"))]
+
+
 def test_rewrite_counts_file_orchestrates_header_workers_and_indexing(monkeypatch, tmp_path):
     process_calls = []
     concat_calls = []
@@ -879,3 +1222,77 @@ def test_rewrite_baf_file_orchestrates_header_workers_and_indexing(monkeypatch, 
             "force": True,
         },
     )]
+
+
+def test_rewrite_baf_file_uses_process_pool_for_parallel_workers(monkeypatch, tmp_path):
+    input_path = tmp_path / "input_parallel.baf.tsv"
+    input_path.write_text("Chr\tPos\tBAF\tSample\nchr1\t100\t0.5\tS1\n")
+
+    process_calls = []
+    submitted = []
+    concat_calls = []
+    tabix_calls = []
+
+    class _Future:
+        def __init__(self, result):
+            self._result = result
+
+        def result(self):
+            return self._result
+
+    class _Pool:
+        def __init__(self, max_workers):
+            self.max_workers = max_workers
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return None
+
+        def submit(self, func, *args):
+            submitted.append(args[1])
+            return _Future(func(*args))
+
+    monkeypatch.setattr(synthesize_module, "_ensure_baf_tabix_index", lambda path: None)
+    monkeypatch.setattr(synthesize_module.os.path, "getsize", lambda path: 100)
+    monkeypatch.setattr(
+        synthesize_module.pysam,
+        "TabixFile",
+        lambda path: _StubTabixFile({}, header=["#meta"], contigs=["chr1", "chr2"]),
+    )
+    monkeypatch.setattr(synthesize_module.pysam, "BGZFile", _StubBGZFile, raising=False)
+    monkeypatch.setattr(
+        synthesize_module,
+        "_process_baf_contig_group",
+        lambda input_path, group, resolved, pos_col, baf_col, sample_col: process_calls.append(
+            (input_path, group, resolved, pos_col, baf_col, sample_col)
+        ) or (len(group), 1),
+    )
+    monkeypatch.setattr(synthesize_module, "ProcessPoolExecutor", _Pool)
+    monkeypatch.setattr(synthesize_module, "as_completed", lambda futures: list(futures))
+    monkeypatch.setattr(
+        synthesize_module,
+        "_concat_bgzf_parts",
+        lambda output_path, part_paths, label="": concat_calls.append((output_path, part_paths, label)),
+    )
+    monkeypatch.setattr(
+        synthesize_module.pysam,
+        "tabix_index",
+        lambda path, **kwargs: tabix_calls.append((path, kwargs)),
+    )
+
+    modified = _rewrite_baf_file(
+        str(input_path),
+        str(tmp_path / "output_parallel.baf.bgz"),
+        [{"chrom": "chr1", "start": 100, "end": 200, "sample_id": "S1", "svtype": "DEL", "baseline_ploidy": 2}],
+        label="baf",
+        n_workers=4,
+    )
+
+    assert modified == 2
+    assert len(submitted) == 2
+    assert len(process_calls) == 2
+    assert all(call[3:] == (1, 2, 3) for call in process_calls)
+    assert concat_calls[0][2] == "baf"
+    assert tabix_calls[0][0] == str(tmp_path / "output_parallel.baf.bgz")

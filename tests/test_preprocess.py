@@ -1,6 +1,9 @@
 import numpy as np
 import pandas as pd
 import pytest
+import sys
+from types import SimpleNamespace
+from types import SimpleNamespace
 
 from gatk_sv_gd.models import GDTable, validate_gd_table_for_preprocess
 import gatk_sv_gd.preprocess as preprocess_module
@@ -77,6 +80,93 @@ def test_region_parsing_helpers_cover_valid_and_invalid_inputs():
     assert preprocess_module._is_chr_y("Y") is True
     assert preprocess_module._is_chr_y("chr2") is False
     assert preprocess_module._flatten_multi_args([["a", "b"], ["c"], []]) == ["a", "b", "c"]
+
+
+def test_parse_args_accepts_expected_preprocess_cli_options(monkeypatch):
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "gatk-sv-gd",
+            "--input",
+            "depth.tsv.gz",
+            "--gd-table",
+            "gd.tsv",
+            "--output-dir",
+            "out",
+            "--exclusion-intervals",
+            "exc1.bed",
+            "exc2.bed",
+            "--flank-exclusion-intervals",
+            "flank.bed",
+            "--par-intervals",
+            "par.bed",
+            "--hard-inclusion-intervals",
+            "hard.bed",
+            "--high-res-counts",
+            "highres.tsv.gz",
+            "--baf-table",
+            "baf.tsv.gz",
+            "--locus-padding",
+            "5000",
+            "--exclusion-threshold",
+            "0.2",
+            "--exclusion-bypass-threshold",
+            "0.9",
+            "--min-bins-per-interval",
+            "5",
+            "--max-bins-per-interval",
+            "8",
+            "--min-rebin-coverage",
+            "0.7",
+            "--min-flank-bases",
+            "1000",
+            "--max-flank-bases",
+            "5000",
+            "--min-flank-bins",
+            "4",
+            "--min-flank-coverage",
+            "0.6",
+            "--region",
+            "chr1:100-200",
+            "--region",
+            "chrX",
+            "--median-min",
+            "0.8",
+            "--median-max",
+            "3.5",
+            "--mad-max",
+            "0.3",
+            "--verbose",
+        ],
+    )
+
+    args = preprocess_module.parse_args()
+
+    assert args.input == "depth.tsv.gz"
+    assert args.gd_table == "gd.tsv"
+    assert args.output_dir == "out"
+    assert args.exclusion_intervals == [["exc1.bed", "exc2.bed"]]
+    assert args.flank_exclusion_intervals == [["flank.bed"]]
+    assert args.par_intervals == [["par.bed"]]
+    assert args.hard_inclusion_intervals == [["hard.bed"]]
+    assert args.high_res_counts == "highres.tsv.gz"
+    assert args.baf_table == "baf.tsv.gz"
+    assert args.locus_padding == 5000
+    assert args.exclusion_threshold == pytest.approx(0.2)
+    assert args.exclusion_bypass_threshold == pytest.approx(0.9)
+    assert args.min_bins_per_interval == 5
+    assert args.max_bins_per_interval == 8
+    assert args.min_rebin_coverage == pytest.approx(0.7)
+    assert args.min_flank_bases == 1000
+    assert args.max_flank_bases == 5000
+    assert args.min_flank_bins == 4
+    assert args.min_flank_coverage == pytest.approx(0.6)
+    assert args.regions == ["chr1:100-200", "chrX"]
+    assert args.median_min == pytest.approx(0.8)
+    assert args.median_max == pytest.approx(3.5)
+    assert args.mad_max == pytest.approx(0.3)
+    assert args.verbose is True
 
 
 def test_locus_overlaps_regions_matches_whole_chromosome_and_interval_overlap():
@@ -168,6 +258,106 @@ def _collect_with_highres(monkeypatch, highres_df):
         min_rebin_coverage=0.5,
     )
     return result, filter_max_values
+
+
+def test_filter_and_prepare_locus_bins_applies_masks_quality_filters_and_breakpoint_drops(monkeypatch):
+    locus_df = pd.DataFrame(
+        [
+            {"Chr": "chrX", "Start": 80, "End": 100, "sample1": 2.0},
+            {"Chr": "chrX", "Start": 100, "End": 120, "sample1": 2.1},
+            {"Chr": "chrX", "Start": 160, "End": 180, "sample1": 2.2},
+            {"Chr": "chrX", "Start": 180, "End": 200, "sample1": 2.3},
+            {"Chr": "chrX", "Start": 200, "End": 220, "sample1": 2.4},
+        ]
+    )
+    rebin_calls = []
+    assign_calls = []
+    quality_calls = []
+
+    def fake_compute_bin_quality_mask(sub_df, **kwargs):
+        quality_calls.append((sub_df[["Start", "End"]].copy(), kwargs))
+        if len(quality_calls) == 1:
+            return np.asarray([True, False]), {"filtered": 1, "par_ignored": 0}
+        return np.asarray([True]), {"filtered": 0, "par_ignored": 1}
+
+    def fake_rebin_locus_intervals(df, locus, max_bins_per_interval, flank_regions, min_rebin_coverage):
+        rebin_calls.append((df[["Start", "End"]].copy(), max_bins_per_interval, min_rebin_coverage))
+        return df.copy()
+
+    def fake_assign_bins_to_intervals(df, locus, flank_regions):
+        assign_calls.append(df[["Start", "End"]].copy())
+        return {"body": [0], "flank": [1], "breakpoint_ranges": [0]}
+
+    monkeypatch.setattr(preprocess_module, "compute_bin_quality_mask", fake_compute_bin_quality_mask)
+    monkeypatch.setattr(preprocess_module, "get_flank_filter_params", lambda params, chrom: {"median_min": 0.5, "median_max": 3.5, "mad_max": 0.4})
+    monkeypatch.setattr(preprocess_module, "rebin_locus_intervals", fake_rebin_locus_intervals)
+    monkeypatch.setattr(preprocess_module, "assign_bins_to_intervals", fake_assign_bins_to_intervals)
+
+    filtered_df, interval_bins = preprocess_module._filter_and_prepare_locus_bins(
+        locus_df,
+        _ChrXLocus(),
+        flank_regions=[(0, 100), (200, 300)],
+        left_bound=75,
+        right_bound=225,
+        max_bins_per_interval=4,
+        exclusion_mask=_IntervalMask("chrX", 90, 175),
+        flank_exclusion_mask=_IntervalMask("chrX", 80, 100),
+        exclusion_threshold=0.2,
+        filter_params={"median_min": 1.0, "median_max": 3.0, "mad_max": 0.5},
+        exclusion_bypass_regions=[(95, 125)],
+        min_rebin_coverage=0.6,
+        ploidy_map={("sample1", "chrX"): 2},
+        par_mask=_IntervalMask("chrX", 205, 215),
+        hard_inclusion_mask=_IntervalMask("chrX", 80, 100),
+    )
+
+    assert filtered_df[["Start", "End"]].values.tolist() == [[100, 120]]
+    assert interval_bins == {"body": [0], "flank": [1]}
+    assert quality_calls[0][0]["Start"].tolist() == [100, 180]
+    assert quality_calls[1][0]["Start"].tolist() == [80]
+    assert quality_calls[1][1]["median_min"] == pytest.approx(0.5)
+    assert rebin_calls[0][0]["Start"].tolist() == [80, 100]
+    assert rebin_calls[0][1:] == (4, 0.6)
+    assert assign_calls[0]["Start"].tolist() == [80, 100]
+
+
+def test_filter_and_prepare_locus_bins_returns_empty_when_masks_remove_everything(monkeypatch):
+    monkeypatch.setattr(
+        preprocess_module,
+        "compute_bin_quality_mask",
+        lambda *args, **kwargs: pytest.fail("quality filtering should not run when all bins are removed earlier"),
+    )
+    monkeypatch.setattr(
+        preprocess_module,
+        "assign_bins_to_intervals",
+        lambda *args, **kwargs: pytest.fail("interval assignment should not run for empty loci"),
+    )
+
+    empty_df, interval_bins = preprocess_module._filter_and_prepare_locus_bins(
+        pd.DataFrame(
+            [
+                {"Chr": "chrX", "Start": 90, "End": 110, "sample1": 2.0},
+                {"Chr": "chrX", "Start": 200, "End": 220, "sample1": 2.0},
+            ]
+        ),
+        _ChrXLocus(),
+        flank_regions=[(0, 100), (200, 300)],
+        left_bound=80,
+        right_bound=230,
+        max_bins_per_interval=0,
+        exclusion_mask=_IntervalMask("chrX", 80, 120),
+        flank_exclusion_mask=None,
+        exclusion_threshold=0.1,
+        filter_params=None,
+        exclusion_bypass_regions=None,
+        min_rebin_coverage=0.5,
+        ploidy_map=None,
+        par_mask=_IntervalMask("chrX", 190, 230),
+        hard_inclusion_mask=None,
+    )
+
+    assert empty_df.empty
+    assert interval_bins == {}
 
 
 def test_build_roi_intervals_from_mappings_merges_overlaps_per_chromosome():
@@ -571,6 +761,288 @@ def test_load_preprocessed_data_reads_optional_baf_summary(tmp_path):
     assert baf_summary_df is not None
     assert baf_summary_df["sample"].tolist() == ["sample1"]
     assert normalization_metadata_df is None
+
+
+def test_main_runs_happy_path_and_writes_filtered_gd_table(tmp_path, monkeypatch):
+    class FakeTableLocus:
+        def __init__(self, breakpoints):
+            self.breakpoints = breakpoints
+            self.n_breakpoints = len(breakpoints)
+
+    class FakeGDTable:
+        def __init__(self, path):
+            self.path = path
+            self.loci = {
+                "standalone-key": FakeTableLocus([(100, 100), (200, 200)]),
+                "cluster_keep": FakeTableLocus([(300, 300), (400, 400), (500, 500)]),
+            }
+            self.df = pd.DataFrame([
+                {
+                    "cluster": np.nan,
+                    "chr": "chr1",
+                    "start_GRCh38": 100,
+                    "end_GRCh38": 200,
+                    "GD_ID": "GD_STANDALONE",
+                    "svtype": "DEL",
+                    "NAHR": "yes",
+                    "terminal": "no",
+                    "BP1": "1",
+                    "BP2": "2",
+                },
+                {
+                    "cluster": "cluster_keep",
+                    "chr": "chr1",
+                    "start_GRCh38": 300,
+                    "end_GRCh38": 400,
+                    "GD_ID": "GD_KEEP",
+                    "svtype": "DUP",
+                    "NAHR": "yes",
+                    "terminal": "no",
+                    "BP1": "2",
+                    "BP2": "3",
+                },
+                {
+                    "cluster": "cluster_drop",
+                    "chr": "chr2",
+                    "start_GRCh38": 500,
+                    "end_GRCh38": 600,
+                    "GD_ID": "GD_DROP",
+                    "svtype": "DEL",
+                    "NAHR": "yes",
+                    "terminal": "no",
+                    "BP1": "1",
+                    "BP2": "2",
+                },
+            ])
+
+        @staticmethod
+        def _standalone_locus_key(row):
+            return "standalone-key"
+
+    args = SimpleNamespace(
+        exclusion_intervals=[["exc1.bed"], ["exc2.bed"]],
+        flank_exclusion_intervals=[["flank.bed"]],
+        par_intervals=[["par.bed"]],
+        hard_inclusion_intervals=[["hard.bed"]],
+        verbose=True,
+        output_dir=str(tmp_path),
+        gd_table="gd_table.tsv",
+        input="input.tsv.gz",
+        median_min=1.0,
+        median_max=3.0,
+        mad_max=0.2,
+        high_res_counts="highres.tsv.gz",
+        regions=["chr1:100-300"],
+        exclusion_threshold=0.25,
+        locus_padding=50,
+        min_bins_per_interval=3,
+        max_bins_per_interval=5,
+        exclusion_bypass_threshold=0.9,
+        min_rebin_coverage=0.6,
+        min_flank_bases=100,
+        max_flank_bases=1000,
+        min_flank_bins=2,
+        min_flank_coverage=0.2,
+        baf_table="baf.tsv.gz",
+    )
+
+    mask_calls = []
+    baf_calls = []
+    metadata_calls = []
+
+    monkeypatch.setattr(preprocess_module, "parse_args", lambda: args)
+    monkeypatch.setattr(preprocess_module, "setup_logging", lambda *args, **kwargs: None)
+    monkeypatch.setattr(preprocess_module, "GDTable", FakeGDTable)
+    monkeypatch.setattr(preprocess_module, "validate_gd_table_for_preprocess", lambda gd_table: None)
+    monkeypatch.setattr(
+        preprocess_module,
+        "ExclusionMask",
+        lambda paths, label: mask_calls.append((tuple(paths), label)) or {"paths": tuple(paths), "label": label},
+    )
+
+    input_df = pd.DataFrame(
+        {
+            "Chr": ["chr1", "chr1"],
+            "Start": [100, 200],
+            "End": [150, 250],
+            "sample1": [10.0, 30.0],
+            "sample2": [20.0, 40.0],
+        }
+    )
+    monkeypatch.setattr(preprocess_module, "read_data", lambda path: input_df.copy())
+    monkeypatch.setattr(preprocess_module, "get_sample_columns", lambda df: ["sample1", "sample2"])
+    monkeypatch.setattr(preprocess_module, "estimate_ploidy", lambda df, output_dir: pd.DataFrame([{"sample": "sample1"}]))
+    monkeypatch.setattr(
+        preprocess_module,
+        "build_ploidy_map",
+        lambda ploidy_df: {("sample1", "chr1"): 2, ("sample2", "chr1"): 2},
+    )
+    monkeypatch.setattr(preprocess_module, "filter_low_quality_bins", lambda df, **kwargs: df.copy())
+
+    combined_df = pd.DataFrame(
+        [{"Chr": "chr1", "Start": 100, "End": 150, "sample1": 1.0, "sample2": 2.0}]
+    )
+    mappings = [
+        preprocess_module.LocusBinMapping(
+            cluster="standalone-key",
+            locus=None,
+            interval_name="body",
+            array_idx=0,
+            chrom="chr1",
+            start=100,
+            end=150,
+        )
+    ]
+    monkeypatch.setattr(
+        preprocess_module,
+        "collect_all_locus_bins",
+        lambda *args, **kwargs: (combined_df.copy(), mappings, {"standalone-key": object(), "cluster_keep": object()}),
+    )
+    monkeypatch.setattr(
+        preprocess_module,
+        "build_normalization_metadata",
+        lambda sample_ids, column_medians, reference_bin_size: metadata_calls.append(
+            (list(sample_ids), column_medians.tolist(), reference_bin_size)
+        ) or pd.DataFrame([{"sample": "sample1", "raw_count_median": 20.0, "reference_bin_size": 50.0}]),
+    )
+    monkeypatch.setattr(preprocess_module, "write_preprocessed_bins", lambda *args, **kwargs: str(tmp_path / "preprocessed_bins.tsv.gz"))
+    monkeypatch.setattr(preprocess_module, "write_normalization_metadata", lambda *args, **kwargs: str(tmp_path / "normalization_metadata.tsv"))
+    monkeypatch.setattr(preprocess_module, "write_locus_metadata", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        preprocess_module,
+        "write_preprocessed_baf",
+        lambda baf_path, mappings_arg, output_dir, ploidy_map=None: baf_calls.append(
+            (baf_path, len(mappings_arg), output_dir, dict(ploidy_map))
+        ) or str(tmp_path / "preprocessed_baf.tsv.gz"),
+    )
+
+    preprocess_module.main()
+
+    assert preprocess_module._util.VERBOSE is True
+    assert mask_calls == [
+        (("exc1.bed", "exc2.bed"), "exclusion regions"),
+        (("flank.bed",), "flank exclusion regions"),
+        (("par.bed",), "pseudoautosomal intervals"),
+        (("hard.bed",), "hard inclusion regions"),
+    ]
+    assert metadata_calls == [(["sample1", "sample2"], [20.0, 30.0], 50.0)]
+    assert baf_calls == [(
+        "baf.tsv.gz",
+        1,
+        str(tmp_path),
+        {("sample1", "chr1"): 2, ("sample2", "chr1"): 2},
+    )]
+
+    filtered_gd_df = pd.read_csv(tmp_path / "gd_table_filtered.tsv", sep="\t")
+    assert filtered_gd_df["GD_ID"].tolist() == ["GD_STANDALONE", "GD_KEEP"]
+
+
+def test_main_requires_par_intervals_when_chr_x_bins_are_present(tmp_path, monkeypatch):
+    class FakeGDTable:
+        def __init__(self, path):
+            self.loci = {"cluster1": SimpleNamespace(breakpoints=[(1, 1)], n_breakpoints=1)}
+
+    args = SimpleNamespace(
+        exclusion_intervals=[],
+        flank_exclusion_intervals=[],
+        par_intervals=[],
+        hard_inclusion_intervals=[],
+        verbose=False,
+        output_dir=str(tmp_path),
+        gd_table="gd_table.tsv",
+        input="input.tsv.gz",
+        median_min=1.0,
+        median_max=3.0,
+        mad_max=0.2,
+        high_res_counts=None,
+        regions=None,
+        exclusion_threshold=0.25,
+        locus_padding=0,
+        min_bins_per_interval=1,
+        max_bins_per_interval=0,
+        exclusion_bypass_threshold=1.0,
+        min_rebin_coverage=0.5,
+        min_flank_bases=10,
+        max_flank_bases=100,
+        min_flank_bins=1,
+        min_flank_coverage=0.0,
+        baf_table=None,
+    )
+
+    monkeypatch.setattr(preprocess_module, "parse_args", lambda: args)
+    monkeypatch.setattr(preprocess_module, "setup_logging", lambda *args, **kwargs: None)
+    monkeypatch.setattr(preprocess_module, "GDTable", FakeGDTable)
+    monkeypatch.setattr(preprocess_module, "validate_gd_table_for_preprocess", lambda gd_table: None)
+    monkeypatch.setattr(
+        preprocess_module,
+        "read_data",
+        lambda path: pd.DataFrame(
+            {"Chr": ["chrX"], "Start": [100], "End": [150], "sample1": [10.0]}
+        ),
+    )
+    monkeypatch.setattr(preprocess_module, "get_sample_columns", lambda df: ["sample1"])
+
+    with pytest.raises(ValueError, match="--par-intervals"):
+        preprocess_module.main()
+
+
+def test_main_rejects_empty_preprocessed_output(tmp_path, monkeypatch):
+    class FakeGDTable:
+        def __init__(self, path):
+            self.loci = {"cluster1": SimpleNamespace(breakpoints=[(1, 1)], n_breakpoints=1)}
+
+    args = SimpleNamespace(
+        exclusion_intervals=[],
+        flank_exclusion_intervals=[],
+        par_intervals=[["par.bed"]],
+        hard_inclusion_intervals=[],
+        verbose=False,
+        output_dir=str(tmp_path),
+        gd_table="gd_table.tsv",
+        input="input.tsv.gz",
+        median_min=1.0,
+        median_max=3.0,
+        mad_max=0.2,
+        high_res_counts=None,
+        regions=None,
+        exclusion_threshold=0.25,
+        locus_padding=0,
+        min_bins_per_interval=1,
+        max_bins_per_interval=0,
+        exclusion_bypass_threshold=1.0,
+        min_rebin_coverage=0.5,
+        min_flank_bases=10,
+        max_flank_bases=100,
+        min_flank_bins=1,
+        min_flank_coverage=0.0,
+        baf_table=None,
+    )
+
+    monkeypatch.setattr(preprocess_module, "parse_args", lambda: args)
+    monkeypatch.setattr(preprocess_module, "setup_logging", lambda *args, **kwargs: None)
+    monkeypatch.setattr(preprocess_module, "GDTable", FakeGDTable)
+    monkeypatch.setattr(preprocess_module, "validate_gd_table_for_preprocess", lambda gd_table: None)
+    monkeypatch.setattr(preprocess_module, "ExclusionMask", lambda *args, **kwargs: object())
+    monkeypatch.setattr(
+        preprocess_module,
+        "read_data",
+        lambda path: pd.DataFrame(
+            {"Chr": ["chr1"], "Start": [100], "End": [150], "sample1": [10.0]}
+        ),
+    )
+    monkeypatch.setattr(preprocess_module, "get_sample_columns", lambda df: ["sample1"])
+    monkeypatch.setattr(preprocess_module, "estimate_ploidy", lambda df, output_dir: pd.DataFrame([{"sample": "sample1"}]))
+    monkeypatch.setattr(preprocess_module, "build_ploidy_map", lambda ploidy_df: {("sample1", "chr1"): 2})
+    monkeypatch.setattr(preprocess_module, "filter_low_quality_bins", lambda df, **kwargs: df.copy())
+    monkeypatch.setattr(
+        preprocess_module,
+        "collect_all_locus_bins",
+        lambda *args, **kwargs: (pd.DataFrame(columns=["Chr", "Start", "End", "sample1"]), [], {}),
+    )
+
+    with pytest.raises(RuntimeError, match="No loci survived preprocessing"):
+        preprocess_module.main()
+
 
 
 def test_select_highres_interval_replacements_returns_only_improved_intervals():

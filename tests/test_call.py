@@ -4,6 +4,7 @@ import numpy as np
 import pandas as pd
 import pytest
 
+import gatk_sv_gd.call as call_module
 from gatk_sv_gd._util import (
     posterior_called_state_to_qual,
     posterior_probability_to_qual,
@@ -583,6 +584,105 @@ def test_parse_args_accepts_null_anomaly_threshold(monkeypatch):
     args = parse_args()
 
     assert args.null_anomaly_threshold == pytest.approx(0.2)
+
+
+def test_main_writes_call_outputs_and_reports_carriers(monkeypatch, tmp_path, capsys):
+    real_read_csv = pd.read_csv
+    args = type(
+        "Args",
+        (),
+        {
+            "cn_posteriors": "cn.tsv.gz",
+            "bin_mappings": "mappings.tsv.gz",
+            "gd_table": "gd.tsv",
+            "ploidy_table": "ploidy.tsv",
+            "output_dir": str(tmp_path),
+            "verbose": True,
+            "min_posterior_interval_confidence": 12.0,
+            "min_flank_non_event_confidence": 18.0,
+            "posterior_interval_bin_correlation": 0.25,
+            "null_anomaly_threshold": 0.2,
+        },
+    )()
+    cn_posteriors_df = pd.DataFrame({"cluster": ["c1"], "value": [1.0]})
+    bin_mappings_df = pd.DataFrame({"cluster": ["c1"], "interval": ["body"]})
+    ploidy_df = pd.DataFrame({"sample": ["S1"], "contig": ["chr1"], "ploidy": [2]})
+    calls_df = pd.DataFrame(
+        {
+            "sample": ["S1", "S2", "S3"],
+            "GD_ID": ["GD1", "GD2", "GD1"],
+            "is_carrier": [True, False, True],
+        }
+    )
+    event_marginals_df = pd.DataFrame({"cluster": ["c1"], "sample": ["S1"], "prob_del_event": [0.9]})
+    records = {}
+
+    def fake_read_csv(path, sep="\t", compression=None):
+        if path == "cn.tsv.gz":
+            return cn_posteriors_df.copy()
+        if path == "mappings.tsv.gz":
+            return bin_mappings_df.copy()
+        if path == "ploidy.tsv":
+            return ploidy_df.copy()
+        raise AssertionError(path)
+
+    def fake_call_cnvs_from_posteriors(*call_args, **call_kwargs):
+        records["call_args"] = (call_args, call_kwargs)
+        return calls_df.copy(), event_marginals_df.copy()
+
+    monkeypatch.setattr(call_module, "parse_args", lambda: args)
+    monkeypatch.setattr(call_module, "setup_logging", lambda *call_args, **call_kwargs: records.setdefault("logging", (call_args, call_kwargs)))
+    monkeypatch.setattr(call_module.pd, "read_csv", fake_read_csv)
+    monkeypatch.setattr(call_module, "GDTable", lambda path: type("GDTableStub", (), {"loci": {"c1": object(), "c2": object()}})())
+    monkeypatch.setattr(call_module, "call_cnvs_from_posteriors", fake_call_cnvs_from_posteriors)
+
+    call_module.main()
+
+    stdout = capsys.readouterr().out
+    assert "Loading CN posteriors" in stdout
+    assert "3 call records" in stdout
+    assert "2 carrier samples across 1 GD sites" in stdout
+    assert records["call_args"][1]["verbose"] is True
+    assert records["call_args"][1]["posterior_interval_bin_correlation"] == pytest.approx(0.25)
+
+    written_calls = real_read_csv(tmp_path / "gd_cnv_calls.tsv.gz", sep="\t", compression="gzip")
+    written_event_marginals = real_read_csv(tmp_path / "event_marginals.tsv.gz", sep="\t", compression="gzip")
+    pd.testing.assert_frame_equal(written_calls, calls_df)
+    pd.testing.assert_frame_equal(written_event_marginals, event_marginals_df)
+
+
+def test_main_reports_when_no_calls_are_produced(monkeypatch, tmp_path, capsys):
+    args = type(
+        "Args",
+        (),
+        {
+            "cn_posteriors": "cn.tsv.gz",
+            "bin_mappings": "mappings.tsv.gz",
+            "gd_table": "gd.tsv",
+            "ploidy_table": "ploidy.tsv",
+            "output_dir": str(tmp_path),
+            "verbose": False,
+            "min_posterior_interval_confidence": 12.0,
+            "min_flank_non_event_confidence": 18.0,
+            "posterior_interval_bin_correlation": 0.25,
+            "null_anomaly_threshold": 0.2,
+        },
+    )()
+
+    monkeypatch.setattr(call_module, "parse_args", lambda: args)
+    monkeypatch.setattr(call_module, "setup_logging", lambda *args, **kwargs: None)
+    monkeypatch.setattr(call_module.pd, "read_csv", lambda path, sep="\t", compression=None: pd.DataFrame({"placeholder": [1]}))
+    monkeypatch.setattr(call_module, "GDTable", lambda path: type("GDTableStub", (), {"loci": {"c1": object()}})())
+    monkeypatch.setattr(
+        call_module,
+        "call_cnvs_from_posteriors",
+        lambda *args, **kwargs: (pd.DataFrame(columns=["sample", "GD_ID", "is_carrier"]), pd.DataFrame(columns=["cluster"])),
+    )
+
+    call_module.main()
+
+    stdout = capsys.readouterr().out
+    assert "No calls produced" in stdout
 
 
 def test_score_call_from_posterior_marginals_fast_path_matches_default():
