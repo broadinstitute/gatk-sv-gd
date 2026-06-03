@@ -8,7 +8,6 @@ The package implements a structured, multi-stage workflow:
 
 ```text
 preprocess -> infer -> call -> plot -> eval -> aggregate
-
 ```
 
 ---
@@ -19,7 +18,6 @@ The package requires Python $\ge$ 3.9. Install the core library and dependencies
 
 ```bash
 python -m pip install .
-
 ```
 
 For developers using modern environments (`uv` or `pip` with PEP 660 support), editable development installations can be initiated via:
@@ -28,7 +26,6 @@ For developers using modern environments (`uv` or `pip` with PEP 660 support), e
 uv pip install -e '.[dev]'
 # or
 python -m pip install -e '.[dev]'
-
 ```
 
 ### Primary Dependencies
@@ -79,25 +76,71 @@ Standard three-column (`chrom`, `start`, `end`) plain text or gzip-compressed fi
 
 ---
 
+## Reference Resources
+
+All hg38 reference files required to run `gatk-sv-gd` are listed in [`resources.json`](resources.json) and are publicly available in Google Cloud Storage. No authentication is required.
+
+| Key | Description | `run_gd.sh` flag |
+|---|---|---|
+| `gd_table` | Genomic disorder locus definitions | `--gd-table` |
+| `segdup_bed` | Segmental duplication intervals | `--segdup-bed`, `--flank-exclusion-interval` |
+| `centromere_intervals` | Centromere intervals | `--centromere-bed` |
+| `acrocentric_intervals` | Acrocentric arm intervals | `--acrocentric-arm-bed` |
+| `gaps_bed` | Reference assembly gap intervals | `--gaps-bed` |
+| `par_intervals` | Pseudoautosomal region intervals | `--par-bed` |
+| `custom_mask` | GD-specific depth mask | `--custom-mask-bed` |
+| `inclusion_intervals` | Hard-inclusion intervals (bypass quality filter) | `--hard-inclusion-bed` |
+| `gtf` | Gene annotations (Gencode v47, protein-coding) | `--gtf` |
+
+### Downloading resources
+
+Download all resources to a local directory with `gsutil`:
+
+```bash
+RESOURCES_DIR="gd_resources"
+mkdir -p "${RESOURCES_DIR}"
+
+gsutil cp \
+  gs://gatk-sv-resources-public/hg38/v0/sv-resources/resources/v1/gd/GenomicDisorderRegions_hg38_2025-12-05.with_bp.tsv \
+  gs://gatk-sv-resources-public/hg38/v0/sv-resources/resources/v1/gd/hg38_GD_custom_mask.bed \
+  gs://gatk-sv-resources-public/hg38/v0/sv-resources/resources/v1/gd/hg38_GD_inclusion_intervals.bed \
+  gs://gatk-sv-resources-public/hg38/v0/sv-resources/resources/v1/gd/hg38_SD.bed.gz \
+  gs://gatk-sv-resources-public/hg38/v0/sv-resources/resources/v1/gd/hg38_acrocentric_arms.bed \
+  gs://gatk-sv-resources-public/hg38/v0/sv-resources/resources/v1/gd/hg38_centromeres.bed \
+  gs://gatk-sv-resources-public/hg38/v0/sv-resources/resources/v1/gd/hg38_gap.bed \
+  gs://gatk-sv-resources-public/hg38/v0/sv-resources/resources/v1/hg38.par.bed \
+  gs://gatk-sv-resources-public/hg38/v0/sv-resources/resources/v1/gencode.v47.basic.protein_coding.canonical.gtf \
+  "${RESOURCES_DIR}/"
+```
+
+---
+
 ## Workflow Execution & Commands
 
 ### End-to-End Local Execution
 
-For streamlined evaluation on smaller cohorts, the repository bundles `run_gd.sh`, which executes the entire sequence locally, outputting directory trees for each individual phase under a designated workspace:
+For streamlined evaluation on smaller cohorts, the repository bundles `run_gd.sh`, which executes the entire sequence locally, outputting directory trees for each individual phase under a designated workspace.
+
+After downloading the reference resources (see [Reference Resources](#reference-resources) above), run:
 
 ```bash
+RESOURCES_DIR="gd_resources"  # directory where resources were downloaded
+
 ./run_gd.sh \
   --work-dir gd_work \
   --input-depth counts.tsv.gz \
-  --gd-table gd_table.tsv \
-  --segdup-bed segdups.bed.gz \
-  --centromere-bed centromeres.bed.gz \
-  --par-bed par.hg38.bed \
+  --gd-table "${RESOURCES_DIR}/GenomicDisorderRegions_hg38_2025-12-05.with_bp.tsv" \
+  --segdup-bed "${RESOURCES_DIR}/hg38_SD.bed.gz" \
+  --flank-exclusion-interval "${RESOURCES_DIR}/hg38_SD.bed.gz" \
+  --centromere-bed "${RESOURCES_DIR}/hg38_centromeres.bed" \
+  --acrocentric-arm-bed "${RESOURCES_DIR}/hg38_acrocentric_arms.bed" \
+  --gaps-bed "${RESOURCES_DIR}/hg38_gap.bed" \
+  --par-bed "${RESOURCES_DIR}/hg38.par.bed" \
+  --custom-mask-bed "${RESOURCES_DIR}/hg38_GD_custom_mask.bed" \
+  --hard-inclusion-bed "${RESOURCES_DIR}/hg38_GD_inclusion_intervals.bed" \
+  --gtf "${RESOURCES_DIR}/gencode.v47.basic.protein_coding.canonical.gtf" \
   --baf-table all_samples.baf.txt.gz \
-  --high-res-counts highres.rd.txt.gz \
-  --gtf genes.gtf.gz \
-  --gaps-bed gaps.bed.gz
-
+  --high-res-counts highres.rd.txt.gz
 ```
 
 Stage-specific parameters can be customized and appended to this wrapper script using the `--preprocess-args`, `--infer-args`, `--call-args`, `--eval-args`, and `--plot-args` flags.
@@ -111,15 +154,22 @@ For large multi-sample cohorts, execute data filtering and interval extraction o
 Normalizes coverage inputs, maps chromosomal ploidies, filters poor-performing bins using a ploidy-aware median/MAD mask, computes optimal dynamic flank sizes, and handles high-resolution interval substitutions.
 
 ```bash
+RESOURCES_DIR="gd_resources"  # directory where resources were downloaded
+
 gatk-sv-gd preprocess \
   --input counts.tsv.gz \
-  --gd-table gd_table.tsv \
-  --exclusion-intervals segdups.bed.gz centromeres.bed.gz \
-  --flank-exclusion-intervals problematic_flanks.bed.gz \
-  --par-intervals par.hg38.bed \
+  --gd-table "${RESOURCES_DIR}/GenomicDisorderRegions_hg38_2025-12-05.with_bp.tsv" \
+  --exclusion-intervals \
+    "${RESOURCES_DIR}/hg38_SD.bed.gz" \
+    "${RESOURCES_DIR}/hg38_centromeres.bed" \
+    "${RESOURCES_DIR}/hg38_acrocentric_arms.bed" \
+    "${RESOURCES_DIR}/hg38_GD_custom_mask.bed" \
+  --flank-exclusion-intervals "${RESOURCES_DIR}/hg38_SD.bed.gz" \
+  --hard-inclusion-intervals "${RESOURCES_DIR}/hg38_GD_inclusion_intervals.bed" \
+  --par-intervals "${RESOURCES_DIR}/hg38.par.bed" \
   --baf-table all_samples.baf.txt.gz \
+  --high-res-counts highres.rd.txt.gz \
   --output-dir preprocessed
-
 ```
 
 *Note: If specific target bins must bypass quality and exclusion filtering to guarantee spatial continuity, pass their coordinates via `--hard-inclusion-intervals`. If chrX bins are present, `--par-intervals` must be provided to accurately isolate pseudoautosomal segments.*
@@ -133,7 +183,6 @@ gatk-sv-gd infer \
   --preprocessed-dir preprocessed \
   --output-dir inference \
   --device cpu
-
 ```
 
 #### Step 3: Genotype & Call Carriers
@@ -147,13 +196,11 @@ gatk-sv-gd call \
   --gd-table preprocessed/gd_table_filtered.tsv \
   --ploidy-table preprocessed/ploidy_estimates.tsv \
   --output-dir calls
-
 ```
 
 ##### Supported Calling Modes
 
 * **`posterior-marginal` (Default):** Direct scoring from pair-state posterior marginals. Converts posterior mass into signed, Phred-like QUAL values using a correlation-adjusted effective independent bin penalty to neutralize counting inflation. It enforces a flank non-event check to discard broad, cross-locus megabase alterations.
-* **`viterbi`:** Smooth segmentation using hidden Markov model transition matrices. Applies custom breakpoint transition overrides to favor structural state changes directly at annotated interval boundaries.
 
 #### Step 4: Visualize Regional Diagnostics
 
@@ -166,13 +213,11 @@ gatk-sv-gd plot \
   --sample-posteriors inference/sample_posteriors.tsv.gz \
   --gd-table preprocessed/gd_table_filtered.tsv \
   --ploidy-table preprocessed/ploidy_estimates.tsv \
-  --viterbi-paths calls/viterbi_paths.tsv.gz \
   --event-marginals calls/event_marginals.tsv.gz \
-  --gtf genes.gtf.gz \
-  --segdup-bed segdups.bed.gz \
-  --gaps-bed gaps.bed.gz \
+  --gtf "${RESOURCES_DIR}/gencode.v47.basic.protein_coding.canonical.gtf" \
+  --segdup-bed "${RESOURCES_DIR}/hg38_SD.bed.gz" \
+  --gaps-bed "${RESOURCES_DIR}/hg38_gap.bed" \
   --output-dir plots
-
 ```
 
 #### Step 5: Cohort Aggregation and Reporting
@@ -183,7 +228,6 @@ Compiles multiple discrete run folders into a global cohort PDF report and machi
 gatk-sv-gd aggregate gd_work_a gd_work_b \
   --output-dir aggregate \
   --min-confidence 0.5
-
 ```
 
 ---
@@ -206,12 +250,52 @@ gatk-sv-gd synthesize \
   --gd-probability 0.5 \
   --seed 42 \
   --output-dir synthetic
-
 ```
 
 ### Truth-Set Evaluation
 
-The `eval` module scores called carrier tables against a synthetic coordinate manifest or a standard BED-style curated truth log. It evaluates accuracy overall and per individual `GD_ID`. It outputs a comprehensive metric report containing calculated sensitivities, precisions, true/false positive breakdowns, and sample discrepancies.
+The `eval` module scores called carrier tables against a truth table and reports sensitivity, precision, TP/FP/FN counts, and sample-level discrepancies overall and per `GD_ID`. Two truth table formats are accepted and auto-detected from the header.
+
+#### Format 1: BED-style (manually curated)
+
+Tab-separated, one row per carrier event. A leading `#` on the header is stripped automatically.
+
+| Column | Description |
+|---|---|
+| `chrom` | Chromosome (e.g. `chr15`) |
+| `start` | 0-based start coordinate |
+| `end` | End coordinate |
+| `name` | GD identifier — matched against `GD_ID` in the calls table |
+| `svtype` | `DEL` or `DUP` |
+| `samples` | Comma-separated list of carrier sample IDs |
+| `NAHR_GD` | `True` / `False` — only `True` rows are evaluated |
+| `NAHR_GD_atypical` | `True` / `False` — `True` rows are excluded before scoring |
+
+Example:
+
+```
+#chrom	start	end	name	svtype	samples	NAHR_GD	NAHR_GD_atypical
+chr15	22800000	28500000	15q11.2_BP1-BP2_DEL	DEL	SAMPLE_A,SAMPLE_B	True	False
+chr15	28500000	30100000	15q11.2_BP2-BP3_DUP	DUP	SAMPLE_C	True	False
+```
+
+#### Format 2: Synthesize format (output of `gatk-sv-gd synthesize`)
+
+Tab-separated, one row per carrier sample. All rows are used as-is with no NAHR filtering.
+
+| Column | Description |
+|---|---|
+| `sample_id` | Sample identifier |
+| `GD_ID` | GD identifier — matched against `GD_ID` in the calls table |
+
+Example:
+
+```
+sample_id	GD_ID
+SAMPLE_A	15q11.2_BP1-BP2_DEL
+SAMPLE_B	15q11.2_BP1-BP2_DEL
+SAMPLE_C	15q11.2_BP2-BP3_DUP
+```
 
 ```bash
 gatk-sv-gd eval \
@@ -220,7 +304,6 @@ gatk-sv-gd eval \
   --gd-table preprocessed/gd_table_filtered.tsv \
   --ploidy-table preprocessed/ploidy_estimates.tsv \
   --output-dir evaluation
-
 ```
 
 ---
@@ -239,7 +322,6 @@ The package optimizes a hierarchical Bayesian network implemented via the Pyro p
 
 ```text
 (0,0), (0,1), (0,2), (1,1), (1,2), (2,2)
-
 ```
 
 For a genomic bin $b$ and sample $s$, the latent copy state $z_{b,s}$ is drawn from a shared bin-specific prior. Let $d_{b,s}$ denote the observed read depth. It is modeled conditionally as:
