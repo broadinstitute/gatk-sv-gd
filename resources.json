@@ -1,0 +1,9 @@
+{
+	"gd_table": "gs://gatk-sv-resources-public/hg38/v0/sv-resources/resources/v1/gd/GenomicDisorderRegions_hg38_2025-12-05.with_bp.tsv",
+	"custom_mask": "gs://gatk-sv-resources-public/hg38/v0/sv-resources/resources/v1/gd/hg38_GD_custom_mask.bed",
+	"inclusion_intervals": "gs://gatk-sv-resources-public/hg38/v0/sv-resources/resources/v1/gd/hg38_GD_inclusion_intervals.bed",
+	"acrocentric_intervals": "gs://gatk-sv-resources-public/hg38/v0/sv-resources/resources/v1/gd/hg38_acrocentric_arms.bed",
+	"centromere_intervals": "gs://gatk-sv-resources-public/hg38/v0/sv-resources/resources/v1/gd/hg38_centromeres.bed",
+	"par_intervals": "gs://gatk-sv-resources-public/hg38/v0/sv-resources/resources/v1/hg38.par.bed",
+	"gtf": "gs://gatk-sv-resources-public/hg38/v0/sv-resources/resources/v1/gencode.v47.basic.protein_coding.canonical.gtf"
+}
