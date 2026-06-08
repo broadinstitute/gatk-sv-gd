@@ -236,6 +236,14 @@ def run_gd_analysis(
     if preprocessed_baf_summary is not None:
         combined_data.attach_baf_summary(preprocessed_baf_summary, mappings)
 
+    # GC content: loaded from gc_fraction column (computed via --ref-fasta in preprocess)
+    if "gc_fraction" in combined_df.columns:
+        gc_values = combined_df["gc_fraction"].values.astype(np.float32)
+        # Replace NaN with 0 (neutral after centering)
+        gc_values = np.nan_to_num(gc_values, nan=0.0)
+        combined_data.attach_gc_content(gc_values)
+        print("  Loaded gc_fraction from preprocessed bins")
+
     sample_raw_count_medians, reference_bin_size = _align_normalization_metadata(
         normalization_metadata,
         combined_data.sample_ids,

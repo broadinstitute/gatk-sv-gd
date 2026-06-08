@@ -610,6 +610,46 @@ def _json_safe(value: Any) -> Any:
     return str(value)
 
 
+# ── Genomic interval overlap helpers ────────────────────────────────
+
+
+def overlap_bases(a_start: int, a_end: int, b_start: int, b_end: int) -> int:
+    """Return the number of overlapping bases between two intervals."""
+    return max(0, min(a_end, b_end) - max(a_start, b_start))
+
+
+def reciprocal_overlap(
+    a_start: int, a_end: int, b_start: int, b_end: int
+) -> float:
+    """Return the reciprocal overlap: overlap / max(len_a, len_b).
+
+    Returns 0.0 if either interval is zero-length.
+    """
+    ovl = overlap_bases(a_start, a_end, b_start, b_end)
+    if ovl == 0:
+        return 0.0
+    max_len = max(a_end - a_start, b_end - b_start)
+    if max_len <= 0:
+        return 0.0
+    return ovl / max_len
+
+
+def fraction_covered(
+    region_start: int, region_end: int, query_start: int, query_end: int
+) -> float:
+    """Return the fraction of *region* covered by *query*.
+
+    Returns 0.0 if the region is zero-length.
+    """
+    region_len = region_end - region_start
+    if region_len <= 0:
+        return 0.0
+    return (
+        overlap_bases(region_start, region_end, query_start, query_end)
+        / region_len
+    )
+
+
 def get_sample_columns(df: pd.DataFrame) -> list:
     """
     Extract sample column names from a DataFrame by excluding metadata columns.
@@ -620,6 +660,6 @@ def get_sample_columns(df: pd.DataFrame) -> list:
     Returns:
         List of sample column names
     """
-    metadata_cols = ["Chr", "Start", "End", "source_file"]
+    metadata_cols = ["Chr", "Start", "End", "gc_fraction", "source_file"]
     sample_cols = [col for col in df.columns if col not in metadata_cols]
     return sample_cols

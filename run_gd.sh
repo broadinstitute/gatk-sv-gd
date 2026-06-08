@@ -3,7 +3,7 @@ set -euo pipefail
 
 usage() {
     cat >&2 <<'EOF'
-Usage: run_gd.sh --work-dir DIR --input-depth FILE --gd-table FILE [options]
+Usage: run_gd.sh --work-dir DIR --input-depth FILE --gd-table FILE --ref-fasta FILE [options]
 
 Runs preprocess, infer, call, optional eval, and plot with the gatk-sv-gd CLI.
 
@@ -11,6 +11,7 @@ Required arguments:
 --work-dir DIR
 --input-depth FILE
 --gd-table FILE
+--ref-fasta FILE                   Indexed reference FASTA for GC fraction computation
 
 Optional data inputs:
 --high-res-counts FILE             Optional bgzipped tabix-indexed high-res counts
@@ -62,6 +63,7 @@ INPUT_DEPTH=""
 HIGH_RESOLUTION_DEPTH=""
 BAF_TABLE=""
 GD_TABLE=""
+REF_FASTA=""
 SEG_DUP_BED=""
 CENTROMERE_BED=""
 ACROCENTRIC_ARM_BED=""
@@ -99,6 +101,10 @@ while [[ $# -gt 0 ]]; do
             ;;
         --baf-table)
             BAF_TABLE="$2"
+            shift 2
+            ;;
+        --ref-fasta)
+            REF_FASTA="$2"
             shift 2
             ;;
         --gd-table)
@@ -212,6 +218,7 @@ fi
 require_arg "${WORK_DIR}" "--work-dir"
 require_arg "${INPUT_DEPTH}" "--input-depth"
 require_arg "${GD_TABLE}" "--gd-table"
+require_arg "${REF_FASTA}" "--ref-fasta"
 
 # ── Directories ────────────────────────────────────────────────────────────
 PREPROCESS_DIR="${WORK_DIR}/preprocess"
@@ -228,6 +235,7 @@ SAMPLE_POSTERIORS="${INFER_DIR}/sample_posteriors.tsv.gz"
 GD_CALLS="${CALL_DIR}/gd_cnv_calls.tsv.gz"
 EVENT_MARGINALS="${CALL_DIR}/event_marginals.tsv.gz"
 PLOIDY_TABLE="${PREPROCESS_DIR}/ploidy_estimates.tsv"
+PREPROCESSED_BINS="${PREPROCESS_DIR}/preprocessed_bins.tsv.gz"
 EVAL_REPORT="${EVAL_DIR}/truth_evaluation_report.tsv"
 
 mkdir -p "${WORK_DIR}"
@@ -251,6 +259,8 @@ fi
 if [[ -n "${BAF_TABLE}" ]]; then
     PREPROCESS_CMD+=(--baf-table "${BAF_TABLE}")
 fi
+
+PREPROCESS_CMD+=(--ref-fasta "${REF_FASTA}")
 
 if [[ -n "${SEG_DUP_BED}" ]]; then
     PREPROCESS_CMD+=(-e "${SEG_DUP_BED}")
@@ -369,6 +379,7 @@ PLOT_CMD=(
     -o "${PLOT_DIR}"
     --ploidy-table "${PLOIDY_TABLE}"
     --event-marginals "${EVENT_MARGINALS}"
+    --preprocessed-bins "${PREPROCESSED_BINS}"
 )
 
 if [[ -n "${HIGH_RESOLUTION_DEPTH}" ]]; then

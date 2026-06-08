@@ -26,7 +26,12 @@ from typing import Dict, List, Optional, Set, Tuple
 
 import pysam
 
-from gatk_sv_gd._util import setup_logging
+from gatk_sv_gd._util import (
+    fraction_covered as _fraction_covered_shared,
+    overlap_bases as _overlap_bases_shared,
+    reciprocal_overlap as _reciprocal_overlap_shared,
+    setup_logging,
+)
 from gatk_sv_gd.models import GDTable
 
 # ── INFO header definitions ──────────────────────────────────────────
@@ -44,37 +49,11 @@ _GD_INFO_KEYS = frozenset({"GD", "NAHR_GD", "NON_NAHR_GD", "NAHR_GD_atypical"})
 # ── Overlap helpers ──────────────────────────────────────────────────
 
 
-def _overlap_bases(a_start: int, a_end: int, b_start: int, b_end: int) -> int:
-    """Return the number of overlapping bases between two intervals."""
-    return max(0, min(a_end, b_end) - max(a_start, b_start))
-
-
-def _reciprocal_overlap(
-    a_start: int, a_end: int, b_start: int, b_end: int
-) -> float:
-    """Return the reciprocal overlap: overlap / max(len_a, len_b).
-
-    Both intervals must individually cover at least this fraction of the
-    *larger* interval for the threshold to be met — equivalent to requiring
-    both fractional overlaps to pass simultaneously.
-    """
-    ovl = _overlap_bases(a_start, a_end, b_start, b_end)
-    if ovl == 0:
-        return 0.0
-    max_len = max(a_end - a_start, b_end - b_start)
-    if max_len <= 0:
-        return 0.0
-    return ovl / max_len
-
-
-def _fraction_covered(
-    region_start: int, region_end: int, query_start: int, query_end: int
-) -> float:
-    """Fraction of *region* covered by *query*."""
-    region_len = region_end - region_start
-    if region_len <= 0:
-        return 0.0
-    return _overlap_bases(region_start, region_end, query_start, query_end) / region_len
+# Thin aliases to shared helpers in _util — kept for backward compat with
+# tests and any external code that references extract._overlap_bases etc.
+_overlap_bases = _overlap_bases_shared
+_reciprocal_overlap = _reciprocal_overlap_shared
+_fraction_covered = _fraction_covered_shared
 
 
 # ── Annotation logic ────────────────────────────────────────────────

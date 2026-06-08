@@ -14,6 +14,7 @@ import numpy as np
 import pandas as pd
 import torch
 from intervaltree import IntervalTree
+from scipy.special import gammaln
 
 import pyro
 import pyro.distributions as dist
@@ -665,6 +666,7 @@ class DepthData:
         self.has_baf = False
         self.has_baf_effective_count = False
         self.sample_ploidy = None
+        self.gc_content = None
 
     def attach_baf_summary(self, baf_summary_df: pd.DataFrame, mappings) -> None:
         """Attach per-bin, per-sample BAF summaries to this data object.
@@ -792,6 +794,41 @@ class DepthData:
             f"{self.n_bins:,} bins x {self.n_samples:,} samples"
         )
 
+    def attach_gc_content(self, gc_fraction: np.ndarray) -> None:
+        """Attach per-bin GC fraction and mean-center it.
+
+        The GC fraction array is converted to a torch tensor of shape
+        ``(n_bins, 1)`` for broadcasting over samples.  Values are
+        mean-centered by subtracting the global mean so that the GC
+        bias slope acts as a zero-centered perturbation around the
+        population average.
+
+        Args:
+            gc_fraction: 1-D numpy array of GC fractions in [0, 1],
+                one value per bin, aligned to ``self.depth`` rows.
+        """
+        if gc_fraction is None:
+            return
+
+        gc_fraction = np.asarray(gc_fraction, dtype=np.float32)
+        if gc_fraction.shape[0] != self.n_bins:
+            raise ValueError(
+                f"gc_fraction length ({gc_fraction.shape[0]}) does not match "
+                f"number of bins ({self.n_bins})"
+            )
+
+        # Mean-center so that the bias slope is a zero-centered perturbation
+        mean_gc = float(np.mean(gc_fraction))
+        centered = gc_fraction - mean_gc
+        self.gc_content = torch.tensor(
+            centered, dtype=self.depth.dtype, device=self.depth.device
+        ).unsqueeze(-1)  # (n_bins, 1)
+        print(
+            f"Attached GC content: {self.n_bins:,} bins, "
+            f"raw mean={mean_gc:.4f}, centered range="
+            f"[{self.gc_content.min():.4f}, {self.gc_content.max():.4f}]"
+        )
+
 
 class CNVModel:
     """
@@ -802,7 +839,7 @@ class CNVModel:
     - Per-bin mean bias: modulates expected depth at each bin
     - Per-sample variance: controls noise in each sample
     - Per-bin variance: controls noise at each bin
-    - Observed depth ~ Normal(CN * sample_mean * bin_bias, variance)
+    - Observed depth ~ StudentT(df, CN * sample_mean * bin_bias, variance)
     """
 
     def __init__(
@@ -1032,7 +1069,9 @@ class CNVModel:
         if not self.freeze_bin_bias:
             self.latent_sites.append("bin_bias")
         self.latent_sites.append("sample_var")
+        self.latent_sites.append("sample_df")
         self.latent_sites.append("length_scale_var")
+        self.latent_sites.append("sample_gc_bias")
         if self.learn_baf_temperature:
             self.latent_sites.append("baf_temperature")
         if not self.freeze_pair_state_priors:
@@ -1095,6 +1134,7 @@ class CNVModel:
             interval_sizes=data.interval_sizes,
             n_bins=data.n_bins,
             n_samples=data.n_samples,
+            gc_content=getattr(data, "gc_content", None),
         )
         return {
             site_name: guide_trace.nodes[site_name]["value"].detach().clone()
@@ -1166,6 +1206,7 @@ class CNVModel:
                 interval_sizes=data.interval_sizes,
                 n_bins=data.n_bins,
                 n_samples=data.n_samples,
+                gc_content=getattr(data, "gc_content", None),
             )
             scheduler.step()
 
@@ -1408,7 +1449,7 @@ class CNVModel:
         return np.transpose(reference_probs, (2, 0, 1))
 
     @config_enumerate(default="parallel")
-    def model(self, depth: torch.Tensor, interval_sizes: torch.Tensor, n_bins: int = None, n_samples: int = None):
+    def model(self, depth: torch.Tensor, interval_sizes: torch.Tensor, n_bins: int = None, n_samples: int = None, gc_content: torch.Tensor = None):
         """
         Probabilistic model for CNV detection.
 
@@ -1436,6 +1477,13 @@ class CNVModel:
         with plate_samples:
             sample_var = pyro.sample(
                 "sample_var", dist.Exponential(self._sample_var_rate_t)
+            )
+            sample_df = pyro.sample(
+                "sample_df", dist.Gamma(torch.tensor(2.0, device=self.device), torch.tensor(0.2, device=self.device))
+            )
+            # Sample-specific GC bias slope — modulates expected depth via GC content
+            sample_gc_bias = pyro.sample(
+                "sample_gc_bias", dist.Normal(0.0, 1.0)
             )
         length_scale_var = pyro.sample(
             "length_scale_var",
@@ -1492,6 +1540,10 @@ class CNVModel:
                 print(f"bin_bias.shape: {bin_bias.shape}")
             expected_total_cn = Vindex(self.total_cn_by_state)[pair_state]
             expected_depth = expected_total_cn * bin_bias
+            # GC bias modulation: depth *= exp(gc_content * sample_gc_bias)
+            if gc_content is not None:
+                gc_mod = torch.exp(gc_content * sample_gc_bias)
+                expected_depth = expected_depth * gc_mod
             min_variance_expected_depth = getattr(self, "min_variance_expected_depth", 0.0)
             if self.debug:
                 print(f"expected_depth.shape: {expected_depth.shape}")
@@ -1532,7 +1584,7 @@ class CNVModel:
                 print(
                     f"About to sample obs with expected_depth.shape={expected_depth.shape}, std.shape={std.shape}, depth.shape={depth.shape}"
                 )
-            pyro.sample("obs", dist.Normal(expected_depth, std), obs=depth)
+            pyro.sample("obs", dist.StudentT(sample_df, expected_depth, std), obs=depth)
 
             # Optional BAF observation on the minor-allele fraction.
             # The observed variance is estimated upstream from the number of
@@ -1713,6 +1765,7 @@ class CNVModel:
             interval_sizes=data.interval_sizes,
             n_bins=data.n_bins,
             n_samples=data.n_samples,
+            gc_content=getattr(data, "gc_content", None),
         )
 
         # Get model trace conditioned on guide
@@ -1727,6 +1780,7 @@ class CNVModel:
             interval_sizes=data.interval_sizes,
             n_bins=data.n_bins,
             n_samples=data.n_samples,
+            gc_content=getattr(data, "gc_content", None),
         )
 
         # Extract all latent variables
@@ -1742,8 +1796,14 @@ class CNVModel:
         map_estimates["sample_var"] = (
             guide_trace.nodes["sample_var"]["value"].detach().cpu().numpy()
         )
+        map_estimates["sample_df"] = (
+            guide_trace.nodes["sample_df"]["value"].detach().cpu().numpy()
+        )
         map_estimates["length_scale_var"] = (
             guide_trace.nodes["length_scale_var"]["value"].detach().cpu().numpy()
+        )
+        map_estimates["sample_gc_bias"] = (
+            guide_trace.nodes["sample_gc_bias"]["value"].detach().cpu().numpy()
         )
         if self.learn_baf_temperature:
             map_estimates["baf_temperature"] = (
@@ -1792,7 +1852,7 @@ class CNVModel:
         Compute exact posterior probabilities analytically using Bayes' rule.
 
         Because the model uses a discrete Categorical hidden state with a
-        small state space (K=6) and a Gaussian observation likelihood, the
+        small state space (K=6) and a Student-T observation likelihood, the
         posterior can be computed exactly once the MAP estimates for the
         continuous latent variables are available.  For each bin *b* and
         sample *s*:
@@ -1822,6 +1882,7 @@ class CNVModel:
         maps = self.get_map_estimates(data)
         bin_bias = maps["bin_bias"]       # (n_bins,) or (n_bins, 1)
         sample_var = maps["sample_var"]   # (n_samples,) or (1, n_samples)
+        sample_df = np.asarray(maps["sample_df"]).squeeze()  # (n_samples,)
         pair_state_probs = maps.get(
             "effective_pair_state_probs",
             self._effective_pair_state_prior_values(maps["pair_state_probs"]),
@@ -1862,6 +1923,15 @@ class CNVModel:
         # states: (n_states, 1, 1);  bin_bias: (1, n_bins, 1)
         states_total_cn = pair_total_cn.reshape(-1, 1, 1)
         expected_depth = states_total_cn * bin_bias[np.newaxis, :, np.newaxis]
+        # GC bias modulation: expected_depth *= exp(gc_content * sample_gc_bias)
+        gc_content = getattr(data, "gc_content", None)
+        if gc_content is not None:
+            sample_gc_bias = np.asarray(maps["sample_gc_bias"]).squeeze()  # (n_samples,)
+            gc_content_np = gc_content.detach().cpu().numpy().squeeze()  # (n_bins,)
+            gc_mod = np.exp(gc_content_np[:, np.newaxis] * sample_gc_bias[np.newaxis, :])
+            # Broadcast from (n_bins, n_samples) to (n_states, n_bins, n_samples)
+            gc_mod = gc_mod[np.newaxis, :, :]
+            expected_depth = expected_depth * gc_mod
         size_modifier = _size_modifier_numpy(interval_sizes[:, np.newaxis], self.bin_size_factor)
         variance_expected_depth = _variance_expected_depth_numpy(
             expected_depth,
@@ -1900,10 +1970,16 @@ class CNVModel:
         obs_b = obs[np.newaxis, :, :]
         std_b = std
 
-        # Gaussian log-PDF
-        log_lik = -0.5 * np.log(2 * np.pi * std_b ** 2) - (
-            (obs_b - expected_depth) ** 2
-        ) / (2 * std_b ** 2)
+        # Broadcast df to (1, 1, n_samples) to match obs_b and std_b
+        df_b = sample_df[np.newaxis, np.newaxis, :]
+
+        # Student-T log-PDF
+        log_lik = (
+            gammaln((df_b + 1) / 2)
+            - gammaln(df_b / 2)
+            - 0.5 * np.log(df_b * np.pi * std_b ** 2)
+            - ((df_b + 1) / 2) * np.log(1 + ((obs_b - expected_depth) ** 2) / (df_b * std_b ** 2))
+        )
 
         # 4. Add log-prior over pair states.
         log_prior = np.log(

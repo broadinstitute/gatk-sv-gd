@@ -10,6 +10,8 @@ The package implements a structured, multi-stage workflow:
 preprocess -> infer -> call -> plot -> eval -> aggregate
 ```
 
+Two ancillary subcommands are also provided: `extract` (pulls putative GD events from VCFs) and `integrate` (integrates GD calls back into a GATK-SV final VCF). `integrate` requires `bcftools` to be available on `PATH` at runtime for output sorting.
+
 ---
 
 ## Installation
@@ -82,6 +84,7 @@ All hg38 reference files required to run `gatk-sv-gd` are listed in [`resources.
 
 | Key | Description | `run_gd.sh` flag |
 |---|---|---|
+| `ref_fasta` | Indexed reference FASTA (required for GC fraction computation) | `--ref-fasta` |
 | `gd_table` | Genomic disorder locus definitions | `--gd-table` |
 | `segdup_bed` | Segmental duplication intervals | `--segdup-bed`, `--flank-exclusion-interval` |
 | `centromere_intervals` | Centromere intervals | `--centromere-bed` |
@@ -129,6 +132,7 @@ RESOURCES_DIR="gd_resources"  # directory where resources were downloaded
 ./run_gd.sh \
   --work-dir gd_work \
   --input-depth counts.tsv.gz \
+  --ref-fasta /path/to/reference.fa \
   --gd-table "${RESOURCES_DIR}/GenomicDisorderRegions_hg38_2025-12-05.with_bp.tsv" \
   --segdup-bed "${RESOURCES_DIR}/hg38_SD.bed.gz" \
   --flank-exclusion-interval "${RESOURCES_DIR}/hg38_SD.bed.gz" \
@@ -158,6 +162,7 @@ RESOURCES_DIR="gd_resources"  # directory where resources were downloaded
 
 gatk-sv-gd preprocess \
   --input counts.tsv.gz \
+  --ref-fasta /path/to/reference.fa \
   --gd-table "${RESOURCES_DIR}/GenomicDisorderRegions_hg38_2025-12-05.with_bp.tsv" \
   --exclusion-intervals \
     "${RESOURCES_DIR}/hg38_SD.bed.gz" \

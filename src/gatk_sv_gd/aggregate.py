@@ -90,6 +90,7 @@ _CASE_COLUMNS = [
     "sample_key",
     "carrier_category",
     "GD_ID",
+    "locus",  # Human-readable label (GD_ID when available, else cluster)
     "cluster",
     "chrom",
     "start",
@@ -650,6 +651,9 @@ def _build_cases_table(calls_df: pd.DataFrame) -> pd.DataFrame:
         "PASS",
         "FAIL",
     )
+    cases["locus"] = cases.get("GD_ID", "").astype(str).str.strip()
+    mask = (cases["locus"] == "") | cases["locus"].isna()
+    cases.loc[mask, "locus"] = cases.loc[mask, "cluster"].astype(str).str.strip()
     for column in _CASE_COLUMNS:
         if column not in cases.columns:
             cases[column] = ""
@@ -1456,7 +1460,7 @@ def _add_summary_pages(
             "batch_label": "Batch",
             "sample": "Sample",
             "GD_ID": "GD ID",
-            "cluster": "Locus",
+            "locus": "Locus",
             "svtype": "Type",
             "left_flank_status": "Left flank",
             "right_flank_status": "Right flank",
@@ -1482,7 +1486,7 @@ def _add_summary_pages(
         column_labels={
             "batch_label": "Batch",
             "GD_ID": "GD ID",
-            "cluster": "Locus",
+            "locus": "Locus",
             "svtype": "Type",
             "modeled_sample_count": "Modeled samples",
             "carrier_sample_count": "Carrier samples",

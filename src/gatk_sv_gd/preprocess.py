@@ -1127,6 +1127,48 @@ def get_locus_interval_bins(
 # =============================================================================
 
 
+def compute_gc_fractions(
+    combined_df: pd.DataFrame,
+    fasta_path: str,
+) -> np.ndarray:
+    """Compute per-bin GC fractions from a reference FASTA.
+
+    Fetches the reference sequence for each bin (Chr, Start, End) and
+    calculates the fraction of bases that are G or C.
+
+    Args:
+        combined_df: DataFrame with columns ``Chr``, ``Start``, ``End``.
+        fasta_path: Path to an indexed reference FASTA file.
+
+    Returns:
+        1-D numpy array of GC fractions (float64), one per row.
+    """
+    fasta = pysam.FastaFile(fasta_path)
+    n_bins = len(combined_df)
+    gc_fractions = np.full(n_bins, np.nan, dtype=np.float64)
+
+    chroms = combined_df["Chr"].astype(str)
+    starts = combined_df["Start"].astype(int)
+    ends = combined_df["End"].astype(int)
+
+    n_success = 0
+    for i in range(n_bins):
+        try:
+            seq = fasta.fetch(str(chroms[i]), int(starts[i]), int(ends[i]))
+            seq_upper = seq.upper()
+            gc = seq_upper.count("G") + seq_upper.count("C")
+            total = len(seq_upper)
+            gc_fractions[i] = gc / total if total > 0 else 0.0
+            n_success += 1
+        except Exception:
+            # Sequence not available (e.g. alternative contig) — leave as NaN
+            gc_fractions[i] = np.nan
+
+    fasta.close()
+    print(f"  GC fractions computed for {n_success}/{n_bins} bins")
+    return gc_fractions
+
+
 def write_preprocessed_bins(
     combined_df: pd.DataFrame,
     output_dir: str,
@@ -1606,6 +1648,11 @@ def parse_args():
              "When provided, preprocess writes preprocessed_baf.tsv.gz "
              "filtered to the retained GD regions and analyzed samples.",
     )
+    parser.add_argument(
+        "--ref-fasta", required=True,
+        help="Path to an indexed reference FASTA file. "
+             "Required to compute per-bin GC fractions for GC bias correction.",
+    )
 
     # Locus processing
     parser.add_argument("--locus-padding", type=int, default=10000,
@@ -1807,6 +1854,12 @@ def main():
             "Check that the GD table and --region filters leave at least "
             "one NAHR locus with sufficient bins."
         )
+
+    # Compute GC fractions from reference FASTA
+    print("\nComputing per-bin GC fractions from reference FASTA...")
+    gc_fractions = compute_gc_fractions(combined_df, args.ref_fasta)
+    combined_df["gc_fraction"] = gc_fractions
+    print("  Added gc_fraction column to preprocessed bins")
 
     # Write preprocessed outputs
     print("\n" + "=" * 80)

@@ -17,6 +17,7 @@ SUBCOMMANDS = {
     "aggregate": "gatk_sv_gd.aggregate",
     "extract": "gatk_sv_gd.extract",
     "synthesize": "gatk_sv_gd.synthesize",
+    "integrate": "gatk_sv_gd.integrate",
 }
 
 DESCRIPTIONS = {
@@ -28,6 +29,7 @@ DESCRIPTIONS = {
     "aggregate": "Aggregate one or more GD run directories into a report",
     "extract": "Extract putative GD events from VCF(s)",
     "synthesize": "Spike synthetic GD CNVs into read-depth matrices",
+    "integrate": "Integrate GD calls into a GATK-SV final VCF",
 }
 
 

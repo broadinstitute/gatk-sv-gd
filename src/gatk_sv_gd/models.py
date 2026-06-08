@@ -38,6 +38,19 @@ class GDLocus:
         """Get overall end position (max of all breakpoint ends)."""
         return max(bp[1] for bp in self.breakpoints)
 
+    @property
+    def display_label(self) -> str:
+        """Human-readable label for the locus.
+
+        Prefers the first GD_ID from the locus entries, falling back to
+        the cluster key (coordinate-style) when no GD_ID is available.
+        """
+        for entry in self.gd_entries:
+            gd_id = entry.get("GD_ID", "")
+            if gd_id:
+                return str(gd_id)
+        return self.cluster
+
     def get_intervals(self) -> List[Tuple[int, int, str]]:
         """
         Get all intervals between adjacent breakpoints.
@@ -317,7 +330,7 @@ class GDTable:
 def validate_gd_table_for_preprocess(gd_table: GDTable) -> None:
     """Reject GD loci that preprocess does not support yet."""
     unsupported = [
-        f"{cluster} ({locus.chrom}:{locus.start:,}-{locus.end:,})"
+        f"{locus.display_label} ({locus.chrom}:{locus.start:,}-{locus.end:,})"
         for cluster, locus in gd_table.loci.items()
         if str(locus.chrom).strip().lower() in {"chry", "y"}
     ]

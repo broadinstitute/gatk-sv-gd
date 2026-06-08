@@ -1846,7 +1846,7 @@ def plot_locus_overview(
         squeeze=False,
     )
 
-    locus_label = f"{locus.cluster} ({chrom}:{locus.start:,}-{locus.end:,})"
+    locus_label = f"{locus.display_label} ({chrom}:{locus.start:,}-{locus.end:,})"
 
     if have_raw:
         stage_start = perf_counter()
@@ -2387,6 +2387,121 @@ def create_anomalous_pdf(
 
 
 # =============================================================================
+# GC Bias Diagnostic Plots
+# =============================================================================
+
+
+def plot_gc_diagnostics(
+    preprocessed_bins_path: str,
+    sample_posteriors_path: str,
+    output_dir: str,
+    n_histogram_bins: int = 60,
+):
+    """Create diagnostic plots visualising GC bias effects per sample.
+
+    Produces a two-panel PNG:
+      1. Histogram of per-sample GC bias slope MAP values (cohort distribution)
+      2. Scatter plot of inferred per-sample GC bias slope vs overdispersion
+
+    Args:
+        preprocessed_bins_path: Path to ``preprocessed_bins.tsv.gz`` (from
+            preprocess step).  Loaded for logging purposes.
+        sample_posteriors_path: Path to ``sample_posteriors.tsv.gz`` (from
+            infer step).  Must contain ``sample`` and ``sample_var_map`` columns;
+            ``sample_gc_bias_map`` is required for both panels.
+        output_dir: Directory to write the output PNG into.
+        n_histogram_bins: Number of bins for the GC bias histogram.
+    """
+    import scipy.stats as stats
+
+    # --- Load preprocessed bins (logged for traceability) ---
+    bins_df = pd.read_csv(preprocessed_bins_path, sep="\t", compression="infer")
+    print(f"Loaded preprocessed bins: {len(bins_df):,} bins")
+
+    # --- Load sample posteriors ---
+    sp_df = pd.read_csv(sample_posteriors_path, sep="\t", compression="infer")
+    samples = sp_df["sample"].values
+    sample_var = sp_df["sample_var_map"].values.astype(float)
+
+    gc_bias_available = "sample_gc_bias_map" in sp_df.columns
+    if gc_bias_available:
+        sample_gc_bias = sp_df["sample_gc_bias_map"].values.astype(float)
+        print(f"Loaded GC bias MAP for {len(sample_gc_bias)} samples")
+    else:
+        sample_gc_bias = None
+        print("NOTE: sample_gc_bias_map not found in sample posteriors")
+
+    # --- Build figure ---
+    fig, axes = plt.subplots(1, 2, figsize=(12, 5))
+
+    # Panel 1: Histogram of per-sample GC bias slope MAP
+    ax = axes[0]
+    if gc_bias_available and len(sample_gc_bias) > 0:
+        ax.hist(sample_gc_bias, bins=n_histogram_bins, color="#4C72B0",
+                edgecolor="white", alpha=0.85, density=False)
+        mean_bias = float(np.mean(sample_gc_bias))
+        median_bias = float(np.median(sample_gc_bias))
+        ax.axvline(mean_bias, color="red", linestyle="--", linewidth=1.5,
+                   label=f"mean = {mean_bias:.4f}")
+        ax.axvline(median_bias, color="green", linestyle="-", linewidth=1.5,
+                   label=f"median = {median_bias:.4f}")
+        ax.legend()
+    else:
+        ax.text(0.5, 0.5, "No GC bias MAP data", ha="center", va="center",
+                transform=ax.transAxes, fontsize=14)
+    ax.set_xlabel("GC Bias Slope (MAP)")
+    ax.set_ylabel("Number of Samples")
+    ax.set_title("Cohort GC Bias Slope Distribution")
+
+    # Panel 2: GC bias vs overdispersion scatter
+    ax = axes[1]
+    if gc_bias_available and len(sample_gc_bias) > 0:
+        ax.scatter(sample_gc_bias, sample_var, s=40, color="#55A868",
+                   alpha=0.7, edgecolors="white", linewidth=0.5)
+
+        # Linear regression fit
+        valid = np.isfinite(sample_gc_bias) & np.isfinite(sample_var)
+        if valid.sum() >= 3:
+            slope, intercept, r_value, p_value, std_err = stats.linregress(
+                sample_gc_bias[valid], sample_var[valid]
+            )
+            x_line = np.sort(sample_gc_bias[valid])
+            ax.plot(x_line, intercept + slope * x_line, color="red",
+                    linewidth=1.5, linestyle="-",
+                    label=f"R² = {r_value**2:.3f}")
+            ax.legend()
+
+        # Annotate points with sample names if cohort is small enough
+        n = len(samples)
+        if n <= 60:
+            for i in range(n):
+                label = str(samples[i])
+                # Truncate very long names
+                if len(label) > 20:
+                    label = label[:18] + ".."
+                ax.annotate(label, (sample_gc_bias[i], sample_var[i]),
+                            fontsize=6, alpha=0.55,
+                            xytext=(3, 3), textcoords="offset points")
+
+        ax.set_xlabel("Sample GC Bias Slope (MAP)")
+        ax.set_ylabel("Sample Overdispersion (MAP)")
+        ax.set_title("GC Bias Slope vs Overdispersion")
+    else:
+        # Fallback: just show overdispersion distribution
+        ax.hist(sample_var, bins=min(40, max(10, len(sample_var) // 2)),
+                color="#55A868", edgecolor="white", alpha=0.85)
+        ax.set_xlabel("Sample Overdispersion (MAP)")
+        ax.set_ylabel("Count")
+        ax.set_title("Overdispersion Distribution (no GC bias data)")
+
+    plt.tight_layout()
+    out_path = os.path.join(output_dir, "gc_diagnostics.png")
+    fig.savefig(out_path, dpi=150, bbox_inches="tight")
+    plt.close()
+    print(f"Created GC diagnostics plot: {out_path}")
+
+
+# =============================================================================
 # Main
 # =============================================================================
 
@@ -2523,6 +2638,12 @@ def parse_args():
         help="truth_evaluation_report.tsv produced by the eval tool. When provided, "
              "plot.py writes true_positives.pdf, false_positives.pdf, and "
              "false_negatives.pdf instead of carrier_plots.pdf.",
+    )
+    parser.add_argument(
+        "--preprocessed-bins",
+        required=True,
+        help="Preprocessed bins file (preprocessed_bins.tsv.gz) from the "
+             "preprocess step.  Required for GC bias diagnostic plots.",
     )
     return parser.parse_args()
 
@@ -2788,6 +2909,17 @@ def main():
     print("\nCreating summary plots...")
     plot_carrier_summary(plot_calls_df, args.output_dir)
     plot_confidence_distribution(plot_calls_df, args.output_dir)
+
+    # --- GC bias diagnostic plots ---
+    print("\nGenerating GC bias diagnostic plots...")
+    if sample_posteriors_path:
+        plot_gc_diagnostics(
+            preprocessed_bins_path=args.preprocessed_bins,
+            sample_posteriors_path=sample_posteriors_path,
+            output_dir=args.output_dir,
+        )
+    else:
+        print("  SKIPPED GC diagnostics — no sample_posteriors.tsv.gz found")
 
     # Create locus overview plots
     if args.skip_locus_plots:

@@ -5,6 +5,7 @@ from types import SimpleNamespace
 
 import numpy as np
 import pandas as pd
+import torch
 
 import pytest
 
@@ -658,8 +659,8 @@ def test_init_omits_frozen_bin_latents_from_guide(monkeypatch):
         freeze_bin_var=True,
     )
 
-    assert model.latent_sites == ["sample_var", "length_scale_var", "baf_temperature", "pair_state_probs"]
-    assert block_calls["expose"] == ["sample_var", "length_scale_var", "baf_temperature", "pair_state_probs"]
+    assert model.latent_sites == ["sample_var", "sample_df", "length_scale_var", "sample_gc_bias", "baf_temperature", "pair_state_probs"]
+    assert block_calls["expose"] == ["sample_var", "sample_df", "length_scale_var", "sample_gc_bias", "baf_temperature", "pair_state_probs"]
 
 
 def test_init_omits_frozen_pair_state_priors_from_guide(monkeypatch):
@@ -686,8 +687,8 @@ def test_init_omits_frozen_pair_state_priors_from_guide(monkeypatch):
         freeze_pair_state_priors=True,
     )
 
-    assert model.latent_sites == ["bin_bias", "sample_var", "length_scale_var", "baf_temperature"]
-    assert block_calls["expose"] == ["bin_bias", "sample_var", "length_scale_var", "baf_temperature"]
+    assert model.latent_sites == ["bin_bias", "sample_var", "sample_df", "length_scale_var", "sample_gc_bias", "baf_temperature"]
+    assert block_calls["expose"] == ["bin_bias", "sample_var", "sample_df", "length_scale_var", "sample_gc_bias", "baf_temperature"]
 
 
 def test_init_omits_baf_temperature_when_fixed(monkeypatch):
@@ -715,6 +716,7 @@ def test_init_omits_baf_temperature_when_fixed(monkeypatch):
     )
 
     assert "length_scale_var" in model.latent_sites
+    assert "sample_gc_bias" in model.latent_sites
     assert "baf_temperature" not in model.latent_sites
     assert "baf_temperature" not in block_calls["expose"]
 
@@ -863,7 +865,7 @@ def test_warmup_model_and_initial_values_conditions_baf_temperature_when_learned
 
 def test_extract_guide_latent_values_filters_to_present_latent_sites(monkeypatch):
     model = object.__new__(CNVModel)
-    model.latent_sites = ["sample_var", "length_scale_var", "baf_temperature"]
+    model.latent_sites = ["sample_var", "sample_df", "length_scale_var", "baf_temperature"]
 
     guide_trace = SimpleNamespace(
         nodes={
@@ -898,7 +900,9 @@ def test_get_map_estimates_extracts_learned_latents_and_cn_probabilities(monkeyp
         nodes={
             "bin_bias": {"value": _FakeTensor([[1.1], [0.9]])},
             "sample_var": {"value": _FakeTensor([0.2])},
+            "sample_df": {"value": _FakeTensor([5.0])},
             "length_scale_var": {"value": _FakeTensor([500.0])},
+            "sample_gc_bias": {"value": _FakeTensor([0.3, -0.1])},
             "baf_temperature": {"value": _FakeTensor([1.5])},
             "pair_state_probs": {"value": _FakeTensor([[0.7, 0.3], [0.4, 0.6]])},
         }
@@ -939,6 +943,7 @@ def test_get_map_estimates_extracts_learned_latents_and_cn_probabilities(monkeyp
     assert np.allclose(map_estimates["bin_bias"], np.array([[1.1], [0.9]], dtype=np.float32))
     assert np.allclose(map_estimates["sample_var"], np.array([0.2], dtype=np.float32))
     assert np.allclose(map_estimates["length_scale_var"], np.array([500.0], dtype=np.float32))
+    assert np.allclose(map_estimates["sample_gc_bias"], np.array([0.3, -0.1], dtype=np.float32))
     assert np.allclose(map_estimates["baf_temperature"], np.array([1.5], dtype=np.float32))
     assert np.allclose(map_estimates["pair_state_probs"], np.array([[0.7, 0.3], [0.4, 0.6]], dtype=np.float32))
     assert np.allclose(map_estimates["pair_state"], np.array([1, 0], dtype=np.int64))
@@ -957,7 +962,9 @@ def test_get_map_estimates_uses_fixed_latents_when_requested(monkeypatch):
     guide_trace = SimpleNamespace(
         nodes={
             "sample_var": {"value": _FakeTensor([0.3])},
+            "sample_df": {"value": _FakeTensor([4.0])},
             "length_scale_var": {"value": _FakeTensor([250.0])},
+            "sample_gc_bias": {"value": _FakeTensor([0.0])},
         }
     )
     discrete_trace = SimpleNamespace(
@@ -1030,6 +1037,16 @@ def test_model_uses_sampled_latents_and_emits_baf_factor(monkeypatch):
             safe_scale = torch.clamp(self.scale, min=1e-6)
             return -((value - self.loc) ** 2) / (2.0 * safe_scale ** 2)
 
+    class _FakeStudentT:
+        def __init__(self, df, loc, scale):
+            self.df = df
+            self.loc = loc
+            self.scale = scale
+
+        def log_prob(self, value):
+            safe_scale = torch.clamp(self.scale, min=1e-6)
+            return -((value - self.loc) ** 2) / (2.0 * safe_scale ** 2)
+
     model = object.__new__(CNVModel)
     model.debug = False
     model.device = "cpu"
@@ -1068,6 +1085,10 @@ def test_model_uses_sampled_latents_and_emits_baf_factor(monkeypatch):
         sample_calls.append(name)
         if name == "sample_var":
             return torch.tensor([0.1, 0.2], dtype=torch.float32)
+        if name == "sample_df":
+            return torch.tensor([3.0, 4.0], dtype=torch.float32)
+        if name == "sample_gc_bias":
+            return torch.tensor([0.1, -0.2], dtype=torch.float32)
         if name == "length_scale_var":
             return torch.tensor(10.0, dtype=torch.float32)
         if name == "baf_temperature":
@@ -1089,10 +1110,12 @@ def test_model_uses_sampled_latents_and_emits_baf_factor(monkeypatch):
         "dist",
         SimpleNamespace(
             Exponential=lambda rate: ("exponential", rate),
+            Gamma=lambda alpha, beta: ("gamma", alpha, beta),
             LogNormal=lambda loc, scale: ("lognormal", loc, scale),
             Dirichlet=lambda alpha: ("dirichlet", alpha),
             Categorical=lambda probs: ("categorical", probs),
             Normal=_FakeNormal,
+            StudentT=_FakeStudentT,
         ),
     )
     monkeypatch.setattr(depth_module, "Vindex", lambda value: value)
@@ -1110,6 +1133,8 @@ def test_model_uses_sampled_latents_and_emits_baf_factor(monkeypatch):
 
     assert sample_calls == [
         "sample_var",
+        "sample_df",
+        "sample_gc_bias",
         "length_scale_var",
         "baf_temperature",
         "bin_bias",
@@ -1134,6 +1159,16 @@ def test_model_uses_fixed_latents_without_baf_factor(monkeypatch):
 
     class _FakeNormal:
         def __init__(self, loc, scale):
+            self.loc = loc
+            self.scale = scale
+
+        def log_prob(self, value):
+            safe_scale = torch.clamp(self.scale, min=1e-6)
+            return -((value - self.loc) ** 2) / (2.0 * safe_scale ** 2)
+
+    class _FakeStudentT:
+        def __init__(self, df, loc, scale):
+            self.df = df
             self.loc = loc
             self.scale = scale
 
@@ -1172,6 +1207,10 @@ def test_model_uses_fixed_latents_without_baf_factor(monkeypatch):
         sample_calls.append(name)
         if name == "sample_var":
             return torch.tensor([0.1, 0.2], dtype=torch.float32)
+        if name == "sample_df":
+            return torch.tensor([3.0, 4.0], dtype=torch.float32)
+        if name == "sample_gc_bias":
+            return torch.tensor([0.0, 0.0], dtype=torch.float32)
         if name == "length_scale_var":
             return torch.tensor(10.0, dtype=torch.float32)
         if name == "pair_state":
@@ -1187,10 +1226,12 @@ def test_model_uses_fixed_latents_without_baf_factor(monkeypatch):
         "dist",
         SimpleNamespace(
             Exponential=lambda rate: ("exponential", rate),
+            Gamma=lambda alpha, beta: ("gamma", alpha, beta),
             LogNormal=lambda loc, scale: ("lognormal", loc, scale),
             Dirichlet=lambda alpha: ("dirichlet", alpha),
             Categorical=lambda probs: ("categorical", probs),
             Normal=_FakeNormal,
+            StudentT=_FakeStudentT,
         ),
     )
     monkeypatch.setattr(depth_module, "Vindex", lambda value: value)
@@ -1202,7 +1243,7 @@ def test_model_uses_fixed_latents_without_baf_factor(monkeypatch):
     model.model(depth=depth, interval_sizes=interval_sizes, n_bins=2, n_samples=2)
 
     assert fixed_calls == ["baf_temperature", ("bin_bias", 2), ("pair_state_probs", 2)]
-    assert sample_calls == ["sample_var", "length_scale_var", "pair_state", "obs"]
+    assert sample_calls == ["sample_var", "sample_df", "sample_gc_bias", "length_scale_var", "pair_state", "obs"]
     assert factor_calls == []
 
 
@@ -1218,6 +1259,16 @@ def test_model_debug_path_reports_tensor_shapes(monkeypatch, capsys):
 
     class _FakeNormal:
         def __init__(self, loc, scale):
+            self.loc = loc
+            self.scale = scale
+
+        def log_prob(self, value):
+            safe_scale = torch.clamp(self.scale, min=1e-6)
+            return -((value - self.loc) ** 2) / (2.0 * safe_scale ** 2)
+
+    class _FakeStudentT:
+        def __init__(self, df, loc, scale):
+            self.df = df
             self.loc = loc
             self.scale = scale
 
@@ -1250,6 +1301,10 @@ def test_model_debug_path_reports_tensor_shapes(monkeypatch, capsys):
     def fake_sample(name, distribution, obs=None):
         if name == "sample_var":
             return torch.tensor([0.1, 0.2], dtype=torch.float32)
+        if name == "sample_df":
+            return torch.tensor([3.0, 4.0], dtype=torch.float32)
+        if name == "sample_gc_bias":
+            return torch.tensor([0.0, 0.0], dtype=torch.float32)
         if name == "length_scale_var":
             return torch.tensor(10.0, dtype=torch.float32)
         if name == "pair_state":
@@ -1266,10 +1321,12 @@ def test_model_debug_path_reports_tensor_shapes(monkeypatch, capsys):
         "dist",
         SimpleNamespace(
             Exponential=lambda rate: ("exponential", rate),
+            Gamma=lambda alpha, beta: ("gamma", alpha, beta),
             LogNormal=lambda loc, scale: ("lognormal", loc, scale),
             Dirichlet=lambda alpha: ("dirichlet", alpha),
             Categorical=lambda probs: ("categorical", probs),
             Normal=_FakeNormal,
+            StudentT=_FakeStudentT,
         ),
     )
     monkeypatch.setattr(depth_module, "Vindex", lambda value: value)
@@ -1326,6 +1383,10 @@ def test_model_raises_when_reference_variance_sample_count_does_not_match(monkey
         "sample",
         lambda name, distribution, obs=None: torch.tensor([0.1, 0.2], dtype=torch.float32)
         if name == "sample_var"
+        else torch.tensor([3.0, 4.0], dtype=torch.float32)
+        if name == "sample_df"
+        else torch.tensor([0.0, 0.0], dtype=torch.float32)
+        if name == "sample_gc_bias"
         else torch.tensor(10.0, dtype=torch.float32)
         if name == "length_scale_var"
         else torch.tensor([[0, 1], [1, 0]], dtype=torch.long)
@@ -1338,10 +1399,12 @@ def test_model_raises_when_reference_variance_sample_count_does_not_match(monkey
         "dist",
         SimpleNamespace(
             Exponential=lambda rate: ("exponential", rate),
+            Gamma=lambda alpha, beta: ("gamma", alpha, beta),
             LogNormal=lambda loc, scale: ("lognormal", loc, scale),
             Dirichlet=lambda alpha: ("dirichlet", alpha),
             Categorical=lambda probs: ("categorical", probs),
             Normal=lambda loc, scale: ("normal", loc, scale),
+            StudentT=lambda df, loc, scale: ("studentT", df, loc, scale),
         ),
     )
     monkeypatch.setattr(depth_module, "Vindex", lambda value: value)
@@ -1693,6 +1756,7 @@ def test_run_discrete_inference_always_uses_full_pair_state_prior():
     model.get_map_estimates = lambda data: {
         "bin_bias": np.asarray([1.0, 1.0], dtype=np.float32),
         "sample_var": np.asarray([0.0, 0.0], dtype=np.float32),
+        "sample_df": np.asarray([1e6, 1e6], dtype=np.float32),
         "bin_var": np.asarray([0.0, 0.0], dtype=np.float32),
         "pair_state_probs": np.asarray([[0.99, 0.01], [0.99, 0.01]], dtype=np.float32),
         "length_scale_var": np.asarray(1.0, dtype=np.float32),
@@ -1737,6 +1801,7 @@ def test_run_discrete_inference_assigns_extreme_outliers_to_null_state():
     model.get_map_estimates = lambda data: {
         "bin_bias": np.asarray([1.0, 1.0], dtype=np.float32),
         "sample_var": np.asarray([0.0, 0.0], dtype=np.float32),
+        "sample_df": np.asarray([1e6, 1e6], dtype=np.float32),
         "bin_var": np.asarray([0.0, 0.0], dtype=np.float32),
         "pair_state_probs": np.asarray([[0.99, 0.01], [0.99, 0.01]], dtype=np.float32),
         "length_scale_var": np.asarray(1.0, dtype=np.float32),
@@ -1774,6 +1839,7 @@ def test_run_discrete_inference_uses_count_anchored_poisson_baseline_when_availa
     model.get_map_estimates = lambda data: {
         "bin_bias": np.asarray([1.0, 1.0], dtype=np.float32),
         "sample_var": np.asarray([0.0, 0.0], dtype=np.float32),
+        "sample_df": np.asarray([1e6, 1e6], dtype=np.float32),
         "bin_var": np.asarray([0.0, 0.0], dtype=np.float32),
         "pair_state_probs": np.asarray([[0.99, 0.01], [0.99, 0.01]], dtype=np.float32),
     }
@@ -1821,6 +1887,7 @@ def test_run_discrete_inference_uses_count_anchored_length_scale_var_when_availa
     model.get_map_estimates = lambda data: {
         "bin_bias": np.asarray([1.0, 1.0], dtype=np.float32),
         "sample_var": np.asarray([sample_var_val, sample_var_val], dtype=np.float32),
+        "sample_df": np.asarray([1e6, 1e6], dtype=np.float32),
         "bin_var": np.asarray([0.0, 0.0], dtype=np.float32),
         "pair_state_probs": np.asarray([[0.99, 0.01], [0.99, 0.01]], dtype=np.float32),
         "length_scale_var": np.asarray(length_scale_var_val, dtype=np.float32),
@@ -1902,6 +1969,7 @@ def test_run_discrete_inference_reweights_reference_prior_for_haploid_ploidy():
     model.get_map_estimates = lambda data: {
         "bin_bias": np.asarray([1.0, 1.0], dtype=np.float32),
         "sample_var": np.asarray([0.2, 0.2], dtype=np.float32),
+        "sample_df": np.asarray([1e6, 1e6], dtype=np.float32),
         "pair_state_probs": pair_priors,
         "length_scale_var": np.asarray(1_000.0, dtype=np.float32),
     }
@@ -1951,6 +2019,7 @@ def test_run_discrete_inference_min_variance_expected_depth_prevents_copy0_null_
         model.get_map_estimates = lambda data: {
             "bin_bias": np.asarray([1.0, 1.0], dtype=np.float32),
             "sample_var": np.asarray([0.2, 0.2], dtype=np.float32),
+            "sample_df": np.asarray([1e6, 1e6], dtype=np.float32),
             "pair_state_probs": np.asarray([[0.4, 0.4], [0.4, 0.4]], dtype=np.float32),
             "length_scale_var": np.asarray(1_000.0, dtype=np.float32),
         }
@@ -2000,6 +2069,7 @@ def test_run_discrete_inference_baf_outlier_rate_caps_contradictory_baf_penalty(
         model._pair_state_prior_mean_np = np.asarray([0.5, 0.5], dtype=np.float64)
         model.get_map_estimates = lambda data: {
             **maps,
+            "sample_df": np.asarray([1e6, 1e6], dtype=np.float32),
             "length_scale_var": np.asarray(1.0, dtype=np.float32),
         }
         return model
@@ -2021,3 +2091,165 @@ def test_run_discrete_inference_baf_outlier_rate_caps_contradictory_baf_penalty(
     assert plain_posterior < 1e-10
     assert robust_posterior > 1e-3
     assert robust_posterior > plain_posterior * 1e6
+
+
+def test_attach_gc_content_mean_centers_and_validates():
+    df = pd.DataFrame({
+        "Chr": ["1", "1", "1"],
+        "Start": [100, 200, 300],
+        "End": [110, 210, 310],
+        "A": [1.0, 2.0, 3.0],
+    })
+    data = DepthData(df, device="cpu", dtype=torch.float32, clamp_threshold=10.0)
+    assert data.gc_content is None
+
+    gc_values = np.array([0.3, 0.5, 0.4], dtype=np.float32)
+    data.attach_gc_content(gc_values)
+
+    # Should be mean-centered
+    mean_gc = float(np.mean(gc_values))  # 0.4
+    assert np.allclose(data.gc_content.squeeze().numpy(), gc_values - mean_gc)
+    assert data.gc_content.shape == (3, 1)
+
+
+def test_attach_gc_content_raises_on_shape_mismatch():
+    df = pd.DataFrame({
+        "Chr": ["1", "1"],
+        "Start": [100, 200],
+        "End": [110, 210],
+        "A": [1.0, 2.0],
+    })
+    data = DepthData(df, device="cpu", dtype=torch.float32, clamp_threshold=10.0)
+
+    bad_gc = np.array([0.3, 0.5, 0.4, 0.6], dtype=np.float32)
+    with pytest.raises(ValueError, match="gc_fraction length"):
+        data.attach_gc_content(bad_gc)
+
+
+def test_gc_content_none_skips_modulation():
+    """When gc_content is absent, run_discrete_inference should not apply GC modulation."""
+    maps = {
+        "bin_bias": np.asarray([1.0, 1.0], dtype=np.float32),
+        "sample_var": np.asarray([0.05, 0.05], dtype=np.float32),
+        "sample_gc_bias": np.asarray([1.0, 1.0], dtype=np.float32),  # large, but should be ignored
+        "pair_state_probs": np.asarray([[0.5, 0.5], [0.5, 0.5]], dtype=np.float32),
+    }
+
+    model = object.__new__(CNVModel)
+    model.pair_states = [(1, 1), (1, 2)]
+    model.max_total_cn = 3
+    model.bin_size_factor = 1.0
+    model.baf_temperature = 0  # no BAF
+    model.baf_outlier_rate = 0.0
+    model.var_length_scale = 1.0
+    model._count_anchored_reference_variance_np = _count_anchored_reference_variance_numpy(
+        np.asarray([4.0, 4.0], dtype=np.float32),
+        reference_bin_size=1.0,
+        bin_size_factor=1.0,
+    )
+    model._pair_state_prior_mean_np = np.asarray([0.5, 0.5], dtype=np.float64)
+    model.get_map_estimates = lambda data: {
+        **maps,
+        "sample_df": np.asarray([1e6, 1e6], dtype=np.float32),
+        "length_scale_var": np.asarray(1.0, dtype=np.float32),
+    }
+
+    data = SimpleNamespace(
+        depth=_FakeTensor([[2.0, 2.0], [2.0, 2.0]]),
+        interval_sizes=_FakeTensor([[1.0], [1.0]]),
+        n_bins=2,
+        n_samples=2,
+        has_baf=False,
+        gc_content=None,  # explicitly None
+    )
+
+    result = CNVModel.run_discrete_inference(model, data)
+    assert "cn_posterior" in result
+    # Should complete without error
+
+
+def test_gc_modulation_in_discrete_inference():
+    """GC modulation should shift expected depth proportional to gc_content * sample_gc_bias."""
+    maps = {
+        "bin_bias": np.asarray([1.0, 1.0], dtype=np.float32),
+        "sample_var": np.asarray([0.05, 0.05], dtype=np.float32),
+        "sample_gc_bias": np.asarray([1.0, -1.0], dtype=np.float32),
+        "pair_state_probs": np.asarray([[0.5, 0.5], [0.5, 0.5]], dtype=np.float32),
+    }
+
+    model = object.__new__(CNVModel)
+    model.pair_states = [(1, 1), (1, 2)]
+    model.max_total_cn = 3
+    model.bin_size_factor = 1.0
+    model.baf_temperature = 0  # no BAF
+    model.baf_outlier_rate = 0.0
+    model.var_length_scale = 1.0
+    model._count_anchored_reference_variance_np = _count_anchored_reference_variance_numpy(
+        np.asarray([4.0, 4.0], dtype=np.float32),
+        reference_bin_size=1.0,
+        bin_size_factor=1.0,
+    )
+    model._pair_state_prior_mean_np = np.asarray([0.5, 0.5], dtype=np.float64)
+    model.get_map_estimates = lambda data: {
+        **maps,
+        "sample_df": np.asarray([1e6, 1e6], dtype=np.float32),
+        "length_scale_var": np.asarray(1.0, dtype=np.float32),
+    }
+
+    # Bin 0: high GC (positive), Bin 1: low GC (negative)
+    gc_content = torch.tensor([[0.5], [-0.5]], dtype=torch.float32)
+
+    data = SimpleNamespace(
+        depth=_FakeTensor([[2.0, 2.0], [2.0, 2.0]]),
+        interval_sizes=_FakeTensor([[1.0], [1.0]]),
+        n_bins=2,
+        n_samples=2,
+        has_baf=False,
+        gc_content=gc_content,
+    )
+
+    result = CNVModel.run_discrete_inference(model, data)
+    assert "cn_posterior" in result
+    # With gc_bias=+1 and gc_content=+0.5, expected_depth for sample 0 increases
+    # with gc_bias=-1 and gc_content=-0.5, expected_depth for sample 1 increases
+    # (both result in exp(0.5) multiplier for their respective bins)
+
+
+def test_sample_gc_bias_in_map_estimates(monkeypatch):
+    """get_map_estimates should extract sample_gc_bias from guide trace."""
+    guide_trace = SimpleNamespace(
+        nodes={
+            "bin_bias": {"value": _FakeTensor([[1.0]])},
+            "sample_var": {"value": _FakeTensor([0.1])},
+            "sample_df": {"value": _FakeTensor([3.0])},
+            "length_scale_var": {"value": _FakeTensor([100.0])},
+            "sample_gc_bias": {"value": _FakeTensor([0.5, -0.3])},
+            "baf_temperature": {"value": _FakeTensor([1.0])},
+            "pair_state_probs": {"value": _FakeTensor([[0.5, 0.5], [0.5, 0.5]])},
+        }
+    )
+    discrete_trace = SimpleNamespace(
+        nodes={
+            "pair_state": {"value": _FakeTensor([[0], [0]], dtype=np.int64)},
+        }
+    )
+
+    model = object.__new__(CNVModel)
+    model.guide = object()
+    model.model = object()
+    model.freeze_bin_bias = False
+    model.freeze_pair_state_priors = False
+    model.learn_baf_temperature = True
+    model.pair_states = [(0, 1), (1, 1)]
+    model.max_total_cn = 2
+    model._effective_pair_state_prior_values = lambda probs: np.asarray(probs, dtype=np.float32)
+    model._null_state_prior_value = lambda: 0.05
+
+    monkeypatch.setattr(depth_module.poutine, "trace", lambda target: SimpleNamespace(
+        get_trace=lambda **kwargs: guide_trace if target is model.guide else discrete_trace
+    ), raising=False)
+    monkeypatch.setattr(depth_module.poutine, "replay", lambda model_fn, trace: ("replayed",), raising=False)
+    monkeypatch.setattr(depth_module, "infer_discrete", lambda trained_model, **kwargs: object())
+
+    estimates = CNVModel.get_map_estimates(model, SimpleNamespace(n_bins=1, n_samples=2, depth=object(), interval_sizes=object()))
+    assert np.allclose(estimates["sample_gc_bias"], np.array([0.5, -0.3], dtype=np.float32))

@@ -78,6 +78,7 @@ def test_write_posterior_tables_handles_single_bin_single_sample_and_baf(tmp_pat
         "cn": 1,
         "pair_state": 1,
         "sample_var": 0.125,
+        "sample_df": 4.5,
         "baf_temperature": 1.5,
         "length_scale_var": 250.0,
         "bin_bias": 0.95,
@@ -129,6 +130,7 @@ def test_write_posterior_tables_handles_single_bin_single_sample_and_baf(tmp_pat
     assert sample_row["baf_temperature_map"] == pytest.approx(1.5)
     assert sample_row["baf_variance_scale_map"] == pytest.approx(1.5)
     assert sample_row["length_scale_var_map"] == pytest.approx(250.0)
+    assert sample_row["sample_df_map"] == pytest.approx(4.5)
 
     bin_row = bin_df.iloc[0]
     assert bin_row["bin_bias_map"] == pytest.approx(0.95)
@@ -281,6 +283,7 @@ def test_write_posterior_tables_handles_extra_dim_transposes_and_scalar_expansio
         "cn": np.array([[0, 1, 0], [1, 0, 1]]),
         "pair_state": np.array([[0, 1], [1, 0], [0, 1]]),
         "sample_var": np.array([0.1, 0.2, 0.3]),
+        "sample_df": np.array([3.5, 4.0, 4.5]),
         "baf_temperature": np.array([2.5]),
         "length_scale_var": np.array([300.0]),
         "bin_bias": np.array([1.1, 0.9]),
@@ -325,6 +328,7 @@ def test_write_posterior_tables_handles_extra_dim_transposes_and_scalar_expansio
 
     assert sample_df["baf_temperature_map"].tolist() == pytest.approx([2.5, 2.5, 2.5])
     assert sample_df["length_scale_var_map"].tolist() == pytest.approx([300.0, 300.0, 300.0])
+    assert sample_df["sample_df_map"].tolist() == pytest.approx([3.5, 4.0, 4.5])
 
     assert bin_df["cn_prior_0"].tolist() == pytest.approx([0.6, 0.4])
     assert bin_df["pair_prior_0_0"].tolist() == pytest.approx([0.7, 0.4])

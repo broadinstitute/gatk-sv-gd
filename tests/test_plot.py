@@ -190,6 +190,8 @@ def test_parse_args_allows_skipping_locus_plots(monkeypatch):
             "--output-dir",
             "out",
             "--skip-locus-plots",
+            "--preprocessed-bins",
+            "preprocessed_bins.tsv.gz",
         ],
     )
 
@@ -757,8 +759,8 @@ def test_plot_locus_overview_draws_raw_and_processed_columns(monkeypatch, tmp_pa
     )
 
     assert [call["title"] for call in draw_calls] == [
-        "Raw normalised — 10q11.2 (chr10:46,005,406-50,651,802)",
-        "Processed — 10q11.2 (chr10:46,005,406-50,651,802)",
+        "Raw normalised — GD1 (chr10:46,005,406-50,651,802)",
+        "Processed — GD1 (chr10:46,005,406-50,651,802)",
     ]
     assert draw_calls[0]["carrier_cols"] == ["S1"]
     assert draw_calls[0]["non_carrier_cols"] == ["S2"]
@@ -840,7 +842,7 @@ def test_plot_locus_overview_draws_single_processed_column_without_raw_counts(mo
 
     assert draw_calls == [
         {
-            "title": "10q11.2 (chr10:46,005,406-50,651,802)",
+            "title": "GD1 (chr10:46,005,406-50,651,802)",
             "carrier_cols": ["S2"],
             "non_carrier_cols": ["S1"],
             "sample_cols": ["S1", "S2"],
@@ -1200,6 +1202,7 @@ def test_plot_main_routes_eval_mode_and_highres_validation(monkeypatch, tmp_path
             flank_scale=0.2,
             event_marginals=None,
             eval_report="eval.tsv",
+            preprocessed_bins=str(out_dir / "preprocessed_bins.tsv.gz"),
         ),
     )
 
@@ -1241,6 +1244,7 @@ def test_plot_main_routes_eval_mode_and_highres_validation(monkeypatch, tmp_path
             flank_scale=0.2,
             event_marginals=None,
             eval_report=None,
+            preprocessed_bins=str(out_dir / "preprocessed_bins.tsv.gz"),
         ),
     )
 
@@ -1304,6 +1308,15 @@ def test_plot_main_routes_carrier_mode_with_sibling_inputs(monkeypatch, tmp_path
                     "qual_dup_event": [-15.0, -30.0],
                 }
             )
+        if path.endswith("preprocessed_bins.tsv.gz"):
+            return pd.DataFrame(
+                {
+                    "Chr": ["chr10", "chr10"],
+                    "Start": [46005406, 48181660],
+                    "End": [48181660, 49845537],
+                    "gc_fraction": [0.42, 0.48],
+                }
+            )
         raise AssertionError(path)
 
     monkeypatch.setattr(plot_module, "setup_logging", lambda *args, **kwargs: None)
@@ -1319,6 +1332,7 @@ def test_plot_main_routes_carrier_mode_with_sibling_inputs(monkeypatch, tmp_path
     monkeypatch.setattr(plot_module, "plot_sample_at_locus", lambda *args, **kwargs: sample_calls.append((args, kwargs)))
     monkeypatch.setattr(plot_module, "create_carrier_pdf", lambda *args, **kwargs: carrier_pdf_calls.append((args, kwargs)))
     monkeypatch.setattr(plot_module, "create_anomalous_pdf", lambda *args, **kwargs: anomalous_pdf_calls.append((args, kwargs)))
+    monkeypatch.setattr(plot_module, "plot_gc_diagnostics", lambda *args, **kwargs: None)
 
     monkeypatch.setattr(
         plot_module,
@@ -1344,6 +1358,7 @@ def test_plot_main_routes_carrier_mode_with_sibling_inputs(monkeypatch, tmp_path
             flank_scale=0.2,
             event_marginals=None,
             eval_report=None,
+            preprocessed_bins=str(tmp_path / "preprocessed_bins.tsv.gz"),
         ),
     )
 
@@ -2385,3 +2400,75 @@ def test_coarsen_pdf_page_signals_groups_values_with_site_weighting_and_invalid_
     assert rebinned_baf_variance.tolist() == pytest.approx([0.053125, np.nan, 0.023125], nan_ok=True)
     assert rebinned_baf_sites.tolist() == pytest.approx([8.0, 0.0, 4.0])
     assert rebinned_event_probs.tolist() == pytest.approx([0.3, 0.6, 0.6])
+
+
+def test_plot_gc_diagnostics_creates_figure(tmp_path, capsys):
+    """plot_gc_diagnostics produces a PNG with two panels."""
+    from gatk_sv_gd.plot import plot_gc_diagnostics
+
+    # Build a minimal preprocessed_bins file with gc_fraction
+    bins_path = tmp_path / "bins.tsv.gz"
+    bins_df = pd.DataFrame({
+        "Chr": ["chr1"] * 5,
+        "Start": [0, 100, 200, 300, 400],
+        "End": [100, 200, 300, 400, 500],
+        "gc_fraction": [0.35, 0.40, 0.45, 0.50, 0.55],
+    })
+    bins_df.to_csv(bins_path, sep="\t", index=False, compression="gzip")
+
+    # Build a sample_posteriors file with sample_gc_bias_map
+    sp_path = tmp_path / "sp.tsv.gz"
+    sp_df = pd.DataFrame({
+        "sample": ["S1", "S2", "S3"],
+        "sample_var_map": [0.1, 0.2, 0.3],
+        "sample_gc_bias_map": [0.5, -0.3, 0.1],
+    })
+    sp_df.to_csv(sp_path, sep="\t", index=False, compression="gzip")
+
+    out_dir = tmp_path / "out"
+    out_dir.mkdir()
+
+    plot_gc_diagnostics(
+        preprocessed_bins_path=str(bins_path),
+        sample_posteriors_path=str(sp_path),
+        output_dir=str(out_dir),
+    )
+
+    stdout = capsys.readouterr().out
+    assert "Created GC diagnostics plot" in stdout
+    assert (out_dir / "gc_diagnostics.png").exists()
+
+
+def test_plot_gc_diagnostics_missing_gc_bias_warns(tmp_path, capsys):
+    """plot_gc_diagnostics handles missing sample_gc_bias_map column gracefully."""
+    from gatk_sv_gd.plot import plot_gc_diagnostics
+
+    bins_path = tmp_path / "bins.tsv.gz"
+    bins_df = pd.DataFrame({
+        "Chr": ["chr1"],
+        "Start": [0],
+        "End": [100],
+        "gc_fraction": [0.45],
+    })
+    bins_df.to_csv(bins_path, sep="\t", index=False, compression="gzip")
+
+    sp_path = tmp_path / "sp.tsv.gz"
+    sp_df = pd.DataFrame({
+        "sample": ["S1"],
+        "sample_var_map": [0.1],
+        # no sample_gc_bias_map
+    })
+    sp_df.to_csv(sp_path, sep="\t", index=False, compression="gzip")
+
+    out_dir = tmp_path / "out"
+    out_dir.mkdir()
+
+    plot_gc_diagnostics(
+        preprocessed_bins_path=str(bins_path),
+        sample_posteriors_path=str(sp_path),
+        output_dir=str(out_dir),
+    )
+
+    stdout = capsys.readouterr().out
+    assert "sample_gc_bias_map not found" in stdout
+    assert (out_dir / "gc_diagnostics.png").exists()

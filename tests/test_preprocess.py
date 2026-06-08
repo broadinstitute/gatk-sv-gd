@@ -114,6 +114,8 @@ def test_parse_args_accepts_expected_preprocess_cli_options(monkeypatch):
             "highres.tsv.gz",
             "--baf-table",
             "baf.tsv.gz",
+            "--ref-fasta",
+            "ref.fasta.gz",
             "--locus-padding",
             "5000",
             "--exclusion-threshold",
@@ -159,6 +161,7 @@ def test_parse_args_accepts_expected_preprocess_cli_options(monkeypatch):
     assert args.hard_inclusion_intervals == [["hard.bed"]]
     assert args.high_res_counts == "highres.tsv.gz"
     assert args.baf_table == "baf.tsv.gz"
+    assert args.ref_fasta == "ref.fasta.gz"
     assert args.locus_padding == 5000
     assert args.exclusion_threshold == pytest.approx(0.2)
     assert args.exclusion_bypass_threshold == pytest.approx(0.9)
@@ -888,6 +891,7 @@ def test_main_runs_happy_path_and_writes_filtered_gd_table(tmp_path, monkeypatch
         min_flank_bins=2,
         min_flank_coverage=0.2,
         baf_table="baf.tsv.gz",
+        ref_fasta=None,
     )
 
     mask_calls = []
@@ -942,6 +946,7 @@ def test_main_runs_happy_path_and_writes_filtered_gd_table(tmp_path, monkeypatch
         "collect_all_locus_bins",
         lambda *args, **kwargs: (combined_df.copy(), mappings, {"standalone-key": object(), "cluster_keep": object()}),
     )
+    monkeypatch.setattr(preprocess_module, "compute_gc_fractions", lambda df, path: np.zeros(len(df), dtype=np.float32))
     monkeypatch.setattr(
         preprocess_module,
         "build_normalization_metadata",
@@ -1011,6 +1016,7 @@ def test_main_requires_par_intervals_when_chr_x_bins_are_present(tmp_path, monke
         min_flank_bins=1,
         min_flank_coverage=0.0,
         baf_table=None,
+        ref_fasta=None,
     )
 
     monkeypatch.setattr(preprocess_module, "parse_args", lambda: args)
@@ -1060,6 +1066,7 @@ def test_main_rejects_empty_preprocessed_output(tmp_path, monkeypatch):
         min_flank_bins=1,
         min_flank_coverage=0.0,
         baf_table=None,
+        ref_fasta=None,
     )
 
     monkeypatch.setattr(preprocess_module, "parse_args", lambda: args)
@@ -1136,6 +1143,7 @@ def test_main_without_baf_table_skips_baf_outputs_and_reports_seven_tables(tmp_p
         min_flank_bins=1,
         min_flank_coverage=0.0,
         baf_table=None,
+        ref_fasta=None,
     )
 
     monkeypatch.setattr(preprocess_module, "parse_args", lambda: args)
@@ -1171,6 +1179,7 @@ def test_main_without_baf_table_skips_baf_outputs_and_reports_seven_tables(tmp_p
             {"cluster_keep": object()},
         ),
     )
+    monkeypatch.setattr(preprocess_module, "compute_gc_fractions", lambda df, path: np.zeros(len(df), dtype=np.float32))
     monkeypatch.setattr(
         preprocess_module,
         "build_normalization_metadata",
@@ -1244,7 +1253,6 @@ def test_collect_all_locus_bins_verbose_rebin_and_breakpoint_masking(monkeypatch
     assert list(zip(combined_df["Start"], combined_df["End"])) == [(100, 200)]
     assert [mapping.interval_name for mapping in mappings] == ["A-C"]
     assert set(included_loci) == {"cluster1"}
-
 
 
 def test_select_highres_interval_replacements_returns_only_improved_intervals():
@@ -1587,3 +1595,159 @@ def test_collect_all_locus_bins_uses_filtered_cache_and_skips_unassigned_bins(mo
     assert list(zip(combined_df["Start"], combined_df["End"])) == [(50, 100), (100, 150), (200, 250), (500, 520)]
     assert [mapping.interval_name for mapping in mappings] == ["left_flank", "A-C", "C-D"]
     assert set(included_loci) == {"cluster1"}
+
+
+def test_compute_gc_fractions_computes_per_bin_gc(tmp_path, monkeypatch):
+    """Test that compute_gc_fractions fetches sequences and computes GC fractions."""
+    import pysam
+    import subprocess
+
+    # Create a temporary FASTA file
+    fasta_path = str(tmp_path / "test.fa")
+    with open(fasta_path, "w") as f:
+        f.write(">chr1\n")
+        f.write("AAAAAACCCCCCGGGGGG\n")
+        f.write(">chr2\n")
+        f.write("TTTTTTTT\n")
+
+    # Index the FASTA (conftest stub is no-op, use samtools directly)
+    pysam.faidx(fasta_path)
+    subprocess.run(["samtools", "faidx", fasta_path], check=True, capture_output=True)
+
+    # Replace stub FastaFile with samtools-backed implementation
+    class SamtoolsFastaFile:
+        """FastaFile stub that uses samtools faidx (1-based) for pysam (0-based)."""
+        def __init__(self, path):
+            self._path = path
+
+        def fetch(self, chrom, start=None, end=None):
+            # pysam uses 0-based, samtools uses 1-based
+            if start is not None:
+                region = f"{chrom}:{start + 1}-{end}"
+            else:
+                region = chrom
+            result = subprocess.run(
+                ["samtools", "faidx", self._path, region],
+                capture_output=True, text=True, check=True,
+            )
+            lines = result.stdout.strip().split("\n")
+            return lines[1] if len(lines) > 1 else lines[0]
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(pysam, "FastaFile", SamtoolsFastaFile)
+
+    combined_df = pd.DataFrame({
+        "Chr": ["chr1", "chr1", "chr2"],
+        "Start": [0, 6, 0],
+        "End": [6, 12, 8],
+    })
+
+    gc_fractions = preprocess_module.compute_gc_fractions(combined_df, fasta_path)
+
+    # chr1:0-6 = AAAAAA, GC = 0/6 = 0.0
+    # chr1:6-12 = CCCCCC, GC = 6/6 = 1.0
+    # chr2:0-8 = TTTTTTTT, GC = 0/8 = 0.0
+    assert len(gc_fractions) == 3
+    assert gc_fractions[0] == 0.0
+    assert gc_fractions[1] == 1.0
+    assert gc_fractions[2] == 0.0
+
+
+def test_compute_gc_fractions_handles_missing_sequence(tmp_path, monkeypatch):
+    """Test that compute_gc_fractions returns NaN for missing sequences."""
+    import pysam
+    import subprocess
+
+    # Create a temporary FASTA file with only chr1
+    fasta_path = str(tmp_path / "test.fa")
+    with open(fasta_path, "w") as f:
+        f.write(">chr1\n")
+        f.write("AAAAAA\n")
+
+    pysam.faidx(fasta_path)
+    subprocess.run(["samtools", "faidx", fasta_path], check=True, capture_output=True)
+
+    class SamtoolsFastaFile:
+        """FastaFile stub that uses samtools faidx (1-based) for pysam (0-based)."""
+        def __init__(self, path):
+            self._path = path
+
+        def fetch(self, chrom, start=None, end=None):
+            # pysam uses 0-based, samtools uses 1-based
+            if start is not None:
+                region = f"{chrom}:{start + 1}-{end}"
+            else:
+                region = chrom
+            result = subprocess.run(
+                ["samtools", "faidx", self._path, region],
+                capture_output=True, text=True, check=True,
+            )
+            lines = result.stdout.strip().split("\n")
+            return lines[1] if len(lines) > 1 else lines[0]
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(pysam, "FastaFile", SamtoolsFastaFile)
+
+    combined_df = pd.DataFrame({
+        "Chr": ["chr1", "chr_missing"],
+        "Start": [0, 0],
+        "End": [6, 6],
+    })
+
+    gc_fractions = preprocess_module.compute_gc_fractions(combined_df, fasta_path)
+
+    assert len(gc_fractions) == 2
+    assert gc_fractions[0] == 0.0  # AAAAAA
+    assert np.isnan(gc_fractions[1])  # chr_missing not in FASTA
+
+
+def test_compute_gc_fractions_prints_summary(capsys, monkeypatch, tmp_path):
+    """Test that compute_gc_fractions prints a summary message."""
+    import pysam
+    import subprocess
+
+    fasta_path = str(tmp_path / "test.fa")
+    with open(fasta_path, "w") as f:
+        f.write(">chr1\n")
+        f.write("AAAAAA\n")
+
+    pysam.faidx(fasta_path)
+    subprocess.run(["samtools", "faidx", fasta_path], check=True, capture_output=True)
+
+    class SamtoolsFastaFile:
+        """FastaFile stub that uses samtools faidx (1-based) for pysam (0-based)."""
+        def __init__(self, path):
+            self._path = path
+
+        def fetch(self, chrom, start=None, end=None):
+            # pysam uses 0-based, samtools uses 1-based
+            if start is not None:
+                region = f"{chrom}:{start + 1}-{end}"
+            else:
+                region = chrom
+            result = subprocess.run(
+                ["samtools", "faidx", self._path, region],
+                capture_output=True, text=True, check=True,
+            )
+            lines = result.stdout.strip().split("\n")
+            return lines[1] if len(lines) > 1 else lines[0]
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(pysam, "FastaFile", SamtoolsFastaFile)
+
+    combined_df = pd.DataFrame({
+        "Chr": ["chr1"],
+        "Start": [0],
+        "End": [6],
+    })
+
+    gc_fractions = preprocess_module.compute_gc_fractions(combined_df, fasta_path)
+    captured = capsys.readouterr()
+    assert "GC fractions computed for 1/1 bins" in captured.out
+    assert len(gc_fractions) == 1

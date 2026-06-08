@@ -225,16 +225,26 @@ def write_posterior_tables(
 
     # Convert to numpy array and squeeze extra dimensions
     sample_var = np.asarray(map_estimates["sample_var"]).squeeze()
+    sample_gc_bias = map_estimates.get("sample_gc_bias")
+    if sample_gc_bias is not None:
+        sample_gc_bias = np.asarray(sample_gc_bias, dtype=np.float64).squeeze()
     baf_temperature = map_estimates.get("baf_temperature")
     if baf_temperature is not None:
         baf_temperature = np.asarray(baf_temperature, dtype=np.float64).squeeze()
     length_scale_var = map_estimates.get("length_scale_var")
     if length_scale_var is not None:
         length_scale_var = np.asarray(length_scale_var, dtype=np.float64).squeeze()
+    sample_df = map_estimates.get("sample_df")
+    if sample_df is not None:
+        sample_df = np.asarray(sample_df, dtype=np.float64).squeeze()
 
     # Ensure it's at least 1D
     if sample_var.ndim == 0:
         sample_var = sample_var.reshape(1)
+    if sample_gc_bias is not None and sample_gc_bias.ndim == 0:
+        sample_gc_bias = np.full(combined_data.n_samples, float(sample_gc_bias), dtype=np.float64)
+    elif sample_gc_bias is not None and sample_gc_bias.size == 1:
+        sample_gc_bias = np.full(combined_data.n_samples, float(sample_gc_bias.reshape(-1)[0]), dtype=np.float64)
     if baf_temperature is not None and baf_temperature.ndim == 0:
         baf_temperature = np.full(combined_data.n_samples, float(baf_temperature), dtype=np.float64)
     elif baf_temperature is not None and baf_temperature.size == 1:
@@ -243,6 +253,10 @@ def write_posterior_tables(
         length_scale_var = np.full(combined_data.n_samples, float(length_scale_var), dtype=np.float64)
     elif length_scale_var is not None and length_scale_var.size == 1:
         length_scale_var = np.full(combined_data.n_samples, float(length_scale_var.reshape(-1)[0]), dtype=np.float64)
+    if sample_df is not None and sample_df.ndim == 0:
+        sample_df = np.full(combined_data.n_samples, float(sample_df), dtype=np.float64)
+    elif sample_df is not None and sample_df.size == 1:
+        sample_df = np.full(combined_data.n_samples, float(sample_df.reshape(-1)[0]), dtype=np.float64)
 
     for sample_idx, sample_id in enumerate(combined_data.sample_ids):
         var_val = sample_var[sample_idx]
@@ -259,6 +273,16 @@ def write_posterior_tables(
             ls_val = length_scale_var[sample_idx]
             row["length_scale_var_map"] = (
                 ls_val.tolist() if isinstance(ls_val, np.ndarray) else float(ls_val)
+            )
+        if sample_df is not None:
+            df_val = sample_df[sample_idx]
+            row["sample_df_map"] = (
+                df_val.tolist() if isinstance(df_val, np.ndarray) else float(df_val)
+            )
+        if sample_gc_bias is not None:
+            gc_val = sample_gc_bias[sample_idx]
+            row["sample_gc_bias_map"] = (
+                gc_val.tolist() if isinstance(gc_val, np.ndarray) else float(gc_val)
             )
         sample_rows.append(row)
 

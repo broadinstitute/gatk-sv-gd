@@ -59,6 +59,8 @@ def _install_test_stub_modules():
         pysam.VariantFile = _StubVariantFile
         pysam.tabix_compress = lambda *args, **kwargs: None
         pysam.tabix_index = lambda *args, **kwargs: None
+        pysam.faidx = lambda *args, **kwargs: None
+        pysam.FastaFile = None  # Will be monkeypatched in tests that need it
         sys.modules["pysam"] = pysam
 
     if "torch" not in sys.modules:
