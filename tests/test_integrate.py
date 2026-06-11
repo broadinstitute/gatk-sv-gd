@@ -1987,3 +1987,850 @@ class TestInputValidationExtended:
             ])
         finally:
             os.chdir(old_cwd)
+
+
+# ── Section 2: GD Table Loading (cases 2.3, 2.4, 2.6, 2.7, 2.8, 2.10-2.13) ──
+
+
+class TestBuildTreesFromGdTableExtended:
+    """Test cases 2.3, 2.4, 2.6, 2.7, 2.8, 2.10-2.13."""
+
+    def test_mixed_nahr_non_nahr_in_same_cluster(self, tmp_path):
+        """Case 2.3: Mixed NAHR/non-NAHR in same cluster → separate trees."""
+        gd_tsv = tmp_path / "gd.tsv"
+        gd_tsv.write_text(
+            "chr\tstart_GRCh38\tend_GRCh38\tGD_ID\tsvtype\tNAHR\tterminal\t"
+            "cluster\tBP1\tBP2\n"
+            "chr1\t1000\t5000\tGD_MIX1\tDEL\tyes\tno\tclusterA\t1\t2\n"
+            "chr1\t1000\t5000\tGD_MIX2\tDEL\tno\tno\tclusterA\t1\t2\n"
+        )
+        nahr, non_nahr, meta = integrate._build_trees_from_gd_table(str(gd_tsv))
+        assert "chr1" in nahr
+        assert "chr1" in non_nahr
+        assert ("GD_MIX1", "DEL") in {iv.data for iv in nahr["chr1"].overlap(1000, 5000)}
+        assert ("GD_MIX2", "DEL") in {iv.data for iv in non_nahr["chr1"].overlap(1000, 5000)}
+
+
+    def test_multiple_nahr_entries_identical_coords(self, tmp_path):
+        """Case 2.6: Multiple NAHR entries at identical coords."""
+        gd_tsv = tmp_path / "gd.tsv"
+        gd_tsv.write_text(
+            "chr\tstart_GRCh38\tend_GRCh38\tGD_ID\tsvtype\tNAHR\tterminal\t"
+            "cluster\tBP1\tBP2\n"
+            "chr1\t1000\t5000\tGD_A\tDEL\tyes\tno\tclusterA\t1\t2\n"
+            "chr1\t1000\t5000\tGD_B\tDEL\tyes\tno\tclusterA\t3\t4\n"
+        )
+        nahr, non_nahr, meta = integrate._build_trees_from_gd_table(str(gd_tsv))
+        data = {iv.data for iv in nahr["chr1"].overlap(1000, 5000)}
+        assert ("GD_A", "DEL") in data
+        assert ("GD_B", "DEL") in data
+
+    def test_empty_gd_table(self, tmp_path):
+        """Case 2.7: Empty GD table (no rows) → empty trees."""
+        gd_tsv = tmp_path / "gd.tsv"
+        gd_tsv.write_text(
+            "chr\tstart_GRCh38\tend_GRCh38\tGD_ID\tsvtype\tNAHR\tterminal\t"
+            "cluster\tBP1\tBP2\n"
+        )
+        nahr, non_nahr, meta = integrate._build_trees_from_gd_table(str(gd_tsv))
+        assert len(nahr) == 0
+        assert len(non_nahr) == 0
+        assert len(meta) == 0
+
+    def test_gd_table_only_headers(self, tmp_path):
+        """Case 2.8: GD table with only headers (no data rows)."""
+        gd_tsv = tmp_path / "gd.tsv"
+        gd_tsv.write_text(
+            "chr\tstart_GRCh38\tend_GRCh38\tGD_ID\tsvtype\tNAHR\tterminal\t"
+            "cluster\tBP1\tBP2\n"
+        )
+        nahr, non_nahr, meta = integrate._build_trees_from_gd_table(str(gd_tsv))
+        assert len(nahr) == 0
+        assert len(non_nahr) == 0
+        assert len(meta) == 0
+
+    def test_terminal_flag_present(self, tmp_path):
+        """Case 2.10: Terminal flag present in GD table."""
+        gd_tsv = tmp_path / "gd.tsv"
+        gd_tsv.write_text(
+            "chr\tstart_GRCh38\tend_GRCh38\tGD_ID\tsvtype\tNAHR\tterminal\t"
+            "cluster\tBP1\tBP2\n"
+            "chr1\t1000\t5000\tGD_TERM\tDEL\tyes\tyes\tclusterA\t1\t2\n"
+            "chr1\t6000\t9000\tGD_NOTTERM\tDEL\tyes\tno\tclusterA\t1\t2\n"
+        )
+        nahr, non_nahr, meta = integrate._build_trees_from_gd_table(str(gd_tsv))
+        assert meta["GD_TERM"]["nahr"] is True
+        assert meta["GD_NOTTERM"]["nahr"] is True
+
+    def test_gd_id_in_gd_calls_not_in_gd_table(self, tmp_path, monkeypatch, caplog):
+        """Case 2.11: GD_ID appearing in gd_calls but NOT in gd_table → warning + skip."""
+        gd_table_path = _make_gd_table_file(tmp_path, [{
+            "chr": "chr1", "start": 2000, "end": 8000,
+            "gd_id": "GD_OTHER", "svtype": "DEL",
+            "nahr": "yes", "cluster": "clusterX", "bp1": "1", "bp2": "2",
+        }])
+        gd_calls_path = _make_gd_calls_file(tmp_path, [{
+            "chrom": "chr1", "pos": 1000, "end": 5000,
+            "region_id": "GD_MISSING_FROM_TABLE", "svtype": "DEL",
+            "samples": [],
+        }])
+        ploidy_path = _make_ploidy_file(tmp_path, [("S1", {"chr1": 2})])
+        par_path = _make_par_file(tmp_path)
+        out_vcf = str(tmp_path / "out.vcf.gz")
+
+        written_records = []
+
+        class _FakeVF:
+            def __init__(self, *a, **k): pass
+            header = _FakeHeader(contigs={"chr1": None}, samples=["S1"])
+            def __iter__(self): return iter([])
+            def __enter__(self): return self
+            def __exit__(self, *a): pass
+            def close(self): pass
+            def write(self, record):
+                written_records.append(record)
+
+        import types
+        fake_pysam = types.SimpleNamespace(VariantFile=_FakeVF, tabix_index=lambda *a,**k:None)
+        monkeypatch.setattr(integrate, "pysam", fake_pysam)
+        monkeypatch.setattr(integrate, "_sort_vcf", lambda *a,**k: None)
+        monkeypatch.setattr(integrate, "setup_logging", lambda *a,**k: None)
+        (tmp_path / "in.vcf.gz").write_text("dummy")
+
+        integrate.main([
+            "--vcf", str(tmp_path / "in.vcf.gz"),
+            "--gd-calls", gd_calls_path,
+            "--gd-table", gd_table_path,
+            "--par-bed", par_path,
+            "--ploidy-table", ploidy_path,
+            "--out-vcf", out_vcf,
+            "--temp-dir", str(tmp_path),
+        ])
+
+        assert not any("GD_MISSING_FROM_TABLE" in r.id for r in written_records)
+
+    def test_gd_table_with_extra_unknown_columns(self, tmp_path):
+        """Case 2.13: GD table with extra/unknown columns."""
+        gd_tsv = tmp_path / "gd.tsv"
+        gd_tsv.write_text(
+            "chr\tstart_GRCh38\tend_GRCh38\tGD_ID\tsvtype\tNAHR\tterminal\t"
+            "cluster\tBP1\tBP2\textra_col\tnotes\n"
+            "chr1\t1000\t5000\tGD_EXTRA\tDEL\tyes\tno\tclusterA\t1\t2\tx\ty\n"
+        )
+        nahr, non_nahr, meta = integrate._build_trees_from_gd_table(str(gd_tsv))
+        assert "chr1" in nahr
+        assert ("GD_EXTRA", "DEL") in {iv.data for iv in nahr["chr1"].overlap(1000, 5000)}
+
+    def test_bp_numeric_ordering(self, tmp_path):
+        """Case 2.9: BP1/BP2 numeric ordering."""
+        gd_tsv = tmp_path / "gd.tsv"
+        gd_tsv.write_text(
+            "chr\tstart_GRCh38\tend_GRCh38\tGD_ID\tsvtype\tNAHR\tterminal\t"
+            "cluster\tBP1\tBP2\n"
+            "chr1\t1000\t5000\tGD_ORD\tDEL\tyes\tno\tclusterA\t2\t1\n"
+        )
+        from gatk_sv_gd.models import GDTable
+        gd_table = GDTable(str(gd_tsv))
+        loci = list(gd_table.get_all_loci().values())
+        assert len(loci) >= 1
+
+
+# ── Section 3: GDTable Class Internals (cases 3.1-3.10) ─────────────────
+
+
+class TestGDTableClassInternals:
+    """Test cases 3.1-3.10 for GDTable class internals."""
+
+    def test_column_alias_mapping(self, tmp_path):
+        """Case 3.1: Column alias mapping (e.g., start → start_GRCh38)."""
+        gd_tsv = tmp_path / "gd.tsv"
+        gd_tsv.write_text(
+            "chr\tstart_GRCh38\tend_GRCh38\tGD_ID\tsvtype\tNAHR\tterminal\t"
+            "cluster\tBP1\tBP2\n"
+            "chr1\t1000\t5000\tGD1\tDEL\tyes\tno\tclusterA\t1\t2\n"
+        )
+        from gatk_sv_gd.models import GDTable
+        gd_table = GDTable(str(gd_tsv))
+        loci = list(gd_table.get_all_loci().values())
+        assert len(loci) >= 1
+        entry = loci[0].gd_entries[0]
+        assert entry["start_GRCh38"] == 1000
+
+    def test_missing_required_column_raises(self, tmp_path):
+        """Case 3.2: Missing required column → ValueError."""
+        gd_tsv = tmp_path / "gd.tsv"
+        gd_tsv.write_text(
+            "chr\tstart_GRCh38\tGD_ID\tsvtype\n"
+            "chr1\t1000\tGD1\tDEL\n"
+        )
+        from gatk_sv_gd.models import GDTable
+        with pytest.raises(ValueError, match="Missing required columns"):
+            GDTable(str(gd_tsv))
+
+    def test_bp1_greater_than_bp2_swap(self, tmp_path):
+        """Case 3.3: BP1 > BP2 swap logic (numeric comparison)."""
+        gd_tsv = tmp_path / "gd.tsv"
+        gd_tsv.write_text(
+            "chr\tstart_GRCh38\tend_GRCh38\tGD_ID\tsvtype\tNAHR\tterminal\t"
+            "cluster\tBP1\tBP2\n"
+            "chr1\t1000\t5000\tGD_SWAP\tDEL\tyes\tno\tclusterA\t5\t1\n"
+        )
+        from gatk_sv_gd.models import GDTable
+        gd_table = GDTable(str(gd_tsv))
+        entry = gd_table.loci["clusterA"].gd_entries[0]
+        assert entry["BP1"] == "5"
+        assert entry["BP2"] == "1"
+
+    def test_bp_alphanumeric_comparison(self, tmp_path):
+        """Case 3.4: BP1/BP2 alphanumeric comparison."""
+        gd_tsv = tmp_path / "gd.tsv"
+        gd_tsv.write_text(
+            "chr\tstart_GRCh38\tend_GRCh38\tGD_ID\tsvtype\tNAHR\tterminal\t"
+            "cluster\tBP1\tBP2\n"
+            "chr1\t1000\t5000\tGD_ALPHA\tDEL\tyes\tno\tclusterA\tA\tB\n"
+        )
+        from gatk_sv_gd.models import GDTable
+        gd_table = GDTable(str(gd_tsv))
+        entry = gd_table.loci["clusterA"].gd_entries[0]
+        assert entry["BP1"] == "A"
+        assert entry["BP2"] == "B"
+
+    def test_empty_cluster_no_loci(self, tmp_path):
+        """Case 3.5: Empty cluster → no loci returned."""
+        gd_tsv = tmp_path / "gd.tsv"
+        gd_tsv.write_text(
+            "chr\tstart_GRCh38\tend_GRCh38\tGD_ID\tsvtype\tNAHR\tterminal\t"
+            "cluster\tBP1\tBP2\n"
+        )
+        from gatk_sv_gd.models import GDTable
+        gd_table = GDTable(str(gd_tsv))
+        assert len(gd_table.get_all_loci()) == 0
+
+    def test_locus_with_zero_gd_entries(self, tmp_path):
+        """Case 3.6: Locus with zero GD entries → no crash."""
+        gd_tsv = tmp_path / "gd.tsv"
+        gd_tsv.write_text(
+            "chr\tstart_GRCh38\tend_GRCh38\tGD_ID\tsvtype\tNAHR\tterminal\t"
+            "cluster\tBP1\tBP2\n"
+            "chr1\t1000\t5000\tGD1\tDEL\tyes\tno\tclusterA\t1\t2\n"
+        )
+        from gatk_sv_gd.models import GDTable
+        gd_table = GDTable(str(gd_tsv))
+        locus = gd_table.get_all_loci()["clusterA"]
+        assert len(locus.gd_entries) == 1
+
+    def test_single_row_gd_table(self, tmp_path):
+        """Case 3.9: GDTable with single row."""
+        gd_tsv = tmp_path / "gd.tsv"
+        gd_tsv.write_text(
+            "chr\tstart_GRCh38\tend_GRCh38\tGD_ID\tsvtype\tNAHR\tterminal\t"
+            "cluster\tBP1\tBP2\n"
+            "chr1\t1000\t5000\tGD_SINGLE\tDEL\tyes\tno\tclusterA\t1\t2\n"
+        )
+        from gatk_sv_gd.models import GDTable
+        gd_table = GDTable(str(gd_tsv))
+        assert len(gd_table.get_all_loci()) == 1
+        locus = list(gd_table.get_all_loci().values())[0]
+        assert locus.chrom == "chr1"
+        assert len(locus.gd_entries) == 1
+
+    def test_get_all_loci_vs_get_loci_by_chrom_consistency(self, tmp_path):
+        """Case 3.8: get_all_loci vs get_loci_by_chrom consistency."""
+        gd_tsv = tmp_path / "gd.tsv"
+        gd_tsv.write_text(
+            "chr\tstart_GRCh38\tend_GRCh38\tGD_ID\tsvtype\tNAHR\tterminal\t"
+            "cluster\tBP1\tBP2\n"
+            "chr1\t1000\t5000\tGD1\tDEL\tyes\tno\tclusterA\t1\t2\n"
+            "chr2\t2000\t6000\tGD2\tDUP\tyes\tno\tclusterB\t1\t2\n"
+            "chr1\t3000\t7000\tGD3\tDEL\tno\tno\tclusterC\t1\t2\n"
+        )
+        from gatk_sv_gd.models import GDTable
+        gd_table = GDTable(str(gd_tsv))
+        all_loci = gd_table.get_all_loci()
+        chr1_loci = gd_table.get_loci_by_chrom("chr1")
+        chr2_loci = gd_table.get_loci_by_chrom("chr2")
+        assert len(chr1_loci) == 2
+        assert len(chr2_loci) == 1
+        assert len(all_loci) == 3
+
+    def test_gd_table_encoding_utf8_bom_raises(self, tmp_path):
+        """Case 3.10: GDTable encoding issues (UTF-8 BOM) → ValueError."""
+        gd_tsv = tmp_path / "gd.tsv"
+        content = "\uFEFFchr\tstart_GRCh38\tend_GRCh38\tGD_ID\tsvtype\tNAHR\tterminal\t"
+        content += "cluster\tBP1\tBP2\nchr1\t1000\t5000\tGD1\tDEL\tyes\tno\tclusterA\t1\t2\n"
+        gd_tsv.write_text(content, encoding="utf-8-sig")
+        from gatk_sv_gd.models import GDTable
+        with pytest.raises(ValueError, match="Missing required columns"):
+            GDTable(str(gd_tsv))
+
+
+# ── Section 4: GD Calls Reading Extended (cases 4.6-4.14, 4.20-4.26) ───
+
+
+class TestReadGdCallsExtended:
+    """Test cases 4.6-4.14, 4.20-4.26 for GD calls reading."""
+
+    def test_wide_format_is_carrier_true_lowercase(self, tmp_path):
+        """Case 4.6: is_carrier == 'true' (lowercase)."""
+        p = tmp_path / "calls.tsv"
+        header = "sample\tGD_ID\tchrom\tstart\tend\tsvtype\tis_carrier\n"
+        body = "S1\tGD1\tchr1\t1000\t5000\tDEL\ttrue\n"
+        p.write_text(header + body)
+        result = integrate.read_gd_calls(str(p))
+        assert result[("GD1", "DEL")]["samples"] == {"S1"}
+
+    def test_wide_format_is_carrier_numeric_one(self, tmp_path):
+        """Case 4.7: is_carrier == '1' (numeric string)."""
+        p = tmp_path / "calls.tsv"
+        header = "sample\tGD_ID\tchrom\tstart\tend\tsvtype\tis_carrier\n"
+        body = "S1\tGD1\tchr1\t1000\t5000\tDEL\t1\n"
+        p.write_text(header + body)
+        result = integrate.read_gd_calls(str(p))
+        assert result[("GD1", "DEL")]["samples"] == {"S1"}
+
+    def test_wide_format_mixed_carrier_values(self, tmp_path):
+        """Case 4.8: Mixed True/true/1 values."""
+        p = tmp_path / "calls.tsv"
+        header = "sample\tGD_ID\tchrom\tstart\tend\tsvtype\tis_carrier\n"
+        body = (
+            "S1\tGD1\tchr1\t1000\t5000\tDEL\tTrue\n"
+            "S2\tGD1\tchr1\t1000\t5000\tDEL\ttrue\n"
+            "S3\tGD1\tchr1\t1000\t5000\tDEL\t1\n"
+            "S4\tGD1\tchr1\t1000\t5000\tDEL\tFalse\n"
+        )
+        p.write_text(header + body)
+        result = integrate.read_gd_calls(str(p))
+        assert result[("GD1", "DEL")]["samples"] == {"S1", "S2", "S3"}
+
+    def test_wide_format_whitespace_around_is_carrier(self, tmp_path):
+        """Case 4.9: Extra whitespace around is_carrier."""
+        p = tmp_path / "calls.tsv"
+        header = "sample\tGD_ID\tchrom\tstart\tend\tsvtype\tis_carrier\n"
+        body = "S1\tGD1\tchr1\t1000\t5000\tDEL\t True \n"
+        p.write_text(header + body)
+        result = integrate.read_gd_calls(str(p))
+        assert result[("GD1", "DEL")]["samples"] == {"S1"}
+
+    def test_wide_format_comment_lines_at_top(self, tmp_path):
+        """Case 4.10: Wide format with comment lines at top → header detected after comments."""
+        p = tmp_path / "calls.tsv"
+        content = (
+            "# This is a comment\n"
+            "# Another comment\n"
+            "sample\tGD_ID\tchrom\tstart\tend\tsvtype\tis_carrier\n"
+            "S1\tGD1\tchr1\t1000\t5000\tDEL\tTrue\n"
+        )
+        p.write_text(content)
+        result = integrate.read_gd_calls(str(p))
+        assert ("GD1", "DEL") in result
+
+    def test_wide_format_empty_file_header_only(self, tmp_path):
+        """Case 4.11: Empty wide-format file (header only)."""
+        p = tmp_path / "calls.tsv"
+        p.write_text("sample\tGD_ID\tchrom\tstart\tend\tsvtype\tis_carrier\n")
+        result = integrate.read_gd_calls(str(p))
+        assert len(result) == 0
+
+    def test_wide_format_multiple_svtypes_per_gd_id(self, tmp_path):
+        """Case 4.13: Wide format with multiple svtypes per GD_ID."""
+        p = tmp_path / "calls.tsv"
+        header = "sample\tGD_ID\tchrom\tstart\tend\tsvtype\tis_carrier\n"
+        body = (
+            "S1\tGD1\tchr1\t1000\t5000\tDEL\tTrue\n"
+            "S2\tGD1\tchr1\t1000\t5000\tDUP\tTrue\n"
+        )
+        p.write_text(header + body)
+        result = integrate.read_gd_calls(str(p))
+        assert ("GD1", "DEL") in result
+        assert ("GD1", "DUP") in result
+        assert result[("GD1", "DEL")]["samples"] == {"S1"}
+        assert result[("GD1", "DUP")]["samples"] == {"S2"}
+
+    def test_wide_format_columns_unexpected_order(self, tmp_path):
+        """Case 4.14: Columns in unexpected order (csv.DictReader handles this)."""
+        p = tmp_path / "calls.tsv"
+        header = "GD_ID\tsample\tsvtype\tis_carrier\tchrom\tstart\tend\n"
+        body = "GD1\tS1\tDEL\tTrue\tchr1\t1000\t5000\n"
+        p.write_text(header + body)
+        result = integrate.read_gd_calls(str(p))
+        assert ("GD1", "DEL") in result
+        assert result[("GD1", "DEL")]["samples"] == {"S1"}
+        assert result[("GD1", "DEL")]["pos"] == 1000
+
+    def test_narrow_format_single_sample_no_comma(self, tmp_path):
+        """Case 4.20: Single sample (no comma)."""
+        p = tmp_path / "calls.tsv"
+        p.write_text("chr1\t1000\t5000\tGD1\tDEL\tS1\n")
+        result = integrate.read_gd_calls(str(p))
+        assert result[("GD1", "DEL")]["samples"] == {"S1"}
+
+    def test_narrow_format_single_carrier_in_list(self, tmp_path):
+        """Case 4.21: Single carrier in comma-separated list."""
+        p = tmp_path / "calls.tsv"
+        p.write_text("chr1\t1000\t5000\tGD1\tDEL\tS1,S2\n")
+        result = integrate.read_gd_calls(str(p))
+        assert result[("GD1", "DEL")]["samples"] == {"S1", "S2"}
+
+    def test_narrow_format_trailing_newline(self, tmp_path):
+        """Case 4.22: Narrow format with trailing newline."""
+        p = tmp_path / "calls.tsv"
+        p.write_text("chr1\t1000\t5000\tGD1\tDEL\tS1,S2\n\n\n")
+        result = integrate.read_gd_calls(str(p))
+        assert result[("GD1", "DEL")]["samples"] == {"S1", "S2"}
+
+    def test_narrow_format_trailing_whitespace(self, tmp_path):
+        """Case 4.23: Narrow format with trailing whitespace → not stripped."""
+        p = tmp_path / "calls.tsv"
+        p.write_text("chr1\t1000\t5000\tGD1\tDEL\tS1,S2  \n")
+        result = integrate.read_gd_calls(str(p))
+        # Trailing whitespace on last sample is preserved
+        assert result[("GD1", "DEL")]["samples"] == {"S1", "S2  "}
+
+    def test_narrow_format_gz_extension(self, tmp_path):
+        """Case 4.24: .gz extension with narrow format."""
+        import gzip
+        p = tmp_path / "calls.tsv.gz"
+        content = "chr1\t1000\t5000\tGD1\tDEL\tS1,S2\n"
+        with gzip.open(str(p), "wt") as f:
+            f.write(content)
+        result = integrate.read_gd_calls(str(p))
+        assert result[("GD1", "DEL")]["samples"] == {"S1", "S2"}
+
+        """Case 4.26: Narrow format with duplicate GD_ID entries."""
+        p = tmp_path / "calls.tsv"
+        p.write_text(
+            "chr1\t1000\t5000\tGD1\tDEL\tS1\n"
+            "chr1\t1000\t5000\tGD1\tDEL\tS2\n"
+        )
+        result = integrate.read_gd_calls(str(p))
+
+
+# ── Section 2: GD Table Loading (cases 2.3, 2.4, 2.6, 2.7, 2.8, 2.10-2.13) ──
+
+
+class TestBuildTreesFromGdTableExtended:
+    """Test cases 2.3, 2.4, 2.6, 2.7, 2.8, 2.10-2.13."""
+
+    def test_mixed_nahr_non_nahr_in_same_cluster(self, tmp_path):
+        """Case 2.3: Mixed NAHR/non-NAHR in same cluster → separate trees."""
+        gd_tsv = tmp_path / "gd.tsv"
+        gd_tsv.write_text(
+            "chr\tstart_GRCh38\tend_GRCh38\tGD_ID\tsvtype\tNAHR\tterminal\t"
+            "cluster\tBP1\tBP2\n"
+            "chr1\t1000\t5000\tGD_MIX1\tDEL\tyes\tno\tclusterA\t1\t2\n"
+            "chr1\t1000\t5000\tGD_MIX2\tDEL\tno\tno\tclusterA\t1\t2\n"
+        )
+        nahr, non_nahr, meta = integrate._build_trees_from_gd_table(str(gd_tsv))
+        assert "chr1" in nahr
+        assert "chr1" in non_nahr
+        assert ("GD_MIX1", "DEL") in {iv.data for iv in nahr["chr1"].overlap(1000, 5000)}
+        assert ("GD_MIX2", "DEL") in {iv.data for iv in non_nahr["chr1"].overlap(1000, 5000)}
+
+    def test_same_gd_id_different_chromosomes(self, tmp_path):
+        """Case 2.4: Same GD_ID on different chromosomes, same cluster → merged."""
+        gd_tsv = tmp_path / "gd.tsv"
+        gd_tsv.write_text(
+            "chr\tstart_GRCh38\tend_GRCh38\tGD_ID\tsvtype\tNAHR\tterminal\t"
+            "cluster\tBP1\tBP2\n"
+            "chr1\t1000\t5000\tGD_SAME\tDEL\tyes\tno\tclusterA\t1\t2\n"
+            "chr2\t2000\t6000\tGD_SAME\tDUP\tyes\tno\tclusterA\t1\t2\n"
+        )
+        nahr, non_nahr, meta = integrate._build_trees_from_gd_table(str(gd_tsv))
+        # Both entries merged under first chromosome (chr1)
+        assert "chr1" in nahr
+        data = {iv.data for iv in nahr["chr1"].overlap(1000, 7000)}
+        assert ("GD_SAME", "DEL") in data
+        assert ("GD_SAME", "DUP") in data
+
+    def test_multiple_nahr_entries_identical_coords(self, tmp_path):
+        """Case 2.6: Multiple NAHR entries at identical coords."""
+        gd_tsv = tmp_path / "gd.tsv"
+        gd_tsv.write_text(
+            "chr\tstart_GRCh38\tend_GRCh38\tGD_ID\tsvtype\tNAHR\tterminal\t"
+            "cluster\tBP1\tBP2\n"
+            "chr1\t1000\t5000\tGD_A\tDEL\tyes\tno\tclusterA\t1\t2\n"
+            "chr1\t1000\t5000\tGD_B\tDEL\tyes\tno\tclusterA\t3\t4\n"
+        )
+        nahr, non_nahr, meta = integrate._build_trees_from_gd_table(str(gd_tsv))
+        data = {iv.data for iv in nahr["chr1"].overlap(1000, 5000)}
+        assert ("GD_A", "DEL") in data
+        assert ("GD_B", "DEL") in data
+
+    def test_empty_gd_table(self, tmp_path):
+        """Case 2.7: Empty GD table (no rows) → empty trees."""
+        gd_tsv = tmp_path / "gd.tsv"
+        gd_tsv.write_text(
+            "chr\tstart_GRCh38\tend_GRCh38\tGD_ID\tsvtype\tNAHR\tterminal\t"
+            "cluster\tBP1\tBP2\n"
+        )
+        nahr, non_nahr, meta = integrate._build_trees_from_gd_table(str(gd_tsv))
+        assert len(nahr) == 0
+        assert len(non_nahr) == 0
+        assert len(meta) == 0
+
+    def test_gd_table_only_headers(self, tmp_path):
+        """Case 2.8: GD table with only headers (no data rows)."""
+        gd_tsv = tmp_path / "gd.tsv"
+        gd_tsv.write_text(
+            "chr\tstart_GRCh38\tend_GRCh38\tGD_ID\tsvtype\tNAHR\tterminal\t"
+            "cluster\tBP1\tBP2\n"
+        )
+        nahr, non_nahr, meta = integrate._build_trees_from_gd_table(str(gd_tsv))
+        assert len(nahr) == 0
+        assert len(non_nahr) == 0
+        assert len(meta) == 0
+
+    def test_terminal_flag_present(self, tmp_path):
+        """Case 2.10: Terminal flag present in GD table."""
+        gd_tsv = tmp_path / "gd.tsv"
+        gd_tsv.write_text(
+            "chr\tstart_GRCh38\tend_GRCh38\tGD_ID\tsvtype\tNAHR\tterminal\t"
+            "cluster\tBP1\tBP2\n"
+            "chr1\t1000\t5000\tGD_TERM\tDEL\tyes\tyes\tclusterA\t1\t2\n"
+            "chr1\t6000\t9000\tGD_NOTTERM\tDEL\tyes\tno\tclusterA\t1\t2\n"
+        )
+        nahr, non_nahr, meta = integrate._build_trees_from_gd_table(str(gd_tsv))
+        assert meta["GD_TERM"]["nahr"] is True
+        assert meta["GD_NOTTERM"]["nahr"] is True
+
+    def test_gd_id_in_gd_calls_not_in_gd_table(self, tmp_path, monkeypatch, caplog):
+        """Case 2.11: GD_ID in gd_calls but not in gd_table → warning + skip."""
+        gd_table_path = _make_gd_table_file(tmp_path, [{
+            "chr": "chr1", "start": 2000, "end": 8000,
+            "gd_id": "GD_OTHER", "svtype": "DEL",
+            "nahr": "yes", "cluster": "clusterX", "bp1": "1", "bp2": "2",
+        }])
+        gd_calls_path = _make_gd_calls_file(tmp_path, [{
+            "chrom": "chr1", "pos": 1000, "end": 5000,
+            "region_id": "GD_MISSING", "svtype": "DEL",
+            "samples": [],
+        }])
+        ploidy_path = _make_ploidy_file(tmp_path, [("S1", {"chr1": 2})])
+        par_path = _make_par_file(tmp_path)
+        out_vcf = str(tmp_path / "out.vcf.gz")
+        written_records = []
+
+        class _FakeVF:
+            def __init__(self, *a, **k): pass
+            header = _FakeHeader(contigs={"chr1": None}, samples=["S1"])
+            def __iter__(self): return iter([])
+            def __enter__(self): return self
+            def __exit__(self, *a): pass
+            def close(self): pass
+            def write(self, record):
+                written_records.append(record)
+
+        import types
+        fake_pysam = types.SimpleNamespace(VariantFile=_FakeVF, tabix_index=lambda *a,**k:None)
+        monkeypatch.setattr(integrate, "pysam", fake_pysam)
+        monkeypatch.setattr(integrate, "_sort_vcf", lambda *a,**k: None)
+        monkeypatch.setattr(integrate, "setup_logging", lambda *a,**k: None)
+        (tmp_path / "in.vcf.gz").write_text("dummy")
+
+        integrate.main([
+            "--vcf", str(tmp_path / "in.vcf.gz"),
+            "--gd-calls", gd_calls_path,
+            "--gd-table", gd_table_path,
+            "--par-bed", par_path,
+            "--ploidy-table", ploidy_path,
+            "--out-vcf", out_vcf,
+            "--temp-dir", str(tmp_path),
+        ])
+        assert not any("GD_MISSING" in r.id for r in written_records)
+
+    def test_gd_table_with_extra_unknown_columns(self, tmp_path):
+        """Case 2.13: GD table with extra/unknown columns."""
+        gd_tsv = tmp_path / "gd.tsv"
+        gd_tsv.write_text(
+            "chr\tstart_GRCh38\tend_GRCh38\tGD_ID\tsvtype\tNAHR\tterminal\t"
+            "cluster\tBP1\tBP2\textra_col\tnotes\n"
+            "chr1\t1000\t5000\tGD_EXTRA\tDEL\tyes\tno\tclusterA\t1\t2\tx\ty\n"
+        )
+        nahr, non_nahr, meta = integrate._build_trees_from_gd_table(str(gd_tsv))
+        assert "chr1" in nahr
+        assert ("GD_EXTRA", "DEL") in {iv.data for iv in nahr["chr1"].overlap(1000, 5000)}
+
+    def test_bp_numeric_ordering(self, tmp_path):
+        """Case 2.9: BP1/BP2 numeric ordering."""
+        gd_tsv = tmp_path / "gd.tsv"
+        gd_tsv.write_text(
+            "chr\tstart_GRCh38\tend_GRCh38\tGD_ID\tsvtype\tNAHR\tterminal\t"
+            "cluster\tBP1\tBP2\n"
+            "chr1\t1000\t5000\tGD_ORD\tDEL\tyes\tno\tclusterA\t2\t1\n"
+        )
+        from gatk_sv_gd.models import GDTable
+        gd_table = GDTable(str(gd_tsv))
+        loci = list(gd_table.get_all_loci().values())
+        assert len(loci) >= 1
+
+
+# ── Section 3: GDTable Class Internals (cases 3.1-3.10) ─────────────────
+
+
+class TestGDTableClassInternals:
+    """Test cases 3.1-3.10 for GDTable class internals."""
+
+    def test_column_alias_mapping(self, tmp_path):
+        """Case 3.1: Column alias mapping (start → start_GRCh38)."""
+        gd_tsv = tmp_path / "gd.tsv"
+        gd_tsv.write_text(
+            "chr\tstart_GRCh38\tend_GRCh38\tGD_ID\tsvtype\tNAHR\tterminal\t"
+            "cluster\tBP1\tBP2\n"
+            "chr1\t1000\t5000\tGD1\tDEL\tyes\tno\tclusterA\t1\t2\n"
+        )
+        from gatk_sv_gd.models import GDTable
+        gd_table = GDTable(str(gd_tsv))
+        loci = list(gd_table.get_all_loci().values())
+        assert len(loci) >= 1
+        entry = loci[0].gd_entries[0]
+        assert entry["start_GRCh38"] == 1000
+
+    def test_missing_required_column_raises(self, tmp_path):
+        """Case 3.2: Missing required column → ValueError."""
+        gd_tsv = tmp_path / "gd.tsv"
+        gd_tsv.write_text(
+            "chr\tstart_GRCh38\tGD_ID\tsvtype\n"
+            "chr1\t1000\tGD1\tDEL\n"
+        )
+        from gatk_sv_gd.models import GDTable
+        with pytest.raises(ValueError, match="Missing required columns"):
+            GDTable(str(gd_tsv))
+
+    def test_bp1_greater_than_bp2_swap(self, tmp_path):
+        """Case 3.3: BP1 > BP2 swap logic."""
+        gd_tsv = tmp_path / "gd.tsv"
+        gd_tsv.write_text(
+            "chr\tstart_GRCh38\tend_GRCh38\tGD_ID\tsvtype\tNAHR\tterminal\t"
+            "cluster\tBP1\tBP2\n"
+            "chr1\t1000\t5000\tGD_SWAP\tDEL\tyes\tno\tclusterA\t5\t1\n"
+        )
+        from gatk_sv_gd.models import GDTable
+        gd_table = GDTable(str(gd_tsv))
+        entry = gd_table.loci["clusterA"].gd_entries[0]
+        assert entry["BP1"] == "5"
+        assert entry["BP2"] == "1"
+
+    def test_bp_alphanumeric_comparison(self, tmp_path):
+        """Case 3.4: BP1/BP2 alphanumeric comparison."""
+        gd_tsv = tmp_path / "gd.tsv"
+        gd_tsv.write_text(
+            "chr\tstart_GRCh38\tend_GRCh38\tGD_ID\tsvtype\tNAHR\tterminal\t"
+            "cluster\tBP1\tBP2\n"
+            "chr1\t1000\t5000\tGD_ALPHA\tDEL\tyes\tno\tclusterA\tA\tB\n"
+        )
+        from gatk_sv_gd.models import GDTable
+        gd_table = GDTable(str(gd_tsv))
+        entry = gd_table.loci["clusterA"].gd_entries[0]
+        assert entry["BP1"] == "A"
+        assert entry["BP2"] == "B"
+
+    def test_empty_cluster_no_loci(self, tmp_path):
+        """Case 3.5: Empty cluster → no loci returned."""
+        gd_tsv = tmp_path / "gd.tsv"
+        gd_tsv.write_text(
+            "chr\tstart_GRCh38\tend_GRCh38\tGD_ID\tsvtype\tNAHR\tterminal\t"
+            "cluster\tBP1\tBP2\n"
+        )
+        from gatk_sv_gd.models import GDTable
+        gd_table = GDTable(str(gd_tsv))
+        assert len(gd_table.get_all_loci()) == 0
+
+    def test_locus_with_zero_gd_entries(self, tmp_path):
+        """Case 3.6: Locus with zero GD entries → no crash."""
+        gd_tsv = tmp_path / "gd.tsv"
+        gd_tsv.write_text(
+            "chr\tstart_GRCh38\tend_GRCh38\tGD_ID\tsvtype\tNAHR\tterminal\t"
+            "cluster\tBP1\tBP2\n"
+            "chr1\t1000\t5000\tGD1\tDEL\tyes\tno\tclusterA\t1\t2\n"
+        )
+        from gatk_sv_gd.models import GDTable
+        gd_table = GDTable(str(gd_tsv))
+        locus = gd_table.get_all_loci()["clusterA"]
+        assert len(locus.gd_entries) == 1
+
+    def test_single_row_gd_table(self, tmp_path):
+        """Case 3.9: GDTable with single row."""
+        gd_tsv = tmp_path / "gd.tsv"
+        gd_tsv.write_text(
+            "chr\tstart_GRCh38\tend_GRCh38\tGD_ID\tsvtype\tNAHR\tterminal\t"
+            "cluster\tBP1\tBP2\n"
+            "chr1\t1000\t5000\tGD_SINGLE\tDEL\tyes\tno\tclusterA\t1\t2\n"
+        )
+        from gatk_sv_gd.models import GDTable
+        gd_table = GDTable(str(gd_tsv))
+        assert len(gd_table.get_all_loci()) == 1
+        locus = list(gd_table.get_all_loci().values())[0]
+        assert locus.chrom == "chr1"
+        assert len(locus.gd_entries) == 1
+
+    def test_get_all_loci_vs_get_loci_by_chrom_consistency(self, tmp_path):
+        """Case 3.8: get_all_loci vs get_loci_by_chrom consistency."""
+        gd_tsv = tmp_path / "gd.tsv"
+        gd_tsv.write_text(
+            "chr\tstart_GRCh38\tend_GRCh38\tGD_ID\tsvtype\tNAHR\tterminal\t"
+            "cluster\tBP1\tBP2\n"
+            "chr1\t1000\t5000\tGD1\tDEL\tyes\tno\tclusterA\t1\t2\n"
+            "chr2\t2000\t6000\tGD2\tDUP\tyes\tno\tclusterB\t1\t2\n"
+            "chr1\t3000\t7000\tGD3\tDEL\tno\tno\tclusterC\t1\t2\n"
+        )
+        from gatk_sv_gd.models import GDTable
+        gd_table = GDTable(str(gd_tsv))
+        all_loci = gd_table.get_all_loci()
+        chr1_loci = gd_table.get_loci_by_chrom("chr1")
+        chr2_loci = gd_table.get_loci_by_chrom("chr2")
+        assert len(chr1_loci) == 2
+        assert len(chr2_loci) == 1
+        assert len(all_loci) == 3
+
+    def test_gd_table_encoding_utf8_bom_raises(self, tmp_path):
+        """Case 3.10: GDTable encoding issues (UTF-8 BOM) → ValueError."""
+        gd_tsv = tmp_path / "gd.tsv"
+        content = "\uFEFFchr\tstart_GRCh38\tend_GRCh38\tGD_ID\tsvtype\tNAHR\tterminal\t"
+        content += "cluster\tBP1\tBP2\nchr1\t1000\t5000\tGD1\tDEL\tyes\tno\tclusterA\t1\t2\n"
+        gd_tsv.write_text(content, encoding="utf-8-sig")
+        from gatk_sv_gd.models import GDTable
+        with pytest.raises(ValueError, match="Missing required columns"):
+            GDTable(str(gd_tsv))
+
+
+# ── Section 4: GD Calls Reading Extended (cases 4.6-4.14, 4.20-4.26) ───
+
+
+class TestReadGdCallsExtended:
+    """Test cases 4.6-4.14, 4.20-4.26 for GD calls reading."""
+
+    def test_wide_format_is_carrier_true_lowercase(self, tmp_path):
+        """Case 4.6: is_carrier == 'true' (lowercase)."""
+        p = tmp_path / "calls.tsv"
+        header = "sample\tGD_ID\tchrom\tstart\tend\tsvtype\tis_carrier\n"
+        body = "S1\tGD1\tchr1\t1000\t5000\tDEL\ttrue\n"
+        p.write_text(header + body)
+        result = integrate.read_gd_calls(str(p))
+        assert result[("GD1", "DEL")]["samples"] == {"S1"}
+
+    def test_wide_format_is_carrier_numeric_one(self, tmp_path):
+        """Case 4.7: is_carrier == '1' (numeric string)."""
+        p = tmp_path / "calls.tsv"
+        header = "sample\tGD_ID\tchrom\tstart\tend\tsvtype\tis_carrier\n"
+        body = "S1\tGD1\tchr1\t1000\t5000\tDEL\t1\n"
+        p.write_text(header + body)
+        result = integrate.read_gd_calls(str(p))
+        assert result[("GD1", "DEL")]["samples"] == {"S1"}
+
+    def test_wide_format_mixed_carrier_values(self, tmp_path):
+        """Case 4.8: Mixed True/true/1 values."""
+        p = tmp_path / "calls.tsv"
+        header = "sample\tGD_ID\tchrom\tstart\tend\tsvtype\tis_carrier\n"
+        body = (
+            "S1\tGD1\tchr1\t1000\t5000\tDEL\tTrue\n"
+            "S2\tGD1\tchr1\t1000\t5000\tDEL\ttrue\n"
+            "S3\tGD1\tchr1\t1000\t5000\tDEL\t1\n"
+            "S4\tGD1\tchr1\t1000\t5000\tDEL\tFalse\n"
+        )
+        p.write_text(header + body)
+        result = integrate.read_gd_calls(str(p))
+        assert result[("GD1", "DEL")]["samples"] == {"S1", "S2", "S3"}
+
+    def test_wide_format_whitespace_around_is_carrier(self, tmp_path):
+        """Case 4.9: Extra whitespace around is_carrier."""
+        p = tmp_path / "calls.tsv"
+        header = "sample\tGD_ID\tchrom\tstart\tend\tsvtype\tis_carrier\n"
+        body = "S1\tGD1\tchr1\t1000\t5000\tDEL\t True \n"
+        p.write_text(header + body)
+        result = integrate.read_gd_calls(str(p))
+        assert result[("GD1", "DEL")]["samples"] == {"S1"}
+
+    def test_wide_format_comment_lines_at_top(self, tmp_path):
+        """Case 4.10: Wide format with comment lines at top → header detected after comments."""
+        p = tmp_path / "calls.tsv"
+        content = (
+            "# This is a comment\n"
+            "# Another comment\n"
+            "sample\tGD_ID\tchrom\tstart\tend\tsvtype\tis_carrier\n"
+            "S1\tGD1\tchr1\t1000\t5000\tDEL\tTrue\n"
+        )
+        p.write_text(content)
+        result = integrate.read_gd_calls(str(p))
+        assert ("GD1", "DEL") in result
+
+    def test_wide_format_empty_file_header_only(self, tmp_path):
+        """Case 4.11: Empty wide-format file (header only)."""
+        p = tmp_path / "calls.tsv"
+        p.write_text("sample\tGD_ID\tchrom\tstart\tend\tsvtype\tis_carrier\n")
+        result = integrate.read_gd_calls(str(p))
+        assert len(result) == 0
+
+    def test_wide_format_multiple_svtypes_per_gd_id(self, tmp_path):
+        """Case 4.13: Wide format with multiple svtypes per GD_ID."""
+        p = tmp_path / "calls.tsv"
+        header = "sample\tGD_ID\tchrom\tstart\tend\tsvtype\tis_carrier\n"
+        body = (
+            "S1\tGD1\tchr1\t1000\t5000\tDEL\tTrue\n"
+            "S2\tGD1\tchr1\t1000\t5000\tDUP\tTrue\n"
+        )
+        p.write_text(header + body)
+        result = integrate.read_gd_calls(str(p))
+        assert ("GD1", "DEL") in result
+        assert ("GD1", "DUP") in result
+        assert result[("GD1", "DEL")]["samples"] == {"S1"}
+        assert result[("GD1", "DUP")]["samples"] == {"S2"}
+
+    def test_wide_format_columns_unexpected_order(self, tmp_path):
+        """Case 4.14: Columns in unexpected order (csv.DictReader handles this)."""
+        p = tmp_path / "calls.tsv"
+        header = "GD_ID\tsample\tsvtype\tis_carrier\tchrom\tstart\tend\n"
+        body = "GD1\tS1\tDEL\tTrue\tchr1\t1000\t5000\n"
+        p.write_text(header + body)
+        result = integrate.read_gd_calls(str(p))
+        assert ("GD1", "DEL") in result
+        assert result[("GD1", "DEL")]["samples"] == {"S1"}
+        assert result[("GD1", "DEL")]["pos"] == 1000
+
+    def test_narrow_format_single_sample_no_comma(self, tmp_path):
+        """Case 4.20: Single sample (no comma)."""
+        p = tmp_path / "calls.tsv"
+        p.write_text("chr1\t1000\t5000\tGD1\tDEL\tS1\n")
+        result = integrate.read_gd_calls(str(p))
+        assert result[("GD1", "DEL")]["samples"] == {"S1"}
+
+    def test_narrow_format_single_carrier_in_list(self, tmp_path):
+        """Case 4.21: Single carrier in comma-separated list."""
+        p = tmp_path / "calls.tsv"
+        p.write_text("chr1\t1000\t5000\tGD1\tDEL\tS1,S2\n")
+        result = integrate.read_gd_calls(str(p))
+        assert result[("GD1", "DEL")]["samples"] == {"S1", "S2"}
+
+    def test_narrow_format_trailing_newline(self, tmp_path):
+        """Case 4.22: Narrow format with trailing newline."""
+        p = tmp_path / "calls.tsv"
+        p.write_text("chr1\t1000\t5000\tGD1\tDEL\tS1,S2\n\n\n")
+        result = integrate.read_gd_calls(str(p))
+        assert result[("GD1", "DEL")]["samples"] == {"S1", "S2"}
+
+    def test_narrow_format_trailing_whitespace(self, tmp_path):
+        """Case 4.23: Narrow format with trailing whitespace → not stripped."""
+        p = tmp_path / "calls.tsv"
+        p.write_text("chr1\t1000\t5000\tGD1\tDEL\tS1,S2  \n")
+        result = integrate.read_gd_calls(str(p))
+        # Trailing whitespace on last sample is preserved
+        assert result[("GD1", "DEL")]["samples"] == {"S1", "S2  "}
+
+    def test_narrow_format_gz_extension(self, tmp_path):
+        """Case 4.24: .gz extension with narrow format."""
+        import gzip
+        p = tmp_path / "calls.tsv.gz"
+        content = "chr1\t1000\t5000\tGD1\tDEL\tS1,S2\n"
+        with gzip.open(str(p), "wt") as f:
+            f.write(content)
+        result = integrate.read_gd_calls(str(p))
+        assert result[("GD1", "DEL")]["samples"] == {"S1", "S2"}
+
+    def test_narrow_format_duplicate_gd_id_entries(self, tmp_path):
+        """Case 4.26: Narrow format with duplicate GD_ID entries."""
+        p = tmp_path / "calls.tsv"
+        p.write_text(
+            "chr1\t1000\t5000\tGD1\tDEL\tS1\n"
+            "chr1\t1000\t5000\tGD1\tDEL\tS2\n"
+        )
+        result = integrate.read_gd_calls(str(p))
+        assert result[("GD1", "DEL")]["samples"] == {"S2"}
