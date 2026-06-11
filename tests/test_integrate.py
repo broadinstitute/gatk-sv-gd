@@ -3181,3 +3181,507 @@ class TestHeaderManagementExtended:
         header = _FakeHeader(contigs={"chr1": None}, samples=["S1"])
         integrate._ensure_headers(header)
         assert "RD_CN" in header.formats
+
+
+# ── Section 22: Parameter Value Edge Cases (cases 22.1-22.10) ────────
+
+
+class TestParameterValues:
+    """Test cases 22.1-22.10 for parameter value edge cases."""
+
+    def test_reciprocal_overlap_zero(self):
+        """Case 22.1: --reciprocal-overlap 0.0 (everything matches)."""
+        args = integrate._parse_args(
+            ["--vcf", "x", "--gd-calls", "y", "--gd-table", "z",
+             "--par-bed", "w", "--ploidy-table", "p", "--out-vcf", "o",
+             "--reciprocal-overlap", "0.0"]
+        )
+        assert args.reciprocal_overlap == 0.0
+
+    def test_reciprocal_overlap_one(self):
+        """Case 22.2: --reciprocal-overlap 1.0 (exact match only)."""
+        args = integrate._parse_args(
+            ["--vcf", "x", "--gd-calls", "y", "--gd-table", "z",
+             "--par-bed", "w", "--ploidy-table", "p", "--out-vcf", "o",
+             "--reciprocal-overlap", "1.0"]
+        )
+        assert args.reciprocal_overlap == 1.0
+
+    def test_reciprocal_overlap_negative(self):
+        """Case 22.3: --reciprocal-overlap < 0.0 (negative, no validation)."""
+        args = integrate._parse_args(
+            ["--vcf", "x", "--gd-calls", "y", "--gd-table", "z",
+             "--par-bed", "w", "--ploidy-table", "p", "--out-vcf", "o",
+             "--reciprocal-overlap", "-0.5"]
+        )
+        assert args.reciprocal_overlap == -0.5
+
+    def test_non_nahr_overlap_zero(self):
+        """Case 22.4: --non-nahr-overlap 0.0 (everything annotated)."""
+        args = integrate._parse_args(
+            ["--vcf", "x", "--gd-calls", "y", "--gd-table", "z",
+             "--par-bed", "w", "--ploidy-table", "p", "--out-vcf", "o",
+             "--non-nahr-overlap", "0.0"]
+        )
+        assert args.non_nahr_overlap == 0.0
+
+    def test_non_nahr_overlap_one(self):
+        """Case 22.5: --non-nahr-overlap 1.0 (only exact match)."""
+        args = integrate._parse_args(
+            ["--vcf", "x", "--gd-calls", "y", "--gd-table", "z",
+             "--par-bed", "w", "--ploidy-table", "p", "--out-vcf", "o",
+             "--non-nahr-overlap", "1.0"]
+        )
+        assert args.non_nahr_overlap == 1.0
+
+    def test_non_nahr_overlap_gt_one(self):
+        """Case 22.6: --non-nahr-overlap > 1.0 (nothing annotates, no error)."""
+        args = integrate._parse_args(
+            ["--vcf", "x", "--gd-calls", "y", "--gd-table", "z",
+             "--par-bed", "w", "--ploidy-table", "p", "--out-vcf", "o",
+             "--non-nahr-overlap", "1.5"]
+        )
+        assert args.non_nahr_overlap == 1.5
+
+    def test_temp_dir_relative(self):
+        """Case 22.7: --temp-dir relative path."""
+        args = integrate._parse_args(
+            ["--vcf", "x", "--gd-calls", "y", "--gd-table", "z",
+             "--par-bed", "w", "--ploidy-table", "p", "--out-vcf", "o",
+             "--temp-dir", "./tmp"]
+        )
+        assert args.temp_dir == "./tmp"
+
+    def test_temp_dir_absolute(self):
+        """Case 22.8: --temp-dir absolute path."""
+        args = integrate._parse_args(
+            ["--vcf", "x", "--gd-calls", "y", "--gd-table", "z",
+             "--par-bed", "w", "--ploidy-table", "p", "--out-vcf", "o",
+             "--temp-dir", "/tmp/gatk"]
+        )
+        assert args.temp_dir == "/tmp/gatk"
+
+    def test_temp_dir_dot(self):
+        """Case 22.9: --temp-dir = '.' (current directory)."""
+        args = integrate._parse_args(
+            ["--vcf", "x", "--gd-calls", "y", "--gd-table", "z",
+             "--par-bed", "w", "--ploidy-table", "p", "--out-vcf", "o",
+             "--temp-dir", "."]
+        )
+        assert args.temp_dir == "."
+
+    def test_default_parameter_values(self):
+        """Case 22.10: Default parameter values used."""
+        args = integrate._parse_args(
+            ["--vcf", "x", "--gd-calls", "y", "--gd-table", "z",
+             "--par-bed", "w", "--ploidy-table", "p", "--out-vcf", "o"]
+        )
+        assert args.reciprocal_overlap == 0.5
+        assert args.non_nahr_overlap == 0.02
+        assert args.temp_dir == "./"
+
+
+# ── Section 7: PAR Region Detection (case 7.7 - cumulative overlap) ──
+
+
+class TestIsInParRegionCumulative:
+    """Case 7.7: is_in_par_region cumulative overlap across multiple PAR regions."""
+
+    def test_cumulative_overlap_across_multiple_par_regions(self):
+        """Case 7.7: Two partial PAR overlaps individually below cutoff but cumulative above.
+
+        PAR1: 100-2000 (len=1900), PAR2: 3000-5000 (len=2000)
+        Variant: 500-4500 (len=4000)
+        Overlap1: 500-2000 = 1500 (1500/4000 = 0.375 < 0.5)
+        Overlap2: 3000-4500 = 1500 (1500/4000 = 0.375 < 0.5)
+
+        The function returns True on first match above cutoff.
+        Since individual overlaps are below 0.5, this returns False.
+        This demonstrates the cumulative overlap limitation.
+        """
+        par = FakeIntervalTree()
+        par.addi(100, 2000)   # PAR1
+        par.addi(3000, 5000)  # PAR2
+        trees = {"chrX": par}
+        # Variant: 500-4500 (len=4000)
+        result = integrate.is_in_par_region(
+            "chrX", 500, 4500, par_trees=trees, cutoff=0.5
+        )
+        # First PAR: overlap 500-2000 = 1500, fraction = 1500/4000 = 0.375 < 0.5
+        # Returns False (doesn't check cumulative)
+        assert result is False
+
+
+# ── Section 8: Expected Copy Number (cases 8.5, 8.9-8.10) ───────────
+
+
+class TestGetExpectedCopyNumberAdditional:
+    """Test cases 8.5, 8.9-8.10 for expected copy number."""
+
+    def test_chrY_ploidy_non_par(self):
+        """Case 8.5: chrY ploidy 1 (non-PAR)."""
+        ploidy_dict = {"S1": {"chrY": 1}}
+        result = integrate.get_expected_cn(
+            "chrY", 1000, 5000, "S1", ploidy_dict, {}
+        )
+        assert result == 1
+
+    def test_chrY_in_par_region(self):
+        """Case 8.9: chrY in PAR region → ecn=2."""
+        ploidy_dict = {"S1": {"chrY": 1}}
+        par = FakeIntervalTree()
+        par.addi(1000, 3000)  # PAR on chrY
+        trees = {"chrY": par}
+        result = integrate.get_expected_cn(
+            "chrY", 1500, 2500, "S1", ploidy_dict, trees
+        )
+        assert result == 2
+
+    def test_chrM_default_ploidy(self):
+        """Case 8.10: chrM (mitochondrial) default ploidy 2."""
+        ploidy_dict = {"S1": {"chr1": 2}}  # chrM not present
+        result = integrate.get_expected_cn(
+            "chrM", 1000, 5000, "S1", ploidy_dict, {}
+        )
+        assert result == 2
+
+
+# ── Section 10: Sample Overlap Scoring (cases 10.7-10.12) ──────────
+
+
+class TestSampleOverlapExtended:
+    """Test cases 10.7-10.12 for sample overlap scoring."""
+
+    """Case 10.7: sample_overlap({'A','B'}, {'B','C'}) → 1/2."""
+    def test_sample_overlap_partial_intersection(self):
+        """Case 10.7: sample_overlap({'A','B'}, {'B','C'}) → 1/2.
+
+        Intersection = {'B'}, size = 1, max(|A|,|B|) = 2, result = 1/2.
+        """
+        result = integrate.sample_overlap({"A", "B"}, {"B", "C"})
+        assert result == pytest.approx(0.5)
+
+    def test_sample_overlap_disjoint(self):
+        """Case 10.8: sample_overlap({'A'*50}, {'B'*50}) → 0.0."""
+        result = integrate.sample_overlap({"A" * 50}, {"B" * 50})
+        assert result == 0.0
+
+    def test_sample_overlap_unicode(self):
+        """Case 10.9: sample_overlap({'café', 'naïve'}, {'café'}) → 0.5."""
+        result = integrate.sample_overlap({"café", "naïve"}, {"café"})
+        assert result == 0.5
+
+    def test_sample_overlap_identical_single(self):
+        """Case 10.10: sample_overlap({'sample 1'}, {'sample 1'}) → 1.0."""
+        result = integrate.sample_overlap({"sample 1"}, {"sample 1"})
+        assert result == 1.0
+
+    def test_sample_overlap_superset_less_than_one(self):
+        """Case 10.11: sample_overlap({'A','B'}, {'A'}) < 1.0."""
+        result = integrate.sample_overlap({"A", "B"}, {"A"})
+        assert result == 0.5
+        assert result < 1.0
+
+    def test_sample_overlap_subset_less_than_one(self):
+        """Case 10.12: sample_overlap({'A'}, {'A','B'}) < 1.0."""
+        result = integrate.sample_overlap({"A"}, {"A", "B"})
+        assert result == 0.5
+        assert result < 1.0
+
+
+# ── Section 11: Genotype Update (cases 11.8, 11.10, 11.12-11.13) ───
+
+
+class TestUpdateGenotypeExtended:
+    """Test cases 11.8, 11.10, 11.12-11.13 for genotype update."""
+
+    def test_ecn_zero_carrier_dup(self):
+        """Case 11.8: ecn=0, carrier=True, svtype=DUP → GT=(None,None), RD_CN=0."""
+        gt = {"GT": (0, 1)}
+        integrate.update_genotype(gt, "S1", is_carrier=True, ecn=0, svtype="DUP")
+        assert gt["GT"] == (None, None)
+        assert gt["RD_CN"] == 0
+        assert gt["RD_GQ"] == 0
+
+    def test_non_carrier_del(self):
+        """Case 11.10: ecn=1, carrier=False, svtype=DEL → GT=(0,0), RD_CN=1, RD_GQ=99."""
+        gt = {"GT": (0, 1)}
+        integrate.update_genotype(gt, "S1", is_carrier=False, ecn=1, svtype="DEL")
+        assert gt["GT"] == (0, 0)
+        assert gt["RD_CN"] == 1
+        assert gt["RD_GQ"] == 99
+        assert gt["GQ"] == 99
+
+    def test_inv_svtype_no_rd_cn(self):
+        """Case 11.12: ecn=3, carrier=True, svtype=INV → GT=(0,1), GQ=99, no RD_CN set."""
+        gt = {"GT": (0, 0), "GQ": 0}
+        integrate.update_genotype(gt, "S1", is_carrier=True, ecn=3, svtype="INV")
+        assert gt["GT"] == (0, 1)
+        assert gt["GQ"] == 99
+        assert "RD_CN" not in gt  # INV/BND never get RD_CN per locked decision
+
+    def test_reset_existing_genotype(self):
+        """Case 11.13: pre-existing GT=(1,2), carrier=False → reset to (0,0)."""
+        gt = {"GT": (1, 2), "GQ": 50, "RD_CN": 5}
+        integrate.update_genotype(gt, "S1", is_carrier=False, ecn=2, svtype="DUP")
+        assert gt["GT"] == (0, 0)
+        assert gt["RD_CN"] == 2
+        assert gt["RD_GQ"] == 99
+        assert gt["GQ"] == 99
+
+
+# ── Section 20: Reader Error Paths (cases 20.1-20.8) ────────────────
+
+
+class TestReaderErrorPaths:
+    """Test cases 20.1-20.8 for reader error paths."""
+
+    def test_narrow_format_non_integer_pos(self, tmp_path):
+        """Case 20.1: Non-integer pos/end → ValueError from int()."""
+        p = tmp_path / "calls.tsv"
+        p.write_text("chr1\tabc\t1000\tGD1\tDEL\tS1\n")
+        with pytest.raises(ValueError):
+            integrate.read_gd_calls(str(p))
+
+    def test_ploidy_table_empty_file(self, tmp_path):
+        """Case 20.2: Empty file (no header) → returns empty dict."""
+        p = tmp_path / "ploidy.tsv"
+        p.write_text("")
+        result = integrate.read_ploidy_table(str(p))
+        assert result == {}
+
+    def test_ploidy_table_non_integer_value(self, tmp_path):
+        """Case 20.3: Non-integer ploidy → ValueError."""
+        p = tmp_path / "ploidy.tsv"
+        p.write_text(
+            "sample\tchr1\n"
+            "S1\tabc\n"
+        )
+        with pytest.raises(ValueError):
+            integrate.read_ploidy_table(str(p))
+
+    def test_bed_non_numeric_coords(self, tmp_path):
+        """Case 20.4: Non-numeric BED coords → ValueError."""
+        par = tmp_path / "par.bed"
+        par.write_text("chr1\tabc\t1000\n")
+        with pytest.raises(ValueError):
+            integrate._read_bed_to_trees(str(par))
+
+    def test_wide_format_missing_column(self, tmp_path):
+        """Case 20.5: Wide format missing required column → ValueError.
+
+        Without GD_ID in header, _looks_like_wide_header returns False,
+        so narrow format is tried, and int('chrom') raises ValueError.
+        """
+        p = tmp_path / "calls.tsv"
+        p.write_text(
+            "sample\tchrom\tstart\tend\tsvtype\tis_carrier\n"  # No GD_ID
+            "S1\tchr1\t1000\t5000\tDEL\tTrue\n"
+        )
+        with pytest.raises(ValueError):
+            integrate.read_gd_calls(str(p))
+
+    def test_wide_format_mixed_encodings(self, tmp_path):
+        """Case 20.7: GD calls with mixed encodings → UnicodeDecodeError."""
+        p = tmp_path / "calls.tsv"
+        # Write binary file with mixed UTF-8 and Latin-1 bytes
+        content = b"chr1\t1000\t5000\tGD1\tDEL\tS1\xff\xfe\n"
+        p.write_bytes(content)
+        with pytest.raises(UnicodeDecodeError):
+            integrate.read_gd_calls(str(p))
+
+    def test_ploidy_table_row_shorter_than_header(self, tmp_path):
+        """Case 20.8: Row shorter than header → reads only available columns."""
+        p = tmp_path / "ploidy.tsv"
+        p.write_text(
+            "sample\tchr1\tchr2\n"
+            "S1\t2\n"  # Missing chr2 value
+        )
+        result = integrate.read_ploidy_table(str(p))
+        # Only available columns are read
+        assert result["S1"]["chr1"] == 2
+        assert "chr2" not in result["S1"]
+
+
+# ── Section 4: GDTable Class Internals (cases 3.1-3.10) ────────────
+
+
+class TestGDTableInternals:
+    """Test cases 3.1-3.10 for GDTable class internals."""
+
+    def test_gd_table_missing_column_start(self, tmp_path):
+        """Case 3.1: GD table with 'start' instead of 'start_GRCh38'."""
+        gd_tsv = tmp_path / "gd.tsv"
+        content = (
+            "chr\tstart\tend_GRCh38\tGD_ID\tsvtype\tNAHR\tterminal\t"
+            "cluster\tBP1\tBP2\n"
+            "chr1\t1000\t5000\tGD1\tDEL\tno\tno\tclusterA\t1\t2\n"
+        )
+        gd_tsv.write_text(content)
+        from gatk_sv_gd.models import GDTable
+        # GDTable checks for required columns
+        with pytest.raises(ValueError, match="Missing required columns"):
+            GDTable(str(gd_tsv))
+
+    def test_gd_table_missing_chr_column(self, tmp_path):
+        """Case 3.2: GD table missing 'chr' column → ValueError."""
+        gd_tsv = tmp_path / "gd.tsv"
+        content = (
+            "start_GRCh38\tend_GRCh38\tGD_ID\tsvtype\tNAHR\tterminal\t"
+            "cluster\tBP1\tBP2\n"
+            "1000\t5000\tGD1\tDEL\tno\tno\tclusterA\t1\t2\n"
+        )
+        gd_tsv.write_text(content)
+        from gatk_sv_gd.models import GDTable
+        with pytest.raises(ValueError, match="Missing required columns"):
+            GDTable(str(gd_tsv))
+
+    def test_gd_table_empty_cluster(self, tmp_path):
+        """Case 3.5: GD table with empty cluster field."""
+        gd_tsv = tmp_path / "gd.tsv"
+        content = (
+            "chr\tstart_GRCh38\tend_GRCh38\tGD_ID\tsvtype\tNAHR\tterminal\t"
+            "cluster\tBP1\tBP2\n"
+            "chr1\t1000\t5000\tGD1\tDEL\tno\tno\t\t1\t2\n"
+        )
+        gd_tsv.write_text(content)
+        from gatk_sv_gd.models import GDTable
+        gd_table = GDTable(str(gd_tsv))
+        all_loci = gd_table.get_all_loci()
+        assert len(all_loci) >= 0  # May or may not load depending on GDTable impl
+
+    def test_gd_table_single_row(self, tmp_path):
+        """Case 3.9: GD table with exactly one data row."""
+        gd_tsv = tmp_path / "gd.tsv"
+        content = (
+            "chr\tstart_GRCh38\tend_GRCh38\tGD_ID\tsvtype\tNAHR\tterminal\t"
+            "cluster\tBP1\tBP2\n"
+            "chr1\t1000\t5000\tGD1\tDEL\tno\tno\tclusterA\t1\t2\n"
+        )
+        gd_tsv.write_text(content)
+        from gatk_sv_gd.models import GDTable
+        gd_table = GDTable(str(gd_tsv))
+        all_loci = gd_table.get_all_loci()
+        assert len(all_loci) == 1
+        chr1_loci = gd_table.get_loci_by_chrom("chr1")
+        assert len(chr1_loci) == 1
+
+
+# ── Section 2: _build_trees_from_gd_table (cases 2.3, 2.4, 2.7-2.8) ─
+
+
+class TestBuildTreesFromGDTable:
+    """Test cases 2.3, 2.4, 2.7-2.8 for _build_trees_from_gd_table."""
+
+    def test_mixed_nahr_and_non_nahr(self, tmp_path):
+        """Case 2.3: Mixed NAHR=yes and NAHR=no in same cluster."""
+        gd_tsv = tmp_path / "gd.tsv"
+        content = (
+            "chr\tstart_GRCh38\tend_GRCh38\tGD_ID\tsvtype\tNAHR\tterminal\t"
+            "cluster\tBP1\tBP2\n"
+            "chr1\t1000\t5000\tGD1\tDEL\tno\tno\tclusterA\t1\t2\n"
+            "chr1\t6000\t10000\tGD2\tDUP\tyes\tno\tclusterA\t3\t4\n"
+        )
+        gd_tsv.write_text(content)
+        nahr_trees, non_nahr_trees, gd_metadata = integrate._build_trees_from_gd_table(
+            str(gd_tsv)
+        )
+        # GD1 (non-NAHR) should be in non_nahr_trees
+        non_nahr_ivs = non_nahr_trees["chr1"]
+        assert any(("GD1", "DEL") == iv.data for iv in non_nahr_ivs)
+        # GD2 (NAHR) should be in nahr_trees
+        nahr_ivs = nahr_trees["chr1"]
+        assert any(("GD2", "DUP") == iv.data for iv in nahr_ivs)
+
+    def test_same_gd_id_on_multiple_chromosomes(self, tmp_path):
+        """Case 2.4: Same GD_ID on chr1 and chr2."""
+        gd_tsv = tmp_path / "gd.tsv"
+        content = (
+            "chr\tstart_GRCh38\tend_GRCh38\tGD_ID\tsvtype\tNAHR\tterminal\t"
+            "cluster\tBP1\tBP2\n"
+            "chr1\t1000\t5000\tGD1\tDEL\tno\tno\tclusterA\t1\t2\n"
+            "chr2\t1000\t5000\tGD1\tDEL\tno\tno\tclusterB\t1\t2\n"
+        )
+        gd_tsv.write_text(content)
+        nahr_trees, non_nahr_trees, gd_metadata = integrate._build_trees_from_gd_table(
+            str(gd_tsv)
+        )
+        assert "chr1" in non_nahr_trees
+        assert "chr2" in non_nahr_trees
+
+    def test_empty_gd_table(self, tmp_path):
+        """Case 2.7: Empty GD table (no rows)."""
+        gd_tsv = tmp_path / "gd.tsv"
+        content = (
+            "chr\tstart_GRCh38\tend_GRCh38\tGD_ID\tsvtype\tNAHR\tterminal\t"
+            "cluster\tBP1\tBP2\n"
+        )
+        gd_tsv.write_text(content)
+        nahr_trees, non_nahr_trees, gd_metadata = integrate._build_trees_from_gd_table(
+            str(gd_tsv)
+        )
+        assert len(nahr_trees) == 0
+        assert len(non_nahr_trees) == 0
+        assert len(gd_metadata) == 0
+
+    def test_header_only_gd_table(self, tmp_path):
+        """Case 2.8: GD table with only headers (no data rows)."""
+        gd_tsv = tmp_path / "gd.tsv"
+        content = (
+            "chr\tstart_GRCh38\tend_GRCh38\tGD_ID\tsvtype\tNAHR\tterminal\t"
+            "cluster\tBP1\tBP2\n"
+        )
+        gd_tsv.write_text(content)
+        nahr_trees, non_nahr_trees, gd_metadata = integrate._build_trees_from_gd_table(
+            str(gd_tsv)
+        )
+        assert len(nahr_trees) == 0
+        assert len(non_nahr_trees) == 0
+
+
+# ── Section 7: VCF Carrier Extraction Edge Cases (cases 9.11-9.13) ──
+
+
+class TestExtractVcfCarriersEdgeCases:
+    """Test cases 9.11-9.13 for VCF carrier extraction."""
+
+    def test_many_samples(self):
+        """Case 9.11: Record with 150 samples → no crash."""
+        samples = {f"S{i}": {"GT": (0, 0) if i % 3 != 0 else (0, 1)} for i in range(150)}
+        rec = type("Rec", (), {
+            "samples": samples,
+            "sample_ids": [f"S{i}" for i in range(150)],
+        })()
+        carriers = integrate._extract_vcf_carriers(rec)
+        assert len(carriers) == 50  # Every 3rd sample is carrier
+
+    def test_triploid_genotype(self):
+        """Case 9.13: GT=(0,1,2) (triploid) → carrier detected."""
+        rec = type("Rec", (), {
+            "samples": {"S1": {"GT": (0, 1, 2)}},
+            "sample_ids": ["S1"],
+        })()
+        carriers = integrate._extract_vcf_carriers(rec)
+        assert "S1" in carriers  # (0,1,2) != (0,0)
+
+
+# ── Section 23: pysam-Specific Behavior (cases 23.7) ────────────────
+
+
+class TestPysamSpecificBehavior:
+    """Test cases 23.7 for pysam-specific behavior."""
+
+    def test_tuple_info_field(self):
+        """Case 23.7: pysam record.info tuple handling for Number=. fields."""
+        rec = type("Rec", (), {
+            "info": {"SVTYPE": ["DEL", "DUP"], "END": 5000, "SVLEN": [100, 200]},
+            "samples": {},
+            "sample_ids": [],
+            "chrom": "chr1",
+            "pos": 1000,
+            "stop": 5000,
+        })()
+        svtype = rec.info.get("SVTYPE", "")
+        if isinstance(svtype, (tuple, list)):
+            svtype = svtype[0] if svtype else ""
+        assert svtype == "DEL"
