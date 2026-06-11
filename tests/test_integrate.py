@@ -432,6 +432,86 @@ class TestReadGdCalls:
         result = integrate.read_gd_calls(str(p))
         assert result[("GD1", "DEL")]["samples"] == set()
 
+    # ── Wide format tests ──────────────────────────────────────────
+
+    def test_wide_format_basic(self, tmp_path):
+        """Wide format with carrier samples."""
+        p = tmp_path / "calls.tsv"
+        header = (
+            "sample\tGD_ID\tchrom\tstart\tend\tsvtype\tis_carrier\n"
+        )
+        body = (
+            "S1\tGD1\tchr1\t1000\t5000\tDEL\tTrue\n"
+            "S2\tGD1\tchr1\t1000\t5000\tDEL\tTrue\n"
+            "S3\tGD1\tchr1\t1000\t5000\tDEL\tFalse\n"
+        )
+        p.write_text(header + body)
+        result = integrate.read_gd_calls(str(p))
+        assert ("GD1", "DEL") in result
+        assert result[("GD1", "DEL")]["pos"] == 1000
+        assert result[("GD1", "DEL")]["end"] == 5000
+        assert result[("GD1", "DEL")]["samples"] == {"S1", "S2"}
+
+    def test_wide_format_gzipped(self, tmp_path):
+        """Wide format with .gz extension."""
+        import gzip
+        p = tmp_path / "calls.tsv.gz"
+        header = (
+            "sample\tGD_ID\tchrom\tstart\tend\tsvtype\tis_carrier\n"
+        )
+        body = (
+            "S1\tGD1\tchr1\t1000\t5000\tDEL\tTrue\n"
+            "S2\tGD1\tchr1\t1000\t5000\tDEL\tFalse\n"
+        )
+        with gzip.open(str(p), "wt") as f:
+            f.write(header + body)
+        result = integrate.read_gd_calls(str(p))
+        assert ("GD1", "DEL") in result
+        assert result[("GD1", "DEL")]["samples"] == {"S1"}
+
+    def test_wide_format_no_carriers(self, tmp_path):
+        """Wide format with no carriers — entry exists but samples is empty."""
+        p = tmp_path / "calls.tsv"
+        header = (
+            "sample\tGD_ID\tchrom\tstart\tend\tsvtype\tis_carrier\n"
+        )
+        body = (
+            "S1\tGD1\tchr1\t1000\t5000\tDEL\tFalse\n"
+        )
+        p.write_text(header + body)
+        result = integrate.read_gd_calls(str(p))
+        assert ("GD1", "DEL") in result
+        assert result[("GD1", "DEL")]["samples"] == set()
+
+    def test_wide_format_multiple_entries(self, tmp_path):
+        """Wide format with multiple GD_ID entries."""
+        p = tmp_path / "calls.tsv"
+        header = (
+            "sample\tGD_ID\tchrom\tstart\tend\tsvtype\tis_carrier\n"
+        )
+        body = (
+            "S1\tGD1\tchr1\t1000\t5000\tDEL\tTrue\n"
+            "S2\tGD2\tchr2\t2000\t6000\tDUP\tTrue\n"
+        )
+        p.write_text(header + body)
+        result = integrate.read_gd_calls(str(p))
+        assert ("GD1", "DEL") in result
+        assert ("GD2", "DUP") in result
+        assert result[("GD1", "DEL")]["chrom"] == "chr1"
+        assert result[("GD2", "DUP")]["chrom"] == "chr2"
+
+    def test_wide_format_header_detection(self, tmp_path):
+        """_looks_like_wide_header requires GD_ID + is_carrier + positional field."""
+        assert integrate._looks_like_wide_header(
+            ["sample", "GD_ID", "chrom", "start", "end", "svtype", "is_carrier"]
+        ) is True
+        assert integrate._looks_like_wide_header(
+            ["chr1", "1000", "5000", "GD1", "DEL", "S1"]
+        ) is False
+        assert integrate._looks_like_wide_header(
+            ["GD_ID", "is_carrier"]  # missing positional field
+        ) is False
+
 
 class TestBuildTreesFromGdTable:
     def test_nahr_and_non_nahr_entries_go_to_correct_trees(
@@ -484,7 +564,65 @@ def _make_gd_table_file(tmp_path, rows):
 
 
 def _make_gd_calls_file(tmp_path, entries):
-    """Write a GD-calls TSV and return its path."""
+    """Write a GD-calls file and return its path.
+
+    Writes the wide format (as produced by the ``call`` subcommand) by default.
+    """
+    return _make_wide_gd_calls_file(tmp_path, entries)
+
+
+def _make_wide_gd_calls_file(tmp_path, entries):
+    """Write a wide-format gd_cnv_calls file (as produced by the call subcommand)."""
+    header = (
+        "sample\tcluster\tGD_ID\tchrom\tstart\tend\tsvtype\tBP1\tBP2\t"
+        "is_terminal\tn_bins\tmean_depth\tsample_ploidy\tmatched_haplotype\t"
+        "hap_cn_state\tmatched_seg_start\tmatched_seg_end\tmatched_seg_n_bins\t"
+        "matched_interval_bp\tinterval_coverage\treciprocal_overlap\t"
+        "min_interval_confidence\traw_min_interval_confidence\t"
+        "left_flank_non_event_median\traw_left_flank_non_event_median\t"
+        "right_flank_non_event_median\traw_right_flank_non_event_median\t"
+        "min_flank_non_event_confidence\traw_min_flank_non_event_confidence\t"
+        "is_carrier\tis_best_match\tlog_prob_score\tconfidence_score\t"
+        "raw_confidence_score\tqual_score\traw_qual_score\t"
+        "null_anomaly_score\tis_null_anomalous\tcalling_method\t"
+        "call_criteria_mean_coverage\tcall_criteria_interval_confidence\t"
+        "call_criteria_flank_non_event_confidence\t"
+        "call_criteria_null_anomaly_score\n"
+    )
+    lines = [header]
+    for e in entries:
+        samples = e.get("samples", [])
+        # Emit one row per carrier sample, plus a non-carrier row if no carriers
+        # (wide format always has at least one row per sample/GD_ID combination)
+        if samples:
+            for sample in samples:
+                line = (
+                    f"{sample}\tcluster\t{e['region_id']}\t{e['chrom']}\t"
+                    f"{e['pos']}\t{e['end']}\t{e['svtype']}\tA\tB\tFalse\t"
+                    f"10\t2.5\t2\t\t\t\t\t0\t1000\t0.5\t0.5\t10.0\t10.0\t"
+                    f"10.0\t10.0\t10.0\t10.0\t10.0\t10.0\tTrue\t"
+                    f"False\t0.5\t0.5\t0.5\t0.5\t0.5\t0.5\t0.1\tFalse\t"
+                    f"posterior-marginal\tnan\t10.0\t10.0\t0.2\n"
+                )
+                lines.append(line)
+        else:
+            # No carriers — emit a row with is_carrier=False so the entry exists
+            line = (
+                f"S1\tcluster\t{e['region_id']}\t{e['chrom']}\t"
+                f"{e['pos']}\t{e['end']}\t{e['svtype']}\tA\tB\tFalse\t"
+                f"10\t2.5\t2\t\t\t\t\t0\t1000\t0.5\t0.5\t10.0\t10.0\t"
+                f"10.0\t10.0\t10.0\t10.0\t10.0\t10.0\tFalse\t"
+                f"False\t0.5\t0.5\t0.5\t0.5\t0.5\t0.5\t0.1\tFalse\t"
+                f"posterior-marginal\tnan\t10.0\t10.0\t0.2\n"
+            )
+            lines.append(line)
+    p = tmp_path / "gd_calls.tsv"
+    p.write_text("".join(lines))
+    return str(p)
+
+
+def _make_narrow_gd_calls_file(tmp_path, entries):
+    """Write a legacy narrow-format GD-calls TSV (6 columns, no header)."""
     lines = ""
     for e in entries:
         samples = ",".join(e.get("samples", [])) or "."

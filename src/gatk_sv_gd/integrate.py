@@ -18,7 +18,7 @@ Usage (via CLI)::
 
     gatk-sv-gd integrate \\
         --vcf input.vcf.gz \\
-        --gd-calls gd_calls.tsv \\
+        --gd-calls gd_cnv_calls.tsv.gz \\
         --gd-table gd_table.tsv \\
         --par-bed par.hg38.bed \\
         --ploidy-table ploidy.tsv \\
@@ -29,6 +29,8 @@ Requirements:
 """
 
 import argparse
+import csv
+import gzip
 import os
 import subprocess
 import sys
@@ -154,10 +156,19 @@ def _build_trees_from_gd_table(
 def read_gd_calls(calls_path: str) -> Dict[Tuple[str, str], dict]:
     """Read GD-call manifest TSV.
 
-    Expected columns (tab-separated, no header required):
-        chrom, pos (0-based), end, region_id, svtype, comma-separated-samples
+    Supports two formats:
 
-    Lines starting with ``#`` and lines with fewer than 6 columns are skipped.
+    1. **Wide format** (output of ``call`` subcommand, ``gd_cnv_calls.tsv.gz``):
+       A header row followed by tabular data with columns including
+       ``sample``, ``GD_ID``, ``chrom``, ``start``, ``end``, ``svtype``,
+       ``is_carrier``.  Rows with ``is_carrier == "True"`` (or ``True``)
+       are grouped by ``(GD_ID, svtype)`` and carrier samples collected.
+
+    2. **Legacy narrow format** (6-column TSV, no header):
+       ``chrom``, ``pos`` (0-based), ``end``, ``region_id``, ``svtype``,
+       comma-separated-samples.
+
+    Lines starting with ``#`` are skipped in the narrow format.
     An empty or ``.`` sample field produces an empty carrier set.
 
     Returns
@@ -165,29 +176,107 @@ def read_gd_calls(calls_path: str) -> Dict[Tuple[str, str], dict]:
     dict mapping ``(region_id, svtype)`` to
     ``{chrom, pos, end, samples}``
     """
-    gd_calls: Dict[Tuple[str, str], dict] = {}
-    with open(calls_path) as f:
-        for line in f:
-            if line.startswith("#"):
-                continue
-            cols = line.rstrip("\n\r").split("\t")
-            if len(cols) < 6:
-                continue
-            chrom, pos, end, region_id, svtype, samples_str = (
-                cols[0], int(cols[1]), int(cols[2]),
-                cols[3], cols[4], cols[5],
-            )
-            samples: Set[str] = (
-                set(samples_str.split(","))
-                if samples_str and samples_str != "."
-                else set()
-            )
-            gd_calls[(region_id, svtype)] = {
-                "chrom": chrom,
-                "pos": pos,
-                "end": end,
-                "samples": samples,
+    # Open file transparently (support .gz and plain text)
+    if calls_path.endswith(".gz"):
+        fp = gzip.open(calls_path, "rt")
+    else:
+        fp = open(calls_path, "r")
+
+    try:
+        # Peek at first non-comment line to detect format
+        first_line = ""
+        for line in fp:
+            stripped = line.strip()
+            if stripped and not stripped.startswith("#"):
+                # Use stripped for header detection (column names)
+                # but keep original line (rstrip only newlines) for parsing
+                first_line = line.rstrip("\n\r")
+                break
+
+        # If the first field looks like a header (contains known column names)
+        # treat as wide format
+        fields = first_line.strip().split("\t")
+        if _looks_like_wide_header(fields):
+            return _read_wide_format(fp, first_line)
+        else:
+            return _read_narrow_format(fp, first_line)
+    finally:
+        fp.close()
+
+
+def _looks_like_wide_header(fields: List[str]) -> bool:
+    """Return True if the fields look like the wide gd_cnv_calls header."""
+    header_set = set(fields)
+    # Require GD_ID AND is_carrier (these never appear in narrow format)
+    # plus at least one of {start, chrom} to disambiguate
+    wide_core = {"GD_ID", "is_carrier"}
+    wide_positional = {"start", "chrom"}
+    return (
+        wide_core.issubset(header_set)
+        and bool(wide_positional.intersection(header_set))
+    )
+
+
+def _read_wide_format(
+    fp,  # file pointer already positioned after first line
+    first_line: str,
+) -> Dict[Tuple[str, str], dict]:
+    """Read the wide ``gd_cnv_calls.tsv.gz`` format.
+
+    Tracks all (GD_ID, svtype) entries from the file (needed for Phase 3
+    novel record detection), but only collects carrier samples from rows
+    where is_carrier is True.
+    """
+    reader = csv.DictReader(
+        [first_line] + fp.readlines(),
+        delimiter="\t",
+    )
+    # Group by (GD_ID, svtype) and collect carrier samples
+    groups: Dict[Tuple[str, str], dict] = {}
+    for row in reader:
+        gd_id = row["GD_ID"]
+        svtype = row["svtype"]
+        key = (gd_id, svtype)
+        if key not in groups:
+            groups[key] = {
+                "chrom": row["chrom"],
+                "pos": int(row["start"]),
+                "end": int(row["end"]),
+                "samples": set(),
             }
+        is_carrier = row.get("is_carrier", "").strip()
+        if is_carrier in ("True", "true", "1"):
+            groups[key]["samples"].add(row["sample"])
+    return groups
+
+
+def _read_narrow_format(
+    fp,  # file pointer already positioned after first line
+    first_line: str,
+) -> Dict[Tuple[str, str], dict]:
+    """Read the legacy 6-column narrow TSV format (no header)."""
+    gd_calls: Dict[Tuple[str, str], dict] = {}
+    for line in [first_line] + fp.readlines():
+        if line.startswith("#"):
+            continue
+        cols = line.rstrip("\n\r").split("\t")
+        if len(cols) < 6:
+            continue
+        chrom, pos, end, region_id, svtype, samples_str = (
+            cols[0], int(cols[1]), int(cols[2]),
+            cols[3], cols[4], cols[5],
+        )
+        samples: Set[str] = (
+            set(samples_str.split(","))
+            if samples_str and samples_str != "."
+            else set()
+        )
+        gd_calls[(region_id, svtype)] = {
+            "chrom": chrom,
+            "pos": pos,
+            "end": end,
+            "samples": samples,
+        }
     return gd_calls
 
 
@@ -367,9 +456,9 @@ def _parse_args(argv: Optional[List[Text]] = None) -> argparse.Namespace:
     parser.add_argument(
         "--gd-calls", required=True,
         help=(
-            "TSV manifest of GD calls: "
-            "chrom, pos (0-based), end, region_id, svtype, "
-            "comma-separated samples."
+            "Output of the ``call`` subcommand (gd_cnv_calls.tsv.gz) — "
+            "wide TSV format with sample, GD_ID, chrom, start, end, svtype, "
+            "is_carrier columns.  Legacy 6-column narrow TSV also supported."
         ),
     )
     parser.add_argument(
