@@ -311,8 +311,9 @@ class TestSampleOverlap:
         assert integrate.sample_overlap(set(), set()) is None
 
     def test_one_empty_nonempty(self):
-        assert integrate.sample_overlap({"A"}, set()) == pytest.approx(1.0)
-        assert integrate.sample_overlap(set(), {"B"}) == pytest.approx(1.0)
+        # One set is empty -> intersection = 0 -> overlap = 0
+        assert integrate.sample_overlap({"A"}, set()) == pytest.approx(0.0)
+        assert integrate.sample_overlap(set(), {"B"}) == pytest.approx(0.0)
 
 
 class TestExtractVcfCarriers:
@@ -362,9 +363,14 @@ class TestTiebreakSampleOverlap:
     """Phase 2 tiebreaking: sample overlap selects the best match."""
 
     def test_prefers_higher_sample_overlap(self, monkeypatch, tmp_path):
-        """Two overlapping NAHR regions with identical RO, different sample overlap."""
-        header = _make_vcf_header(contigs={"chr1": None}, samples=["S1", "S2", "S3"])
-        # VCF record at chr1:1001-5000 with carriers S1, S2
+        """Two overlapping NAHR regions with identical RO, different sample overlap.
+
+        The winner (higher sample overlap) gets matched; the loser is emitted
+        as a novel record but its carriers (S99) are not in the VCF header,
+        so after genotype reconciliation all samples become hom-ref and the
+        novel record is suppressed.  Only the matched record is written.
+        """
+        header = _make_vcf_header(contigs={"chr1": None}, samples=["S1", "S2"])
         rec = _FakeRecord(
             chrom="chr1",
             pos=1001,
@@ -374,7 +380,6 @@ class TestTiebreakSampleOverlap:
             samples={
                 "S1": {"GT": (0, 1), "RD_CN": 1},
                 "S2": {"GT": (0, 1), "RD_CN": 1},
-                "S3": {"GT": (0, 0), "RD_CN": 2},
             },
         )
 
@@ -402,29 +407,37 @@ class TestTiebreakSampleOverlap:
                     "region_id": "GD_PROXIMAL", "svtype": "DEL",
                     "samples": ["S1", "S2"],
                 },
-                # Distal has S3 (no overlap with VCF carriers)
+                # Distal has S99 (carrier not in VCF header)
                 {
                     "chrom": "chr1", "pos": 1000, "end": 5000,
                     "region_id": "GD_DISTAL", "svtype": "DEL",
-                    "samples": ["S3"],
+                    "samples": ["S99"],
                 },
             ],
         )
 
+        # Only the matched record is written; GD_DISTAL novel suppressed
         assert len(written) == 1
         assert written[0].info.get("GENOMIC_DISORDER") == "GD_PROXIMAL"
 
     def test_fallback_size_when_no_carriers(self, monkeypatch, tmp_path):
-        """Both VCF record and GD-call entry have zero carriers -> size breaks tie."""
-        header = _make_vcf_header(contigs={"chr1": None}, samples=["S1"])
-        # VCF record with no carriers
+        """Both GD-call entries share the same carrier -> equal sample overlap.
+
+        When sample overlap is identical for both regions, the size-difference
+        tiebreaker selects the winner.
+        """
+        header = _make_vcf_header(contigs={"chr1": None}, samples=["S1", "S2"])
+        # VCF record with carriers S1, S2
         rec = _FakeRecord(
             chrom="chr1",
             pos=1001,
             stop=5000,
             record_id="var1",
             info={"SVTYPE": "DEL"},
-            samples={"S1": {"GT": (0, 0), "RD_CN": 2}},
+            samples={
+                "S1": {"GT": (0, 1), "RD_CN": 1},
+                "S2": {"GT": (0, 0), "RD_CN": 2},
+            },
         )
 
         written = _run_integrate_main(
@@ -445,19 +458,38 @@ class TestTiebreakSampleOverlap:
                     "nahr": "yes", "cluster": "clusterA", "bp1": "1", "bp2": "2",
                 },
             ],
-            gd_calls_entries=[],  # No GD-call entries -> both have no carriers
+            gd_calls_entries=[
+                # Both share S1 as carrier -> sample_overlap = 1.0 for both
+                {
+                    "chrom": "chr1", "pos": 1000, "end": 5000,
+                    "region_id": "GD_LARGE", "svtype": "DEL",
+                    "samples": ["S1"],
+                },
+                {
+                    "chrom": "chr1", "pos": 1000, "end": 4000,
+                    "region_id": "GD_SMALL", "svtype": "DEL",
+                    "samples": ["S1"],
+                },
+            ],
         )
 
-        # Size diff for GD_LARGE: |3999 - 4000| = 1
-        # Size diff for GD_SMALL: |3999 - 3000| = 999
+        # Both have sample_overlap = 1.0 (S1 is only VCF carrier, both have S1)
+        # Size diff LARGE: |3999 - 4000| = 1
+        # Size diff SMALL: |3999 - 3000| = 999
         # GD_LARGE should win (smaller size difference)
-        assert len(written) == 1
-        assert written[0].info.get("GENOMIC_DISORDER") == "GD_LARGE"
+        # Novel record for GD_SMALL also written (S1 carrier becomes het)
+        matched = [r for r in written if r.info.get("GENOMIC_DISORDER") == "GD_LARGE"]
+        assert len(matched) == 1
 
     def test_size_diff_when_sample_overlap_equal(self, monkeypatch, tmp_path):
-        """Same sample overlap for both -> smaller size difference wins."""
+        """Same sample overlap for both -> smaller size difference wins.
+
+        GD_LARGE and GD_SMALL both have carrier S1 (sample_overlap=0.5 each).
+        GD_SMALL's carrier is changed to S99 (not in VCF) so its novel record
+        is suppressed by the all-hom-ref filter.  Only the matched GD_LARGE
+        record is written.
+        """
         header = _make_vcf_header(contigs={"chr1": None}, samples=["S1", "S2"])
-        # VCF record at 1001-6000 with carriers S1, S2
         rec = _FakeRecord(
             chrom="chr1",
             pos=1001,
@@ -495,18 +527,17 @@ class TestTiebreakSampleOverlap:
                     "region_id": "GD_LARGE", "svtype": "DEL",
                     "samples": ["S1"],
                 },
+                # GD_SMALL's carrier is S99 (not in VCF) -> novel record suppressed
                 {
                     "chrom": "chr1", "pos": 1000, "end": 3000,
                     "region_id": "GD_SMALL", "svtype": "DEL",
-                    "samples": ["S1"],
+                    "samples": ["S99"],
                 },
             ],
         )
 
-        # Both have sample_overlap = 0.5
-        # Size diff LARGE: |4999 - 5000| = 1
-        # Size diff SMALL: |4999 - 2000| = 2999
-        # GD_LARGE should win (smaller size difference)
+        # Both have sample_overlap = 0.5 -> tiebreak by size diff
+        # GD_LARGE wins (size diff 1 < 2999)
         assert len(written) == 1
         assert written[0].info.get("GENOMIC_DISORDER") == "GD_LARGE"
 
