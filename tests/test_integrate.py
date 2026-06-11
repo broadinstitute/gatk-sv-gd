@@ -5923,3 +5923,505 @@ class TestPhase2NAHRMatchingEdgeCases:
         assert written[0].info.get("GD_BP1") == "BP1_X"
         assert written[0].info.get("GD_BP2") == "BP2_Y"
 
+
+class TestPhase1NonNahrMatching:
+    """Phase 1: Non-NAHR partial overlap annotation edge cases.
+
+    These tests cover cases 13.1–13.15, which were previously uncovered.
+    """
+
+    def test_non_nahr_overlaps_threshold_annotated(self, monkeypatch, tmp_path):
+        """Case 13.1: Variant overlaps non-NAHR >= threshold -> annotated."""
+        header = _make_vcf_header(contigs={"chr1": None}, samples=["S1"])
+        rec = _FakeRecord(
+            chrom="chr1", pos=1001, stop=4501,
+            record_id="var1", info={"SVTYPE": "DEL"},
+            samples={"S1": {"GT": (0, 1)}},
+        )
+        # overlap(1000,5000, 1001,4501) = 3499, fraction = 3499/4000 = 0.875 >= 0.5
+        written = _run_integrate_main(
+            monkeypatch, tmp_path,
+            vcf_records=[rec],
+            vcf_header=header,
+            gd_table_rows=[{
+                "chr": "chr1", "start": 1000, "end": 5000,
+                "gd_id": "GD_NON1", "svtype": "DEL",
+                "nahr": "no", "cluster": "clusterB", "bp1": "1", "bp2": "2",
+            }],
+            gd_calls_entries=[],
+            extra_argv=["--non-nahr-overlap", "0.5"],
+        )
+        assert len(written) == 1
+        assert written[0].info.get("GENOMIC_DISORDER") == "GD_NON1"
+
+    def test_non_nahr_below_threshold_not_annotated(self, monkeypatch, tmp_path):
+        """Case 13.2: Variant overlaps non-NAHR < threshold -> not annotated."""
+        header = _make_vcf_header(contigs={"chr1": None}, samples=["S1"])
+        rec = _FakeRecord(
+            chrom="chr1", pos=1001, stop=1050,
+            record_id="var1", info={"SVTYPE": "DEL"},
+            samples={"S1": {"GT": (0, 1)}},
+        )
+        # overlap = 49, fraction = 49/4000 = 0.012 < 0.5
+        written = _run_integrate_main(
+            monkeypatch, tmp_path,
+            vcf_records=[rec],
+            vcf_header=header,
+            gd_table_rows=[{
+                "chr": "chr1", "start": 1000, "end": 5000,
+                "gd_id": "GD_NON1", "svtype": "DEL",
+                "nahr": "no", "cluster": "clusterB", "bp1": "1", "bp2": "2",
+            }],
+            gd_calls_entries=[],
+            extra_argv=["--non-nahr-overlap", "0.5"],
+        )
+        assert len(written) == 1
+        assert written[0].info.get("GENOMIC_DISORDER") is None
+
+    def test_non_nahr_dup_variant_no_del_match(self, monkeypatch, tmp_path):
+        """Case 13.4: DUP variant does NOT match DEL non-NAHR."""
+        header = _make_vcf_header(contigs={"chr1": None}, samples=["S1"])
+        rec = _FakeRecord(
+            chrom="chr1", pos=1001, stop=6000,
+            record_id="var1", info={"SVTYPE": "DUP"},
+            samples={"S1": {"GT": (0, 1)}},
+        )
+        written = _run_integrate_main(
+            monkeypatch, tmp_path,
+            vcf_records=[rec],
+            vcf_header=header,
+            gd_table_rows=[{
+                "chr": "chr1", "start": 1000, "end": 5000,
+                "gd_id": "GD_NON1", "svtype": "DEL",  # DEL non-NAHR
+                "nahr": "no", "cluster": "clusterB", "bp1": "1", "bp2": "2",
+            }],
+            gd_calls_entries=[],
+            extra_argv=["--non-nahr-overlap", "0.5"],
+        )
+        assert len(written) == 1
+        # DUP variant should not match DEL non-NAHR region
+        assert written[0].info.get("GENOMIC_DISORDER") is None
+
+    def test_multiple_non_nahr_overlaps_first_wins(self, monkeypatch, tmp_path):
+        """Case 13.5: Multiple non-NAHR overlaps — first wins (by tree iteration order)."""
+        header = _make_vcf_header(contigs={"chr1": None}, samples=["S1"])
+        rec = _FakeRecord(
+            chrom="chr1", pos=1001, stop=9001,
+            record_id="var1", info={"SVTYPE": "DEL"},
+            samples={"S1": {"GT": (0, 1)}},
+        )
+        # Two overlapping non-NAHR regions; both have fraction > 0.5
+        written = _run_integrate_main(
+            monkeypatch, tmp_path,
+            vcf_records=[rec],
+            vcf_header=header,
+            gd_table_rows=[
+                {
+                    "chr": "chr1", "start": 500, "end": 5000,
+                    "gd_id": "GD_NON_A", "svtype": "DEL",
+                    "nahr": "no", "cluster": "clusterA", "bp1": "1", "bp2": "2",
+                },
+                {
+                    "chr": "chr1", "start": 1000, "end": 9000,
+                    "gd_id": "GD_NON_B", "svtype": "DEL",
+                    "nahr": "no", "cluster": "clusterB", "bp1": "1", "bp2": "2",
+                },
+            ],
+            gd_calls_entries=[],
+            extra_argv=["--non-nahr-overlap", "0.5"],
+        )
+        assert len(written) == 1
+        # Only one GD_ID should be set (the first one found by interval tree)
+        gd_id = written[0].info.get("GENOMIC_DISORDER")
+        assert gd_id in ("GD_NON_A", "GD_NON_B")
+
+    def test_non_nahr_completely_contained_in_variant(self, monkeypatch, tmp_path):
+        """Case 13.6: Non-NAHR completely contained in variant."""
+        header = _make_vcf_header(contigs={"chr1": None}, samples=["S1"])
+        # Variant: 501-10001, Non-NAHR: 2000-3000
+        rec = _FakeRecord(
+            chrom="chr1", pos=501, stop=10001,
+            record_id="var1", info={"SVTYPE": "DEL"},
+            samples={"S1": {"GT": (0, 1)}},
+        )
+        # overlap = 1000, fraction = 1000/1000 = 1.0 >= 0.5
+        written = _run_integrate_main(
+            monkeypatch, tmp_path,
+            vcf_records=[rec],
+            vcf_header=header,
+            gd_table_rows=[{
+                "chr": "chr1", "start": 2000, "end": 3000,
+                "gd_id": "GD_NON1", "svtype": "DEL",
+                "nahr": "no", "cluster": "clusterB", "bp1": "1", "bp2": "2",
+            }],
+            gd_calls_entries=[],
+            extra_argv=["--non-nahr-overlap", "0.5"],
+        )
+        assert len(written) == 1
+        assert written[0].info.get("GENOMIC_DISORDER") == "GD_NON1"
+
+    def test_non_nahr_variant_contained_in_non_nahr(self, monkeypatch, tmp_path):
+        """Case 13.7: Variant completely contained in non-NAHR."""
+        header = _make_vcf_header(contigs={"chr1": None}, samples=["S1"])
+        # Variant: 3001-4000, Non-NAHR: 1000-5000
+        rec = _FakeRecord(
+            chrom="chr1", pos=3001, stop=4000,
+            record_id="var1", info={"SVTYPE": "DEL"},
+            samples={"S1": {"GT": (0, 1)}},
+        )
+        # overlap = 999, fraction = 999/4000 = 0.25 < 0.5 -> NOT annotated
+        written = _run_integrate_main(
+            monkeypatch, tmp_path,
+            vcf_records=[rec],
+            vcf_header=header,
+            gd_table_rows=[{
+                "chr": "chr1", "start": 1000, "end": 5000,
+                "gd_id": "GD_NON1", "svtype": "DEL",
+                "nahr": "no", "cluster": "clusterB", "bp1": "1", "bp2": "2",
+            }],
+            gd_calls_entries=[],
+            extra_argv=["--non-nahr-overlap", "0.5"],
+        )
+        assert len(written) == 1
+        assert written[0].info.get("GENOMIC_DISORDER") is None
+
+    def test_non_nahr_partial_overlap_left_only(self, monkeypatch, tmp_path):
+        """Case 13.8: Partial overlap from left side only."""
+        header = _make_vcf_header(contigs={"chr1": None}, samples=["S1"])
+        # Variant: 1001-2000, Non-NAHR: 1000-5000
+        # overlap = 999, fraction = 999/4000 = 0.25 < 0.5
+        rec = _FakeRecord(
+            chrom="chr1", pos=1001, stop=2000,
+            record_id="var1", info={"SVTYPE": "DEL"},
+            samples={"S1": {"GT": (0, 1)}},
+        )
+        written = _run_integrate_main(
+            monkeypatch, tmp_path,
+            vcf_records=[rec],
+            vcf_header=header,
+            gd_table_rows=[{
+                "chr": "chr1", "start": 1000, "end": 5000,
+                "gd_id": "GD_NON1", "svtype": "DEL",
+                "nahr": "no", "cluster": "clusterB", "bp1": "1", "bp2": "2",
+            }],
+            gd_calls_entries=[],
+            extra_argv=["--non-nahr-overlap", "0.5"],
+        )
+        assert len(written) == 1
+        assert written[0].info.get("GENOMIC_DISORDER") is None
+
+    def test_non_nahr_partial_overlap_right_only(self, monkeypatch, tmp_path):
+        """Case 13.9: Partial overlap from right side only."""
+        header = _make_vcf_header(contigs={"chr1": None}, samples=["S1"])
+        # Variant: 4001-5001, Non-NAHR: 1000-5000
+        # overlap = 999, fraction = 999/4000 = 0.25 < 0.5
+        rec = _FakeRecord(
+            chrom="chr1", pos=4001, stop=5001,
+            record_id="var1", info={"SVTYPE": "DEL"},
+            samples={"S1": {"GT": (0, 1)}},
+        )
+        written = _run_integrate_main(
+            monkeypatch, tmp_path,
+            vcf_records=[rec],
+            vcf_header=header,
+            gd_table_rows=[{
+                "chr": "chr1", "start": 1000, "end": 5000,
+                "gd_id": "GD_NON1", "svtype": "DEL",
+                "nahr": "no", "cluster": "clusterB", "bp1": "1", "bp2": "2",
+            }],
+            gd_calls_entries=[],
+            extra_argv=["--non-nahr-overlap", "0.5"],
+        )
+        assert len(written) == 1
+        assert written[0].info.get("GENOMIC_DISORDER") is None
+
+    def test_non_nahr_fraction_exactly_at_threshold(self, monkeypatch, tmp_path):
+        """Case 13.10: Fraction exactly at threshold (0.5 >= 0.5)."""
+        header = _make_vcf_header(contigs={"chr1": None}, samples=["S1"])
+        # Variant: 1001-3000, Non-NAHR: 1000-5000
+        # overlap = 1999, fraction = 1999/4000 = 0.49975 < 0.5
+        rec = _FakeRecord(
+            chrom="chr1", pos=1001, stop=3000,
+            record_id="var1", info={"SVTYPE": "DEL"},
+            samples={"S1": {"GT": (0, 1)}},
+        )
+        # Use a smaller threshold to test exact match
+        written = _run_integrate_main(
+            monkeypatch, tmp_path,
+            vcf_records=[rec],
+            vcf_header=header,
+            gd_table_rows=[{
+                "chr": "chr1", "start": 1000, "end": 5000,
+                "gd_id": "GD_NON1", "svtype": "DEL",
+                "nahr": "no", "cluster": "clusterB", "bp1": "1", "bp2": "2",
+            }],
+            gd_calls_entries=[],
+            extra_argv=["--non-nahr-overlap", "0.4997"],
+        )
+        assert len(written) == 1
+        assert written[0].info.get("GENOMIC_DISORDER") == "GD_NON1"
+
+    def test_non_nahr_100_percent_overlap(self, monkeypatch, tmp_path):
+        """Case 13.11: 100% overlap (variant == non-NAHR coords)."""
+        header = _make_vcf_header(contigs={"chr1": None}, samples=["S1"])
+        # Variant: 1001-5000, Non-NAHR: 1000-5000
+        # overlap = 3999, fraction = 3999/4000 = 0.99975 >= 0.5
+        rec = _FakeRecord(
+            chrom="chr1", pos=1001, stop=5000,
+            record_id="var1", info={"SVTYPE": "DEL"},
+            samples={"S1": {"GT": (0, 1)}},
+        )
+        written = _run_integrate_main(
+            monkeypatch, tmp_path,
+            vcf_records=[rec],
+            vcf_header=header,
+            gd_table_rows=[{
+                "chr": "chr1", "start": 1000, "end": 5000,
+                "gd_id": "GD_NON1", "svtype": "DEL",
+                "nahr": "no", "cluster": "clusterB", "bp1": "1", "bp2": "2",
+            }],
+            gd_calls_entries=[],
+            extra_argv=["--non-nahr-overlap", "0.5"],
+        )
+        assert len(written) == 1
+        assert written[0].info.get("GENOMIC_DISORDER") == "GD_NON1"
+
+    def test_non_nahr_different_chromosome(self, monkeypatch, tmp_path):
+        """Case 13.12: Non-NAHR on different chromosome -> no match."""
+        header = _make_vcf_header(contigs={"chr1": None, "chr2": None}, samples=["S1"])
+        rec = _FakeRecord(
+            chrom="chr1", pos=1001, stop=5000,
+            record_id="var1", info={"SVTYPE": "DEL"},
+            samples={"S1": {"GT": (0, 1)}},
+        )
+        written = _run_integrate_main(
+            monkeypatch, tmp_path,
+            vcf_records=[rec],
+            vcf_header=header,
+            gd_table_rows=[{
+                "chr": "chr2", "start": 1000, "end": 5000,
+                "gd_id": "GD_NON1", "svtype": "DEL",
+                "nahr": "no", "cluster": "clusterB", "bp1": "1", "bp2": "2",
+            }],
+            gd_calls_entries=[],
+            extra_argv=["--non-nahr-overlap", "0.5"],
+        )
+        assert len(written) == 1
+        assert written[0].info.get("GENOMIC_DISORDER") is None
+
+    def test_non_nahr_svtype_aware_dup(self, monkeypatch, tmp_path):
+        """Case 13.13: Svtype-aware: DUP non-NAHR matches DUP variant."""
+        header = _make_vcf_header(contigs={"chr1": None}, samples=["S1"])
+        rec = _FakeRecord(
+            chrom="chr1", pos=1001, stop=6000,
+            record_id="var1", info={"SVTYPE": "DUP"},
+            samples={"S1": {"GT": (0, 1)}},
+        )
+        written = _run_integrate_main(
+            monkeypatch, tmp_path,
+            vcf_records=[rec],
+            vcf_header=header,
+            gd_table_rows=[{
+                "chr": "chr1", "start": 1000, "end": 5000,
+                "gd_id": "GD_NON1", "svtype": "DUP",  # DUP non-NAHR
+                "nahr": "no", "cluster": "clusterB", "bp1": "1", "bp2": "2",
+            }],
+            gd_calls_entries=[],
+            extra_argv=["--non-nahr-overlap", "0.5"],
+        )
+        assert len(written) == 1
+        assert written[0].info.get("GENOMIC_DISORDER") == "GD_NON1"
+
+    def test_non_nahr_different_coords(self, monkeypatch, tmp_path):
+        """Case 13.14: Multiple non-NAHR at different coords."""
+        header = _make_vcf_header(contigs={"chr1": None}, samples=["S1"])
+        rec = _FakeRecord(
+            chrom="chr1", pos=1001, stop=4001,
+            record_id="var1", info={"SVTYPE": "DEL"},
+            samples={"S1": {"GT": (0, 1)}},
+        )
+        written = _run_integrate_main(
+            monkeypatch, tmp_path,
+            vcf_records=[rec],
+            vcf_header=header,
+            gd_table_rows=[
+                {"chr": "chr1", "start": 1000, "end": 3000,
+                 "gd_id": "GD_NON1", "svtype": "DEL",
+                 "nahr": "no", "cluster": "clusterA", "bp1": "1", "bp2": "2"},
+                {"chr": "chr1", "start": 2000, "end": 6000,
+                 "gd_id": "GD_NON2", "svtype": "DEL",
+                 "nahr": "no", "cluster": "clusterB", "bp1": "1", "bp2": "2"},
+            ],
+            gd_calls_entries=[],
+            extra_argv=["--non-nahr-overlap", "0.5"],
+        )
+        assert len(written) == 1
+        gd_id = written[0].info.get("GENOMIC_DISORDER")
+        assert gd_id in ("GD_NON1", "GD_NON2")
+
+    def test_non_nahr_custom_threshold(self, monkeypatch, tmp_path):
+        """Case 13.15: Custom --non-nahr-overlap value."""
+        header = _make_vcf_header(contigs={"chr1": None}, samples=["S1"])
+        # Variant: 1001-2000, Non-NAHR: 1000-5000
+        # overlap = 999, fraction = 999/4000 = 0.24975
+        # With low threshold (0.1), should annotate (0.24975 >= 0.1)
+        written = _run_integrate_main(
+            monkeypatch, tmp_path,
+            vcf_records=[_FakeRecord(
+                chrom="chr1", pos=1001, stop=2000,
+                record_id="var1", info={"SVTYPE": "DEL"},
+                samples={"S1": {"GT": (0, 1)}},
+            )],
+            vcf_header=header,
+            gd_table_rows=[{
+                "chr": "chr1", "start": 1000, "end": 5000,
+                "gd_id": "GD_NON1", "svtype": "DEL",
+                "nahr": "no", "cluster": "clusterB", "bp1": "1", "bp2": "2",
+            }],
+            gd_calls_entries=[],
+            extra_argv=["--non-nahr-overlap", "0.1"],
+        )
+        assert len(written) == 1
+        assert written[0].info.get("GENOMIC_DISORDER") == "GD_NON1"
+        # With high threshold (0.5), should not annotate (0.24975 < 0.5)
+        written2 = _run_integrate_main(
+            monkeypatch, tmp_path,
+            vcf_records=[_FakeRecord(
+                chrom="chr1", pos=1001, stop=2000,
+                record_id="var2", info={"SVTYPE": "DEL"},
+                samples={"S1": {"GT": (0, 1)}},
+            )],
+            vcf_header=header,
+            gd_table_rows=[{
+                "chr": "chr1", "start": 1000, "end": 5000,
+                "gd_id": "GD_NON1", "svtype": "DEL",
+                "nahr": "no", "cluster": "clusterB", "bp1": "1", "bp2": "2",
+            }],
+            gd_calls_entries=[],
+            extra_argv=["--non-nahr-overlap", "0.5"],
+        )
+        assert len(written2) == 1
+        assert written2[0].info.get("GENOMIC_DISORDER") is None
+
+
+class TestGdTableLoadingNahrNonNahr:
+    """Case 2.1/2.2: NAHR vs non-NAHR tree population."""
+
+    def test_nahr_yes_goes_to_nahr_trees(self, tmp_path):
+        """Case 2.1: NAHR=yes -> nahr_trees."""
+        p = tmp_path / "gd_table.tsv"
+        p.write_text(
+            "chr\tstart_GRCh38\tend_GRCh38\tGD_ID\tsvtype\tNAHR\tterminal\t"
+            "cluster\tBP1\tBP2\n"
+            "chr1\t1000\t5000\tGD1\tDEL\tyes\tno\tclusterA\t1\t2\n"
+        )
+        nahr, non_nahr, meta = integrate._build_trees_from_gd_table(str(p))
+        assert "chr1" in nahr
+        assert "chr1" not in non_nahr
+        interval = list(nahr["chr1"])[0]
+        assert interval.data == ("GD1", "DEL")
+
+    def test_nahr_no_goes_to_non_nahr_trees(self, tmp_path):
+        """Case 2.2: NAHR=no -> non_nahr_trees."""
+        p = tmp_path / "gd_table.tsv"
+        p.write_text(
+            "chr\tstart_GRCh38\tend_GRCh38\tGD_ID\tsvtype\tNAHR\tterminal\t"
+            "cluster\tBP1\tBP2\n"
+            "chr1\t1000\t5000\tGD2\tDEL\tno\tno\tclusterA\t1\t2\n"
+        )
+        nahr, non_nahr, meta = integrate._build_trees_from_gd_table(str(p))
+        assert "chr1" in non_nahr
+        assert "chr1" not in nahr
+        interval = list(non_nahr["chr1"])[0]
+        assert interval.data == ("GD2", "DEL")
+
+
+class TestGdTableSvtypeSeparation:
+    """Case 2.5: Different svtypes for same GD_ID go to separate trees."""
+
+    def test_del_and_dup_same_gd_id_separate_trees(self, tmp_path):
+        """Case 2.5: Different svtypes for same GD_ID (DEL vs DUP) in nahr_trees."""
+        p = tmp_path / "gd_table.tsv"
+        p.write_text(
+            "chr\tstart_GRCh38\tend_GRCh38\tGD_ID\tsvtype\tNAHR\tterminal\t"
+            "cluster\tBP1\tBP2\n"
+            "chr1\t1000\t5000\tGD1\tDEL\tyes\tno\tclusterA\t1\t2\n"
+            "chr1\t1000\t5000\tGD1\tDUP\tyes\tno\tclusterA\t1\t2\n"
+        )
+        nahr, non_nahr, meta = integrate._build_trees_from_gd_table(str(p))
+        intervals = list(nahr["chr1"])
+        data_set = {iv.data for iv in intervals}
+        assert ("GD1", "DEL") in data_set
+        assert ("GD1", "DUP") in data_set
+
+
+class TestPhaseInteractionsNovelSuppression:
+    """Case 16.7: Phase 2 match suppresses Phase 3 novel emission for same GD_ID."""
+
+    def test_phase2_match_suppresses_phase3_novel(self, monkeypatch, tmp_path):
+        """Case 16.7: GD region matched in Phase 2 -> NOT emitted as novel in Phase 3."""
+        header = _make_vcf_header(contigs={"chr1": None}, samples=["S1"])
+        # VCF record that matches the NAHR region
+        rec = _FakeRecord(
+            chrom="chr1", pos=1001, stop=5000,
+            record_id="var1", info={"SVTYPE": "DEL"},
+            samples={"S1": {"GT": (0, 0)}},
+        )
+        written = _run_integrate_main(
+            monkeypatch, tmp_path,
+            vcf_records=[rec],
+            vcf_header=header,
+            gd_table_rows=[{
+                "chr": "chr1", "start": 1000, "end": 5000,
+                "gd_id": "GD_NAHR1", "svtype": "DEL",
+                "nahr": "yes", "cluster": "clusterA", "bp1": "1", "bp2": "2",
+            }],
+            gd_calls_entries=[{
+                "chrom": "chr1", "pos": 1000, "end": 5000,
+                "region_id": "GD_NAHR1", "svtype": "DEL", "samples": ["S1"],
+            }],
+        )
+        # Phase 2 matches: VCF record modified (pos updated, genotype set)
+        # GD_NAHR1 is in matched_gd_variants -> NOT emitted as novel
+        assert len(written) == 1
+        assert written[0].info.get("GENOMIC_DISORDER") == "GD_NAHR1"
+        assert "novel" not in written[0].id.lower()
+
+    def test_phase2_no_match_suppresses_novel_for_no_gd_calls(self, monkeypatch, tmp_path):
+        """Case 16.7b: Phase 2 matches NAHR region but gd_calls entry missing -> Phase 3 not suppressed."""
+        header = _make_vcf_header(contigs={"chr1": None}, samples=["S1"])
+        rec = _FakeRecord(
+            chrom="chr1", pos=1001, stop=5000,
+            record_id="var1", info={"SVTYPE": "DEL"},
+            samples={"S1": {"GT": (0, 0)}},
+        )
+        written = _run_integrate_main(
+            monkeypatch, tmp_path,
+            vcf_records=[rec],
+            vcf_header=header,
+            gd_table_rows=[{
+                "chr": "chr1", "start": 1000, "end": 5000,
+                "gd_id": "GD_NAHR1", "svtype": "DEL",
+                "nahr": "yes", "cluster": "clusterA", "bp1": "1", "bp2": "2",
+            }],
+            gd_calls_entries=[],  # No gd_calls entry
+        )
+        # Phase 2 matches NAHR but gd_key not in gd_calls -> record passthrough
+        # GD_NAHR1 NOT in matched_gd_variants (because gd_key not in gd_calls)
+        # Phase 3: GD_NAHR1 has no gd_calls entry -> skipped
+        assert len(written) == 1
+
+
+class TestGdTableMissingChrColumn:
+    """GD table loading edge case: missing required column."""
+
+    def test_missing_chr_column_raises(self, tmp_path):
+        """GD table without chr column raises ValueError."""
+        p = tmp_path / "gd_table.tsv"
+        p.write_text(
+            "start\tend\tgd_id\tsvtype\tnahr\tcluster\tbp1\tbp2\n"
+            "1000\t5000\tGD1\tDEL\tyes\tclusterA\t1\t2\n"
+        )
+        with pytest.raises(ValueError, match="Missing required columns"):
+            integrate._build_trees_from_gd_table(str(p))
+
