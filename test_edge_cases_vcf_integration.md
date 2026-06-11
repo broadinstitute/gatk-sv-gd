@@ -54,9 +54,9 @@
 | 1.6 | Missing ploidy table → exit code 1 | ✅ |
 | 1.7 | Multiple files missing at once | ✅ |
 | 1.8 | bcftools not found on PATH | ✅ |
-| 1.9 | bcftools sort returns non-zero exit | ❌ |
+| 1.9 | bcftools sort returns non-zero exit | ✅ |
 | 1.10 | Custom `--temp-dir` that doesn't exist (should be created) | ✅ |
-| 1.11 | `--temp-dir` with insufficient permissions | ❌ |
+| 1.11 | `--temp-dir` with insufficient permissions | ✅ |
 | 1.12 | Output directory doesn't exist (no `os.makedirs` for output dir) | ✅ |
 | 1.13 | Output file path with nested directories | ✅ |
 | 1.14 | All args provided via `--help` (exit 0) | ✅ |
@@ -540,7 +540,7 @@
 
 | Category | Total Cases | ✅ Covered | ❌ Not Covered | ⚠️ Partial |
 |----------|:-----------:|:----------:|:--------------:|:----------:|
-| Input Validation & CLI | 15 | 11 | 4 | 0 |
+| Input Validation & CLI | 15 | 13 | 2 | 0 |
 | GD Table Loading | 13 | 13 | 0 | 0 |
 | GDTable Class Internals | 10 | 10 | 0 | 0 |
 | GD Calls Reading | 26 | 15 | 11 | 0 |
@@ -565,9 +565,9 @@
 | pysam-Specific Behavior | 7 | 7 | 0 | 0 |
 | Contig Naming | 5 | 5 | 0 | 0 |
 | Multi-Chromosomal | 10 | 5 | 5 | 0 |
-| **TOTAL** | **291** | **259** | **32** | **0** |
+| **TOTAL** | **291** | **261** | **30** | **0** |
 
-Coverage: ~89% of identified edge cases have tests. 
+Coverage: ~90% of identified edge cases have tests. 
 
 Each step is a single test. All should complete in ≤ 10s and use only in-memory mocks (no real bcftools/pysam I/O).
 
