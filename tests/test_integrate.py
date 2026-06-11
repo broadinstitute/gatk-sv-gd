@@ -786,7 +786,7 @@ class TestMainMatchedWithCall:
 
         assert len(written) == 1
         out = written[0]
-        # Off-by-one fix: pos should be manifest_pos+1 = 1001
+        # pos should be 1-based VCF = manifest pos + 1 = 1001
         assert out.pos == 1001
         assert out.stop == 5000
         assert out.info.get("GENOMIC_DISORDER") == "GD_DEL1"

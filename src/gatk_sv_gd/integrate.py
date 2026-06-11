@@ -628,13 +628,16 @@ def main(argv: Optional[List[Text]] = None) -> None:
                                 gd_info = gd_calls[gd_key]
                                 meta = gd_metadata[region_id]
 
-                                # Overwrite coordinates — off-by-one fix:
-                                # manifest pos is 0-based; VCF POS is 1-based.
+                                # Overwrite coordinates from GD manifest.
+                                # gd_info["pos"] is 0-based, gd_info["end"] is 0-based exclusive.
+                                # pysam writes record.pos directly to VCF (no +1), so add 1.
+                                # SVLEN must use 1-based pos: (end - pos - 1).
+                                # Stop must be set AFTER SVLEN to prevent pysam recomputation.
                                 record.pos = gd_info["pos"] + 1
-                                record.stop = gd_info["end"]
                                 record.info["SVLEN"] = (
-                                    record.stop - record.pos
+                                    gd_info["end"] - gd_info["pos"] - 1
                                 )
+                                record.stop = gd_info["end"]
                                 record.info[GENOMIC_DISORDER_KEY] = region_id
                                 record.info["GD_CLUSTER"] = meta["cluster"]
                                 record.info["GD_BP1"] = meta["bp1"]
@@ -693,7 +696,10 @@ def main(argv: Optional[List[Text]] = None) -> None:
                         id=f"{region_id}_{svtype}_novel",
                     )
                     new_rec.info["SVTYPE"] = svtype
-                    new_rec.info["SVLEN"] = stop - pos
+                    # pysam computes stop = rec.pos + SVLEN, and rec.pos is
+                    # 1-based (new_record adds 1 to 0-based start).
+                    # So SVLEN must be (stop - 1) - pos to preserve stop.
+                    new_rec.info["SVLEN"] = stop - pos - 1
                     new_rec.info["EV"] = ("RD",)
                     new_rec.info["ALGORITHMS"] = ("depth",)
                     new_rec.info[GENOMIC_DISORDER_KEY] = region_id
