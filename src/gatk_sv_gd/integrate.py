@@ -358,6 +358,48 @@ def get_expected_cn(
     return ploidy_dict[sample].get(chrom, 2)
 
 
+# ── Carrier extraction ───────────────────────────────────────────────
+
+
+def _extract_vcf_carriers(record: "pysam.VariantRecord") -> Set[str]:
+    """Return carrier samples from a VCF record.
+
+    Carriers are samples whose genotype is **not** ``(0, 0)``.
+    """
+    carriers: Set[str] = set()
+    for sample_name, gt_dict in record.samples.items():
+        gt = gt_dict.get("GT", (0, 0))
+        if gt != (0, 0):
+            carriers.add(sample_name)
+    return carriers
+
+
+def sample_overlap(set_a: Set[str], set_b: Set[str]) -> Optional[float]:
+    """Return sample-overlap score between two carrier sets.
+
+    Defined as ``|A ∩ B| / max(|A|, |B|)``.
+
+    Returns
+    -------
+    float in ``[0, 1]`` when at least one set is non-empty.
+    ``None`` when **both** sets are empty (signals "undefined, use fallback").
+
+    Example
+    -------
+    >>> sample_overlap({"A", "B"}, {"A", "B", "C"})
+    0.6666666666666666
+    >>> sample_overlap({"A"}, {"B"})
+    0.0
+    >>> sample_overlap(set(), set())
+    >>>
+    """
+    if not set_a and not set_b:
+        return None
+    intersection = len(set_a & set_b)
+    union_max = max(len(set_a), len(set_b))
+    return intersection / union_max
+
+
 # ── Genotype update ──────────────────────────────────────────────────
 
 
@@ -598,7 +640,9 @@ def main(argv: Optional[List[Text]] = None) -> None:
                                 break
 
                     # Phase 2: NAHR competitive reciprocal-overlap matching
+                    # with sample-overlap tiebreaking.
                     if chrom in nahr_trees:
+                        vcf_carriers = _extract_vcf_carriers(record)
                         overlappers = []
                         for ov in nahr_trees[chrom].overlap(pos, stop):
                             ov_gd_id, ov_svtype = ov.data
@@ -611,15 +655,38 @@ def main(argv: Optional[List[Text]] = None) -> None:
                             size_diff = abs(
                                 record_len - (ov.end - ov.begin)
                             )
-                            overlappers.append((ro, -size_diff, ov))
+                            # Sample-overlap tiebreaker
+                            gd_key = (ov_gd_id, svtype)
+                            if gd_key in gd_calls:
+                                gd_carriers = gd_calls[gd_key]["samples"]
+                                so = sample_overlap(vcf_carriers, gd_carriers)
+                            else:
+                                so = None
+                            overlappers.append((ro, so, size_diff, ov))
 
-                        overlappers.sort(key=lambda x: (x[0], x[1]))
+                        overlappers.sort(
+                            key=lambda x: (
+                                x[0],
+                                # Descending sample overlap (None sorts as -1,
+                                # i.e. before any numeric score)
+                                x[1] if x[1] is not None else -1,
+                                # Ascending size difference (as tiebreaker)
+                                x[2],
+                            )
+                        )
 
                         if (
                             overlappers
                             and overlappers[-1][0] >= args.reciprocal_overlap
                         ):
-                            best_nahr = overlappers[-1][2]
+                            best_ro, best_so, _, best_nahr = overlappers[-1]
+                            logger.debug(
+                                "matched %s → %s (ro=%.3f, so=%.3f)",
+                                record.id,
+                                best_nahr.data[0],
+                                best_ro,
+                                best_so if best_so is not None else -1,
+                            )
                             region_id, _ov_svtype = best_nahr.data
                             gd_key = (region_id, svtype)
 
