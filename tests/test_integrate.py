@@ -285,6 +285,232 @@ class TestOverlapHelpers:
         assert fraction_covered(100, 200, 200, 300) == pytest.approx(0.0)
 
 
+# ── Sample-overlap unit tests ──────────────────────────────────────────
+
+
+class TestSampleOverlap:
+    """Tests for sample_overlap() and _extract_vcf_carriers()."""
+
+    def test_partial_overlap(self):
+        assert integrate.sample_overlap(
+            {"A", "B"}, {"A", "B", "C"}
+        ) == pytest.approx(2 / 3)
+
+    def test_disjoint_sets(self):
+        assert integrate.sample_overlap({"A"}, {"B"}) == 0.0
+
+    def test_identical_sets(self):
+        assert integrate.sample_overlap({"A", "B"}, {"A", "B"}) == 1.0
+
+    def test_subset(self):
+        assert integrate.sample_overlap({"A"}, {"A", "B", "C"}) == pytest.approx(
+            1 / 3
+        )
+
+    def test_both_empty_returns_none(self):
+        assert integrate.sample_overlap(set(), set()) is None
+
+    def test_one_empty_nonempty(self):
+        assert integrate.sample_overlap({"A"}, set()) == pytest.approx(1.0)
+        assert integrate.sample_overlap(set(), {"B"}) == pytest.approx(1.0)
+
+
+class TestExtractVcfCarriers:
+    """Tests for _extract_vcf_carriers()."""
+
+    def test_no_carriers(self):
+        rec = _FakeRecord(
+            chrom="chr1",
+            pos=1001,
+            stop=5000,
+            samples={"S1": {"GT": (0, 0)}, "S2": {"GT": (0, 0)}},
+        )
+        assert integrate._extract_vcf_carriers(rec) == set()
+
+    def test_one_carrier(self):
+        rec = _FakeRecord(
+            chrom="chr1",
+            pos=1001,
+            stop=5000,
+            samples={"S1": {"GT": (0, 1)}, "S2": {"GT": (0, 0)}},
+        )
+        assert integrate._extract_vcf_carriers(rec) == {"S1"}
+
+    def test_all_carriers(self):
+        rec = _FakeRecord(
+            chrom="chr1",
+            pos=1001,
+            stop=5000,
+            samples={"S1": {"GT": (0, 1)}, "S2": {"GT": (0, 1)}},
+        )
+        assert integrate._extract_vcf_carriers(rec) == {"S1", "S2"}
+
+    def test_no_call_ignored(self):
+        rec = _FakeRecord(
+            chrom="chr1",
+            pos=1001,
+            stop=5000,
+            samples={"S1": {"GT": (None, None)}, "S2": {"GT": (0, 0)}},
+        )
+        assert integrate._extract_vcf_carriers(rec) == {"S1"}
+
+
+# ── Phase 2 tiebreaking tests ──────────────────────────────────────────
+
+
+class TestTiebreakSampleOverlap:
+    """Phase 2 tiebreaking: sample overlap selects the best match."""
+
+    def test_prefers_higher_sample_overlap(self, monkeypatch, tmp_path):
+        """Two overlapping NAHR regions with identical RO, different sample overlap."""
+        header = _make_vcf_header(contigs={"chr1": None}, samples=["S1", "S2", "S3"])
+        # VCF record at chr1:1001-5000 with carriers S1, S2
+        rec = _FakeRecord(
+            chrom="chr1",
+            pos=1001,
+            stop=5000,
+            record_id="var1",
+            info={"SVTYPE": "DEL"},
+            samples={
+                "S1": {"GT": (0, 1), "RD_CN": 1},
+                "S2": {"GT": (0, 1), "RD_CN": 1},
+                "S3": {"GT": (0, 0), "RD_CN": 2},
+            },
+        )
+
+        written = _run_integrate_main(
+            monkeypatch, tmp_path,
+            vcf_records=[rec],
+            vcf_header=header,
+            gd_table_rows=[
+                # Both regions at identical coords -> identical RO
+                {
+                    "chr": "chr1", "start": 1000, "end": 5000,
+                    "gd_id": "GD_PROXIMAL", "svtype": "DEL",
+                    "nahr": "yes", "cluster": "clusterA", "bp1": "1", "bp2": "2",
+                },
+                {
+                    "chr": "chr1", "start": 1000, "end": 5000,
+                    "gd_id": "GD_DISTAL", "svtype": "DEL",
+                    "nahr": "yes", "cluster": "clusterA", "bp1": "1", "bp2": "2",
+                },
+            ],
+            gd_calls_entries=[
+                # Proximal has S1, S2 (perfect match with VCF carriers)
+                {
+                    "chrom": "chr1", "pos": 1000, "end": 5000,
+                    "region_id": "GD_PROXIMAL", "svtype": "DEL",
+                    "samples": ["S1", "S2"],
+                },
+                # Distal has S3 (no overlap with VCF carriers)
+                {
+                    "chrom": "chr1", "pos": 1000, "end": 5000,
+                    "region_id": "GD_DISTAL", "svtype": "DEL",
+                    "samples": ["S3"],
+                },
+            ],
+        )
+
+        assert len(written) == 1
+        assert written[0].info.get("GENOMIC_DISORDER") == "GD_PROXIMAL"
+
+    def test_fallback_size_when_no_carriers(self, monkeypatch, tmp_path):
+        """Both VCF record and GD-call entry have zero carriers -> size breaks tie."""
+        header = _make_vcf_header(contigs={"chr1": None}, samples=["S1"])
+        # VCF record with no carriers
+        rec = _FakeRecord(
+            chrom="chr1",
+            pos=1001,
+            stop=5000,
+            record_id="var1",
+            info={"SVTYPE": "DEL"},
+            samples={"S1": {"GT": (0, 0), "RD_CN": 2}},
+        )
+
+        written = _run_integrate_main(
+            monkeypatch, tmp_path,
+            vcf_records=[rec],
+            vcf_header=header,
+            gd_table_rows=[
+                # Region 1: 4000 bp (larger)
+                {
+                    "chr": "chr1", "start": 1000, "end": 5000,
+                    "gd_id": "GD_LARGE", "svtype": "DEL",
+                    "nahr": "yes", "cluster": "clusterA", "bp1": "1", "bp2": "2",
+                },
+                # Region 2: 3000 bp (smaller, closer to variant size = 3999)
+                {
+                    "chr": "chr1", "start": 1000, "end": 4000,
+                    "gd_id": "GD_SMALL", "svtype": "DEL",
+                    "nahr": "yes", "cluster": "clusterA", "bp1": "1", "bp2": "2",
+                },
+            ],
+            gd_calls_entries=[],  # No GD-call entries -> both have no carriers
+        )
+
+        # Size diff for GD_LARGE: |3999 - 4000| = 1
+        # Size diff for GD_SMALL: |3999 - 3000| = 999
+        # GD_LARGE should win (smaller size difference)
+        assert len(written) == 1
+        assert written[0].info.get("GENOMIC_DISORDER") == "GD_LARGE"
+
+    def test_size_diff_when_sample_overlap_equal(self, monkeypatch, tmp_path):
+        """Same sample overlap for both -> smaller size difference wins."""
+        header = _make_vcf_header(contigs={"chr1": None}, samples=["S1", "S2"])
+        # VCF record at 1001-6000 with carriers S1, S2
+        rec = _FakeRecord(
+            chrom="chr1",
+            pos=1001,
+            stop=6000,
+            record_id="var1",
+            info={"SVTYPE": "DEL"},
+            samples={
+                "S1": {"GT": (0, 1), "RD_CN": 1},
+                "S2": {"GT": (0, 1), "RD_CN": 1},
+            },
+        )
+
+        written = _run_integrate_main(
+            monkeypatch, tmp_path,
+            vcf_records=[rec],
+            vcf_header=header,
+            gd_table_rows=[
+                # Larger region: 5000 bp
+                {
+                    "chr": "chr1", "start": 1000, "end": 6000,
+                    "gd_id": "GD_LARGE", "svtype": "DEL",
+                    "nahr": "yes", "cluster": "clusterA", "bp1": "1", "bp2": "2",
+                },
+                # Smaller region: 2000 bp (closer to variant length 4999)
+                {
+                    "chr": "chr1", "start": 1000, "end": 3000,
+                    "gd_id": "GD_SMALL", "svtype": "DEL",
+                    "nahr": "yes", "cluster": "clusterA", "bp1": "1", "bp2": "2",
+                },
+            ],
+            gd_calls_entries=[
+                # Both have S1 as carrier -> sample_overlap = 0.5 for both
+                {
+                    "chrom": "chr1", "pos": 1000, "end": 6000,
+                    "region_id": "GD_LARGE", "svtype": "DEL",
+                    "samples": ["S1"],
+                },
+                {
+                    "chrom": "chr1", "pos": 1000, "end": 3000,
+                    "region_id": "GD_SMALL", "svtype": "DEL",
+                    "samples": ["S1"],
+                },
+            ],
+        )
+
+        # Both have sample_overlap = 0.5
+        # Size diff LARGE: |4999 - 5000| = 1
+        # Size diff SMALL: |4999 - 2000| = 2999
+        # GD_LARGE should win (smaller size difference)
+        assert len(written) == 1
+        assert written[0].info.get("GENOMIC_DISORDER") == "GD_LARGE"
+
+
 class TestIsInParRegion:
     def _make_par_trees(self, intervals):
         trees = defaultdict(FakeIntervalTree)
