@@ -79,7 +79,7 @@
 | 2.9 | BP1/BP2 alphanumeric vs numeric ordering | ✅ |
 | 2.10 | Terminal flag present in GD table | ✅ |
 | 2.11 | GD_ID appearing in gd_calls but NOT in gd_table | ✅ |
-| 2.12 | Column name variants (e.g., `start` vs `start_GRCh38`) | ❌ |
+| 2.12 | Column name variants (e.g., `start` vs `start_GRCh38`) | ✅ |
 | 2.13 | GD table with extra/unknown columns | ✅ |
 
 ---
@@ -94,7 +94,7 @@
 | 3.4 | BP1/BP2 alphanumeric comparison (e.g., `A1` vs `A2`) | ✅ |
 | 3.5 | Empty cluster → no loci returned | ✅ |
 | 3.6 | Locus with zero GD entries | ✅ |
-| 3.7 | Malformed cluster/locus hierarchy | ❌ |
+| 3.7 | Malformed cluster/locus hierarchy | ✅ |
 | 3.8 | `get_all_loci` vs `get_loci_by_chrom` consistency | ✅ |
 | 3.9 | GDTable with single row | ✅ |
 | 3.10 | GDTable encoding issues (UTF-8 BOM, etc.) | ✅ |
@@ -541,8 +541,8 @@
 | Category | Total Cases | ✅ Covered | ❌ Not Covered | ⚠️ Partial |
 |----------|:-----------:|:----------:|:--------------:|:----------:|
 | Input Validation & CLI | 15 | 10 | 5 | 0 |
-| GD Table Loading | 13 | 12 | 1 | 0 |
-| GDTable Class Internals | 10 | 9 | 1 | 0 |
+| GD Table Loading | 13 | 13 | 0 | 0 |
+| GDTable Class Internals | 10 | 10 | 0 | 0 |
 | GD Calls Reading | 26 | 15 | 11 | 0 |
 | Ploidy Table Reading | 10 | 7 | 3 | 0 |
 | PAR BED Reading | 8 | 5 | 3 | 0 |
@@ -565,9 +565,9 @@
 | pysam-Specific Behavior | 7 | 7 | 0 | 0 |
 | Contig Naming | 5 | 5 | 0 | 0 |
 | Multi-Chromosomal | 10 | 5 | 5 | 0 |
-| **TOTAL** | **291** | **247** | **44** | **0** |
+| **TOTAL** | **291** | **249** | **42** | **0** |
 
-Coverage: ~85% of identified edge cases have tests. 
+Coverage: ~86% of identified edge cases have tests. 
 
 Each step is a single test. All should complete in ≤ 10s and use only in-memory mocks (no real bcftools/pysam I/O).
 
