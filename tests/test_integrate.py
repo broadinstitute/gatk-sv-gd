@@ -6719,3 +6719,36 @@ class TestPloidyTableEdgeCases:
         assert result["S1  "]["  chr1  "] == 2
 
 
+class TestGdTableColumnVariants:
+    """GD Table edge cases: column name variants (2.12), malformed hierarchy (3.7)."""
+
+    def test_column_name_variant_start_not_alias(self, tmp_path):
+        """Case 2.12: `start` is NOT an alias for `start_GRCh38` → ValueError."""
+        p = tmp_path / "gd_table.tsv"
+        p.write_text(
+            "chr\tstart\tend\tGD_ID\tsvtype\tNAHR\tterminal\t"
+            "cluster\tBP1\tBP2\n"
+            "chr1\t1000\t5000\tGD1\tDEL\tyes\tno\tclusterA\t1\t2\n"
+        )
+        with pytest.raises(ValueError, match="Missing required columns"):
+            integrate._build_trees_from_gd_table(str(p))
+
+
+class TestGdTableMalformedHierarchy:
+    """GDTable class internals: malformed cluster/locus hierarchy (3.7)."""
+
+    def test_empty_cluster_uses_key(self, tmp_path):
+        """Case 3.7: Empty cluster column → locus keyed by chr:start-end."""
+        p = tmp_path / "gd_table.tsv"
+        p.write_text(
+            "chr\tstart_GRCh38\tend_GRCh38\tGD_ID\tsvtype\tNAHR\tterminal\t"
+            "cluster\tBP1\tBP2\n"
+            "chr1\t1000\t5000\tGD1\tDEL\tyes\tno\t\t1\t2\n"
+        )
+        from gatk_sv_gd.models import GDTable
+        gt = GDTable(str(p))
+        loci = gt.get_all_loci()
+        # Empty cluster → locus keyed by chr:start-end
+        assert "chr1:1000-5000" in loci
+
+
