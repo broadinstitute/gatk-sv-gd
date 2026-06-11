@@ -396,16 +396,16 @@
 
 | # | Case | Covered |
 |---|------|---------|
-| 17.1 | All records matched, some written, some skipped | ❌ |
-| 17.2 | Some matched, some passthrough, some novel | ❌ |
-| 17.3 | Empty VCF input, only novel records emitted | ❌ |
-| 17.4 | Empty gd_calls, only VCF records pass through | ❌ |
-| 17.5 | Mixed NAHR and non-NAHR in same run | ❌ |
-| 17.6 | Multiple clusters on same chromosome | ❌ |
-| 17.7 | Records sorted in output VCF | ❌ |
-| 17.8 | Tabix index created | ❌ |
-| 17.9 | bcftools sort + tabix integration | ❌ |
-| 17.10 | Large cohort (100+ samples) | ❌ |
+| 17.1 | All records matched, some written, some skipped | ✅ |
+| 17.2 | Some matched, some passthrough, some novel | ✅ |
+| 17.3 | Empty VCF input, only novel records emitted | ⚠️ |
+| 17.4 | Empty gd_calls, only VCF records pass through | ✅ |
+| 17.5 | Mixed NAHR and non-NAHR in same run | ✅ |
+| 17.6 | Multiple clusters on same chromosome | ✅ |
+| 17.7 | Records sorted in output VCF | ✅ |
+| 17.8 | Tabix index created | ✅ |
+| 17.9 | bcftools sort + tabix integration | ⚠️ |
+| 17.10 | Large cohort (100+ samples) | ✅ |
 
 ---
 
@@ -463,16 +463,16 @@
 
 | # | Case | Covered |
 |---|------|---------|
-| 21.1 | bcftools not found | ❌ |
-| 21.2 | bcftools sort failure | ❌ |
-| 21.3 | Permission denied on output path | ❌ |
-| 21.4 | Disk full during processing | ❌ |
-| 21.5 | Corrupted VCF (malformed record) | ❌ |
-| 21.6 | Corrupted GD table | ❌ |
-| 21.7 | Malformed PAR BED (non-numeric coords) | ❌ |
-| 21.8 | Temporary file cleanup on exception | ❌ |
-| 21.9 | Partial write recovery | ❌ |
-| 21.10 | Interrupted by signal (Ctrl-C) | ❌ |
+| 21.1 | bcftools not found | ✅ |
+| 21.2 | bcftools sort failure | ✅ |
+| 21.3 | Permission denied on output path | ✅ |
+| 21.4 | Disk full during processing | ✅ |
+| 21.5 | Corrupted VCF (malformed record) | ✅ |
+| 21.6 | Corrupted GD table | ✅ |
+| 21.7 | Malformed PAR BED (non-numeric coords) | ✅ |
+| 21.8 | Temporary file cleanup on exception | ⚠️ |
+| 21.9 | Partial write recovery | ⚠️ |
+| 21.10 | Interrupted by signal (Ctrl-C) | ✅ |
 
 ---
 
@@ -499,7 +499,7 @@
 |---|------|---------|
 | 23.1 | pysam recomputes `stop = pos + SVLEN` when SVLEN is set | ✅ |
 | 23.2 | Code sets SVLEN **before** stop to exploit recomputation | ✅ |
-| 23.3 | pysam version change breaks SVLEN/stop order assumption | ❌ |
+| 23.3 | pysam version change breaks SVLEN/stop order assumption | ✅ |
 | 23.4 | `new_record` 0-based input → 1-based `.pos` | ✅ |
 | 23.5 | pysam `VariantFile` iteration order (chromosomal sort) | ✅ |
 | 23.6 | Empty VCF: tabix index on zero records | ✅ |
@@ -528,11 +528,11 @@
 | 25.3 | chrY records with ploidy 1 | ✅ |
 | 25.4 | chrX records in PAR region | ✅ |
 | 25.5 | chrM records | ✅ |
-| 25.6 | Uncontiguous contigs (e.g., chrUn_*) | ❌ |
-| 25.7 | 200+ samples in VCF | ❌ |
-| 25.8 | 100+ GD regions | ❌ |
-| 25.9 | 1000+ VCF records | ❌ |
-| 25.10 | Memory pressure with large inputs | ❌ |
+| 25.6 | Uncontiguous contigs (e.g., chrUn_*) | ✅ |
+| 25.7 | 200+ samples in VCF | ✅ |
+| 25.8 | 100+ GD regions | ✅ |
+| 25.9 | 1000+ VCF records | ✅ |
+| 25.10 | Memory pressure with large inputs | ✅ |
 
 ---
 
@@ -556,7 +556,7 @@
 | Phase 2: NAHR Matching | 28 | 28 | 0 | 0 |
 | Phase 3: Novel Records | 16 | 14 | 2 | 0 |
 | Phase Interactions | 7 | 7 | 0 | 0 |
-| End-to-End Scenarios | 10 | 0 | 10 | 0 |
+| End-to-End Scenarios | 10 | 8 | 2 | 0 |
 | Coordinate & SVLEN | 11 | 11 | 0 | 0 |
 | Header / FORMAT / INFO | 10 | 10 | 0 | 0 |
 | Reader Error Paths | 8 | 8 | 0 | 0 |
@@ -564,10 +564,10 @@
 | Parameter Values | 10 | 10 | 0 | 0 |
 | pysam-Specific Behavior | 7 | 7 | 0 | 0 |
 | Contig Naming | 5 | 5 | 0 | 0 |
-| Multi-Chromosomal | 10 | 5 | 5 | 0 |
-| **TOTAL** | **291** | **266** | **25** | **0** |
+| Multi-Chromosomal | 10 | 10 | 0 | 0 |
+| **TOTAL** | **291** | **284** | **7** | **0** |
 
-Coverage: ~91% of identified edge cases have tests. 
+Coverage: ~98% of identified edge cases have tests. 
 
 Each step is a single test. All should complete in ≤ 10s and use only in-memory mocks (no real bcftools/pysam I/O).
 
