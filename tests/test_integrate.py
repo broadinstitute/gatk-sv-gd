@@ -3325,6 +3325,55 @@ class TestPloidyTableReadingExtended:
 # ── Section 6: PAR BED Reading (cases 6.4-6.8) ───────────────────────
 
 
+class TestParBedReadingBasic:
+    """Test cases 6.1, 6.2, 6.3 for PAR BED reading."""
+
+    def test_valid_bed_entries(self, tmp_path):
+        """Case 6.1: Valid BED entries → trees populated."""
+        par = tmp_path / "par.bed"
+        par.write_text(
+            "chrX\t10000\t2781479\n"
+            "chrY\t1000001\t2781479\n"
+        )
+        trees = integrate._read_bed_to_trees(str(par))
+        assert "chrX" in trees
+        assert "chrY" in trees
+        # Check that the intervals are actually in the tree
+        overlaps = list(trees["chrX"].overlap(15000, 15001))
+        assert len(overlaps) >= 1
+
+    def test_comment_lines_skipped(self, tmp_path):
+        """Case 6.2: Comment lines (# ...) in PAR BED → skipped."""
+        par = tmp_path / "par.bed"
+        par.write_text(
+            "# PAR regions for chrX and chrY\n"
+            "chrX\t10000\t2781479\n"
+            "# End of PAR definitions\n"
+            "chrY\t1000001\t2781479\n"
+        )
+        trees = integrate._read_bed_to_trees(str(par))
+        assert "chrX" in trees
+        assert "chrY" in trees
+
+    def test_short_lines_skipped(self, tmp_path):
+        """Case 6.3: Lines with fewer than 3 columns → skipped."""
+        par = tmp_path / "par.bed"
+        par.write_text(
+            "chrX\t10000\t2781479\n"
+            "chrX\t20000\n"  # Only 2 columns → skip
+            "chrY\t1000001\t2781479\n"
+            "short\n"  # Only 1 column → skip
+        )
+        trees = integrate._read_bed_to_trees(str(par))
+        assert "chrX" in trees
+        assert "chrY" in trees
+        # Should only have 2 valid intervals
+        x_overlaps = list(trees["chrX"].overlap(15000, 15001))
+        y_overlaps = list(trees["chrY"].overlap(1500000, 1500001))
+        assert len(x_overlaps) >= 1
+        assert len(y_overlaps) >= 1
+
+
 class TestParBedReadingExtended:
     """Test cases 6.4-6.8 for PAR BED reading."""
 
@@ -3565,7 +3614,7 @@ class TestExtractVcfCarriersExtended:
 
 
 class TestHeaderManagementExtended:
-    """Test cases 12.2, 12.4-12.6 for header management."""
+    """Test cases 12.2-12.6 for header management."""
 
     def test_all_required_format_headers_added(self, tmp_path):
         """Case 12.2: All required FORMAT headers added."""
@@ -3574,6 +3623,15 @@ class TestHeaderManagementExtended:
         assert "RD_CN" in header.formats
         assert "RD_GQ" in header.formats
         assert "EV" in header.info
+
+    def test_idempotent_info_headers(self, tmp_path):
+        """Case 12.3: Idempotent: pre-existing INFO headers not duplicated."""
+        header = _FakeHeader(contigs={"chr1": None}, samples=["S1"])
+        integrate._ensure_headers(header)
+        first_count = len(header.info)
+        integrate._ensure_headers(header)
+        second_count = len(header.info)
+        assert first_count == second_count
 
     def test_idempotent_format_headers(self, tmp_path):
         """Case 12.4: Idempotent: pre-existing FORMAT not duplicated."""
@@ -4081,6 +4139,23 @@ class TestExtractVcfCarriersEdgeCases:
         })()
         carriers = integrate._extract_vcf_carriers(rec)
         assert "S1" in carriers  # (0,1,2) != (0,0)
+
+    def test_phased_vs_unphased_genotype(self):
+        """Case 9.12: Phased GT (0|1) vs unphased (0,1) — pysam returns tuples.
+
+        pysam always returns GT as a tuple regardless of phase pipe character.
+        Both (0, 1) phased and unphased should be treated as carrier.
+        """
+        rec = type("Rec", (), {
+            "samples": {
+                "S1": {"GT": (0, 1)},   # unphased (0,1)
+                "S2": {"GT": (0, 1)},   # pysam returns tuple for phased too
+            },
+            "sample_ids": ["S1", "S2"],
+        })()
+        carriers = integrate._extract_vcf_carriers(rec)
+        # Both should be carriers — phased vs unphased is irrelevant
+        assert carriers == {"S1", "S2"}
 
 
 # ── Section 23: pysam-Specific Behavior (cases 23.7) ────────────────

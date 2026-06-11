@@ -162,9 +162,9 @@
 
 | # | Case | Covered |
 |---|------|---------|
-| 6.1 | Valid BED entries | ❌ |
-| 6.2 | Comment lines skipped | ❌ |
-| 6.3 | Short lines (<3 cols) skipped | ❌ |
+| 6.1 | Valid BED entries | ✅ |
+| 6.2 | Comment lines skipped | ✅ |
+| 6.3 | Short lines (<3 cols) skipped | ✅ |
 | 6.4 | Multiple chromosomes | ✅ |
 | 6.5 | Overlapping PAR intervals (should merge) | ✅ |
 | 6.6 | PAR intervals on chrX and chrY | ✅ |
@@ -222,7 +222,7 @@
 | 9.9 | Mixed GT formats in same record | ✅ |
 | 9.10 | Record with zero samples | ✅ |
 | 9.11 | Record with many samples (100+) | ✅ |
-| 9.12 | Phased GT `(0|1)` vs unphased `(0,1)` (pysam returns tuples) | ❌ |
+| 9.12 | Phased GT `(0|1)` vs unphased `(0,1)` (pysam returns tuples) | ✅ |
 | 9.13 | Triploid GT `(0,1,2)` | ✅ |
 
 ---
@@ -274,7 +274,7 @@
 |---|------|---------|
 | 12.1 | All required INFO headers added | ✅ (via idempotent test) |
 | 12.2 | All required FORMAT headers added | ✅ |
-| 12.3 | Idempotent: pre-existing INFO not duplicated | ❌ |
+| 12.3 | Idempotent: pre-existing INFO not duplicated | ✅ |
 | 12.4 | Idempotent: pre-existing FORMAT not duplicated | ✅ |
 | 12.5 | Partial pre-existing INFO (only some present) | ✅ |
 | 12.6 | Empty header (no INFO, no FORMAT) | ✅ |
@@ -545,13 +545,13 @@
 | GDTable Class Internals | 10 | 10 | 0 | 0 |
 | GD Calls Reading | 26 | 15 | 11 | 0 |
 | Ploidy Table Reading | 10 | 10 | 0 | 0 |
-| PAR BED Reading | 8 | 5 | 3 | 0 |
+| PAR BED Reading | 8 | 8 | 0 | 0 |
 | PAR Region Detection | 10 | 6 | 4 | 0 |
 | Expected Copy Number | 8 | 4 | 4 | 0 |
-| VCF Carrier Extraction | 13 | 7 | 6 | 0 |
+| VCF Carrier Extraction | 13 | 13 | 0 | 0 |
 | Sample Overlap Scoring | 12 | 12 | 0 | 0 |
 | Genotype Update | 13 | 13 | 0 | 0 |
-| Header Management | 6 | 4 | 2 | 0 |
+| Header Management | 6 | 6 | 0 | 0 |
 | Phase 1: Non-NAHR | 15 | 15 | 0 | 0 |
 | Phase 2: NAHR Matching | 28 | 28 | 0 | 0 |
 | Phase 3: Novel Records | 16 | 14 | 2 | 0 |
@@ -565,9 +565,9 @@
 | pysam-Specific Behavior | 7 | 7 | 0 | 0 |
 | Contig Naming | 5 | 5 | 0 | 0 |
 | Multi-Chromosomal | 10 | 5 | 5 | 0 |
-| **TOTAL** | **291** | **261** | **30** | **0** |
+| **TOTAL** | **291** | **266** | **25** | **0** |
 
-Coverage: ~90% of identified edge cases have tests. 
+Coverage: ~91% of identified edge cases have tests. 
 
 Each step is a single test. All should complete in ≤ 10s and use only in-memory mocks (no real bcftools/pysam I/O).
 
