@@ -918,6 +918,61 @@ class TestMainNovelRecord:
         assert nov.samples["S1"]["GT"] == (0, 1)
         assert nov.samples["S1"]["RD_CN"] == 1
 
+    def test_novel_record_skipped_all_homref(self, monkeypatch, tmp_path):
+        """Phase 3: novel record with all hom-ref genotypes is skipped."""
+        header = _make_vcf_header(contigs={"chr1": None}, samples=["S1", "S2"])
+
+        written = _run_integrate_main(
+            monkeypatch, tmp_path,
+            vcf_records=[],  # No existing records to match
+            vcf_header=header,
+            gd_table_rows=[{
+                "chr": "chr1", "start": 1000, "end": 5000,
+                "gd_id": "GD_DEL1", "svtype": "DEL",
+                "nahr": "yes", "cluster": "clusterA", "bp1": "1", "bp2": "2",
+            }],
+            gd_calls_entries=[{
+                "chrom": "chr1", "pos": 1000, "end": 5000,
+                "region_id": "GD_DEL1", "svtype": "DEL",
+                "samples": [],  # No carriers -> all hom-ref
+            }],
+        )
+
+        # Novel record should be skipped because all samples are hom-ref
+        assert len(written) == 0
+
+    def test_phase2_matched_skipped_all_homref(self, monkeypatch, tmp_path):
+        """Phase 2: matched record with all hom-ref genotypes is skipped."""
+        header = _make_vcf_header(contigs={"chr1": None}, samples=["S1", "S2"])
+        # Input VCF has a DUP that overlaps the GD region
+        rec = _FakeRecord(
+            chrom="chr1",
+            pos=1001,  # 1-based
+            stop=5000,
+            record_id="var_dup",
+            info={"SVTYPE": "DUP"},
+            samples={"S1": {"GT": (0, 1)}, "S2": {"GT": (0, 0)}},
+        )
+
+        written = _run_integrate_main(
+            monkeypatch, tmp_path,
+            vcf_records=[rec],
+            vcf_header=header,
+            gd_table_rows=[{
+                "chr": "chr1", "start": 1000, "end": 5000,
+                "gd_id": "GD_DUP1", "svtype": "DUP",
+                "nahr": "yes", "cluster": "clusterA", "bp1": "1", "bp2": "2",
+            }],
+            gd_calls_entries=[{
+                "chrom": "chr1", "pos": 1000, "end": 5000,
+                "region_id": "GD_DUP1", "svtype": "DUP",
+                "samples": [],  # No carriers -> all hom-ref after reconciliation
+            }],
+        )
+
+        # Matched record should be skipped because all samples become hom-ref
+        assert len(written) == 0
+
 
 class TestMainNonDelDupPassthrough:
     """Non-DEL/DUP records pass through untouched."""

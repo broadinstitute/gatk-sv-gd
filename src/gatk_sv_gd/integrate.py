@@ -659,6 +659,16 @@ def main(argv: Optional[List[Text]] = None) -> None:
                                         gt, sample, is_carrier, ecn, svtype
                                     )
 
+                                # Skip matched records where all samples are
+                                # hom-ref after genotype reconciliation — they
+                                # carry no useful signal beyond the input VCF.
+                                all_homref = all(
+                                    gt.get("GT") == (0, 0)
+                                    for gt in record.samples.values()
+                                )
+                                if all_homref:
+                                    continue
+
                     vcf_out.write(record)
 
                 # ── Phase 3: novel records for unmatched GD calls ────
@@ -714,6 +724,15 @@ def main(argv: Optional[List[Text]] = None) -> None:
                         )
                         is_carrier = sample in carriers
                         update_genotype(gt, sample, is_carrier, ecn, svtype)
+
+                    # Skip novel records where all samples are hom-ref —
+                    # they carry no useful signal beyond the input VCF.
+                    all_homref = all(
+                        gt.get("GT") == (0, 0)
+                        for gt in new_rec.samples.values()
+                    )
+                    if all_homref:
+                        continue
 
                     vcf_out.write(new_rec)
 
