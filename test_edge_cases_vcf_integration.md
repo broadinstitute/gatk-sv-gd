@@ -388,7 +388,7 @@
 | 16.4 | Record annotated in Phase 1 AND matched in Phase 2 → `GENOMIC_DISORDER` value from Phase 2 | ✅ |
 | 16.5 | Phase 2 match with no gd_calls entry → Phase 1 annotation preserved | ✅ |
 | 16.6 | All three phases active on same chromosome | ✅ |
-| 16.7 | Phase 2 match suppresses Phase 3 novel emission for same GD_ID | ❌ |
+| 16.7 | Phase 2 match suppresses Phase 3 novel emission for same GD_ID | ✅ |
 
 ---
 
@@ -555,7 +555,7 @@
 | Phase 1: Non-NAHR | 15 | 15 | 0 | 0 |
 | Phase 2: NAHR Matching | 28 | 28 | 0 | 0 |
 | Phase 3: Novel Records | 16 | 14 | 2 | 0 |
-| Phase Interactions | 7 | 6 | 1 | 0 |
+| Phase Interactions | 7 | 7 | 0 | 0 |
 | End-to-End Scenarios | 10 | 0 | 10 | 0 |
 | Coordinate & SVLEN | 11 | 11 | 0 | 0 |
 | Header / FORMAT / INFO | 10 | 10 | 0 | 0 |
@@ -565,9 +565,9 @@
 | pysam-Specific Behavior | 7 | 7 | 0 | 0 |
 | Contig Naming | 5 | 5 | 0 | 0 |
 | Multi-Chromosomal | 10 | 5 | 5 | 0 |
-| **TOTAL** | **291** | **246** | **45** | **0** |
+| **TOTAL** | **291** | **247** | **44** | **0** |
 
-Coverage: ~84% of identified edge cases have tests. 
+Coverage: ~85% of identified edge cases have tests. 
 
 Each step is a single test. All should complete in ≤ 10s and use only in-memory mocks (no real bcftools/pysam I/O).
 
