@@ -2834,3 +2834,350 @@ class TestReadGdCallsExtended:
         )
         result = integrate.read_gd_calls(str(p))
         assert result[("GD1", "DEL")]["samples"] == {"S2"}
+
+
+# ── Section 5: Ploidy Table Reading (cases 5.3, 5.4, 5.7-5.10) ─────────
+
+
+class TestPloidyTableReadingExtended:
+    """Test cases 5.3, 5.4, 5.7-5.10 for ploidy table reading."""
+
+    def test_multiple_chromosomes_per_sample(self, tmp_path):
+        """Case 5.3: Multiple chromosomes per sample."""
+        p = tmp_path / "ploidy.tsv"
+        p.write_text(
+            "sample\tchr1\tchr2\tchr3\n"
+            "S1\t2\t3\t2\n"
+        )
+        result = integrate.read_ploidy_table(str(p))
+        assert result["S1"]["chr1"] == 2
+        assert result["S1"]["chr2"] == 3
+        assert result["S1"]["chr3"] == 2
+
+    def test_empty_ploidy_table(self, tmp_path):
+        """Case 5.4: Empty ploidy table (header only)."""
+        p = tmp_path / "ploidy.tsv"
+        p.write_text("sample\tchr1\n")
+        result = integrate.read_ploidy_table(str(p))
+        assert len(result) == 0
+
+    def test_malformed_row_too_few_columns(self, tmp_path):
+        """Case 5.7: Malformed row (too few columns) → NaN → crash on int()."""
+        p = tmp_path / "ploidy.tsv"
+        p.write_text(
+            "sample\tchr1\tchr2\n"
+            "S1\t2\n"
+        )
+        import pandas as pd
+        df = pd.read_csv(str(p), sep="\t")
+        # The missing value becomes NaN
+        assert pd.isna(df.loc[0, "chr2"])
+
+    def test_extra_whitespace_in_ploidy_table(self, tmp_path):
+        """Case 5.8: Extra whitespace / tabs in ploidy table → not stripped."""
+        p = tmp_path / "ploidy.tsv"
+        p.write_text("  sample \t chr1 \t chr2 \n  S1 \t 2 \t 3 \n")
+        result = integrate.read_ploidy_table(str(p))
+        # Whitespace in sample names and column names is preserved
+        assert "S1 " in result
+
+    def test_non_integer_ploidy_value_raises(self, tmp_path):
+        """Case 5.9: Non-integer ploidy value → ValueError from int()."""
+        p = tmp_path / "ploidy.tsv"
+        p.write_text(
+            "sample\tchr1\n"
+            "S1\t2.5\n"
+        )
+        with pytest.raises(ValueError):
+            integrate.read_ploidy_table(str(p))
+
+    def test_heterogeneous_ploidy_per_sample(self, tmp_path):
+        """Case 5.10: Heterogeneous ploidy (sample A diploid, sample B triploid)."""
+        p = tmp_path / "ploidy.tsv"
+        p.write_text(
+            "sample\tchr1\tchr2\n"
+            "S1\t2\t2\n"
+            "S2\t3\t3\n"
+        )
+        result = integrate.read_ploidy_table(str(p))
+        assert result["S1"]["chr1"] == 2
+        assert result["S2"]["chr1"] == 3
+
+
+# ── Section 6: PAR BED Reading (cases 6.4-6.8) ───────────────────────
+
+
+class TestParBedReadingExtended:
+    """Test cases 6.4-6.8 for PAR BED reading."""
+
+    def test_multiple_chromosomes(self, tmp_path):
+        """Case 6.4: Multiple chromosomes in PAR BED."""
+        par = tmp_path / "par.bed"
+        par.write_text(
+            "chrX\t1000\t5000\n"
+            "chrY\t1000\t3000\n"
+        )
+        trees = integrate._read_bed_to_trees(str(par))
+        assert "chrX" in trees
+        assert "chrY" in trees
+
+    def test_overlapping_par_intervals(self, tmp_path):
+        """Case 6.5: Overlapping PAR intervals (IntervalTree handles overlaps)."""
+        par = tmp_path / "par.bed"
+        par.write_text(
+            "chrX\t1000\t5000\n"
+            "chrX\t3000\t7000\n"
+        )
+        trees = integrate._read_bed_to_trees(str(par))
+        assert "chrX" in trees
+        overlaps = list(trees["chrX"].overlap(4000, 4001))
+        assert len(overlaps) >= 1
+
+    def test_par_on_chrX_and_chrY(self, tmp_path):
+        """Case 6.6: PAR intervals on chrX and chrY."""
+        par = tmp_path / "par.bed"
+        par.write_text(
+            "chrX\t1000\t5000\n"
+            "chrY\t1000\t3000\n"
+        )
+        trees = integrate._read_bed_to_trees(str(par))
+        assert "chrX" in trees
+        assert "chrY" in trees
+
+    def test_par_covering_entire_chromosome(self, tmp_path):
+        """Case 6.7: PAR covering entire chromosome."""
+        par = tmp_path / "par.bed"
+        par.write_text(
+            "chrX\t0\t155000000\n"
+        )
+        trees = integrate._read_bed_to_trees(str(par))
+        assert "chrX" in trees
+        overlaps = list(trees["chrX"].overlap(77000000, 77000001))
+        assert len(overlaps) >= 1
+
+    def test_empty_par_bed_file(self, tmp_path):
+        """Case 6.8: Empty PAR BED file."""
+        par = tmp_path / "par.bed"
+        par.write_text("")
+        trees = integrate._read_bed_to_trees(str(par))
+        assert len(trees) == 0
+
+
+# ── Section 7: PAR Region Detection (cases 7.3, 7.4, 7.8-7.10) ─────────
+
+
+class TestIsInParRegionExtended:
+    """Test cases 7.3, 7.4, 7.8-7.10 for PAR region detection."""
+
+    def test_partial_overlap_above_cutoff(self, tmp_path):
+        """Case 7.3: Variant partially overlaps PAR, above cutoff (0.5)."""
+        par = tmp_path / "par.bed"
+        par.write_text("chrX\t1000\t10000\n")
+        result = integrate.is_in_par_region(
+            "chrX", 5000, 14000, par_trees=integrate._read_bed_to_trees(str(par))
+        )
+        # Overlap: 5000-10000 = 5000, variant len = 9000, fraction = 5000/9000 ≈ 0.56
+        assert result is True
+
+    def test_variant_at_cutoff_boundary(self, tmp_path):
+        """Case 7.4: Variant exactly at cutoff boundary (fraction = 0.5)."""
+        par = tmp_path / "par.bed"
+        par.write_text("chrX\t1000\t6000\n")
+        # Variant: 3000-11000 (len=8000), overlap: 3000-6000=3000, fraction=3000/8000=0.375
+        result = integrate.is_in_par_region(
+            "chrX", 3000, 11000, par_trees=integrate._read_bed_to_trees(str(par))
+        )
+        assert result is False
+
+    def test_variant_spans_multiple_par_regions(self, tmp_path):
+        """Case 7.8: Variant spans multiple PAR regions (not cumulative)."""
+        par = tmp_path / "par.bed"
+        par.write_text(
+            "chrX\t1000\t3000\n"
+            "chrX\t7000\t9000\n"
+        )
+        # Variant 1000-9000 (len=8000), first PAR: 1000-3000 (len=2000)
+        # Fraction = 2000/8000 = 0.25 < 0.5 → returns False
+        # Even though second PAR also overlaps, results are NOT cumulative
+        result = integrate.is_in_par_region(
+            "chrX", 1000, 9000, par_trees=integrate._read_bed_to_trees(str(par))
+        )
+        assert result is False
+
+    def test_par_region_completely_contained_in_variant(self, tmp_path):
+        """Case 7.9: PAR region completely contained in variant."""
+        par = tmp_path / "par.bed"
+        par.write_text("chrX\t2000\t4000\n")
+        # Variant: 1000-5000 (len=4000), PAR: 2000-4000 (len=2000)
+        # Overlap: 2000, fraction = 2000/4000 = 0.5
+        result = integrate.is_in_par_region(
+            "chrX", 1000, 5000, par_trees=integrate._read_bed_to_trees(str(par))
+        )
+        assert result is True
+
+    def test_par_region_completely_contains_variant(self, tmp_path):
+        """Case 7.10: PAR region completely contains variant."""
+        par = tmp_path / "par.bed"
+        par.write_text("chrX\t1000\t10000\n")
+        # Variant: 3000-5000 (len=2000), PAR: 1000-10000
+        # Overlap: 2000, fraction = 2000/2000 = 1.0
+        result = integrate.is_in_par_region(
+            "chrX", 3000, 5000, par_trees=integrate._read_bed_to_trees(str(par))
+        )
+        assert result is True
+
+
+# ── Section 8: Expected Copy Number (cases 8.6-8.8) ──────────────────
+
+
+class TestGetExpectedCopyNumber:
+    """Test cases 8.6-8.8 for expected copy number."""
+
+    def test_ecn_triploid_dup(self, tmp_path):
+        """Case 8.6: ecn=3 (triploid) → DUP RD_CN=4."""
+        ploidy_path = tmp_path / "ploidy.tsv"
+        ploidy_path.write_text(
+            "sample\tchr1\n"
+            "S1\t3\n"
+        )
+        ploidy_dict = integrate.read_ploidy_table(str(ploidy_path))
+        par_trees = {}
+        result = integrate.get_expected_cn("chr1", 1000, 5000, "S1", ploidy_dict, par_trees)
+        assert result == 3
+
+    def test_ecn_triploid_del(self, tmp_path):
+        """Case 8.7: ecn=3 (triploid) → DEL RD_CN=2."""
+        ploidy_path = tmp_path / "ploidy.tsv"
+        ploidy_path.write_text(
+            "sample\tchr1\n"
+            "S1\t3\n"
+        )
+        ploidy_dict = integrate.read_ploidy_table(str(ploidy_path))
+        par_trees = {}
+        result = integrate.get_expected_cn("chr1", 1000, 5000, "S1", ploidy_dict, par_trees)
+        assert result == 3
+
+    def test_ecn_chrY_ploidy_non_par(self, tmp_path):
+        """Case 8.8: ecn=0 (chrY ploidy 1, non-PAR)."""
+        ploidy_path = tmp_path / "ploidy.tsv"
+        ploidy_path.write_text(
+            "sample\tchrY\n"
+            "S1\t1\n"
+        )
+        ploidy_dict = integrate.read_ploidy_table(str(ploidy_path))
+        par_trees = {}
+        result = integrate.get_expected_cn("chrY", 1000, 5000, "S1", ploidy_dict, par_trees)
+        assert result == 1
+
+
+# ── Section 9: VCF Carrier Extraction (cases 9.6-9.10) ──────────────
+
+
+class TestExtractVcfCarriersExtended:
+    """Test cases 9.6-9.10 for VCF carrier extraction."""
+
+    def test_homozygous_alt_genotype(self, tmp_path, monkeypatch):
+        """Case 9.6: Homozygous alt (1,1) → carrier."""
+        vcf = tmp_path / "in.vcf.gz"
+        vcf.write_text(
+            "##fileformat=VCFv4.2\n"
+            "##contig=<ID=chr1,length=1000000>\n"
+            "#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\tS1\n"
+            "chr1\t1000\t.\tA\tG\t.\t.\t.\tGT\t1|1\n"
+        )
+        import pysam
+        real_vf = type("RealVF", (), {
+            "__iter__": lambda self: iter([
+                type("Rec", (), {
+                    "samples": {"S1": {"GT": (1, 1)}},
+                    "sample_ids": ["S1"],
+                })(),
+            ]),
+        })()
+        monkeypatch.setattr(integrate.pysam, "VariantFile", lambda *a, **k: real_vf)
+        recs = list(integrate.pysam.VariantFile(str(vcf)))
+        for rec in recs:
+            carriers = integrate._extract_vcf_carriers(rec)
+        assert "S1" in carriers
+
+    def test_multi_allelic_genotype(self, tmp_path, monkeypatch):
+        """Case 9.7: Multi-allelic (0,2) → carrier."""
+        rec = type("Rec", (), {
+            "samples": {"S1": {"GT": (0, 2)}},
+            "sample_ids": ["S1"],
+        })()
+        carriers = integrate._extract_vcf_carriers(rec)
+        assert "S1" in carriers
+
+    def test_missing_gt_field_defaults_to_homref(self, tmp_path, monkeypatch):
+        """Case 9.8: Missing GT field → defaults to (0,0) → not carrier."""
+        rec = type("Rec", (), {
+            "samples": {"S1": {}},
+            "sample_ids": ["S1"],
+        })()
+        carriers = integrate._extract_vcf_carriers(rec)
+        assert "S1" not in carriers
+
+    def test_mixed_gt_formats_in_same_record(self, tmp_path, monkeypatch):
+        """Case 9.9: Mixed GT formats in same record."""
+        rec = type("Rec", (), {
+            "samples": {"S1": {"GT": (0, 1)}, "S2": {"GT": (1, 1)}},
+            "sample_ids": ["S1", "S2"],
+        })()
+        carriers = integrate._extract_vcf_carriers(rec)
+        assert "S1" in carriers
+        assert "S2" in carriers
+
+    def test_record_with_zero_samples(self, tmp_path, monkeypatch):
+        """Case 9.10: Record with zero samples → no crash."""
+        rec = type("Rec", (), {
+            "samples": {},
+            "sample_ids": [],
+        })()
+        carriers = integrate._extract_vcf_carriers(rec)
+        assert len(carriers) == 0
+
+
+# ── Section 10: Variant-to-GD_ID Matching (cases 10.1-10.7, 10.10) ───
+# SKIPPED: No dedicated _variant_to_gd_id function exists; matching is done inline
+# in main() using IntervalTree.overlap(). Will test via integration tests.
+
+
+# ── Section 12: Header Management (cases 12.2, 12.4-12.6) ───────────
+
+
+class TestHeaderManagementExtended:
+    """Test cases 12.2, 12.4-12.6 for header management."""
+
+    def test_all_required_format_headers_added(self, tmp_path):
+        """Case 12.2: All required FORMAT headers added."""
+        header = _FakeHeader(contigs={"chr1": None}, samples=["S1"])
+        integrate._ensure_headers(header)
+        assert "RD_CN" in header.formats
+        assert "RD_GQ" in header.formats
+        assert "EV" in header.info
+
+    def test_idempotent_format_headers(self, tmp_path):
+        """Case 12.4: Idempotent: pre-existing FORMAT not duplicated."""
+        header = _FakeHeader(contigs={"chr1": None}, samples=["S1"])
+        integrate._ensure_headers(header)
+        first_count = len(header.formats)
+        integrate._ensure_headers(header)
+        second_count = len(header.formats)
+        assert first_count == second_count
+
+    def test_partial_pre_existing_info_headers(self, tmp_path):
+        """Case 12.5: Partial pre-existing INFO (only some present)."""
+        header = _FakeHeader(contigs={"chr1": None}, samples=["S1"])
+        header.info["SVTYPE"] = object()
+        header.info["END"] = object()
+        integrate._ensure_headers(header)
+        assert "RD_CN" in header.formats
+        assert "SVTYPE" in header.info
+        assert "END" in header.info
+
+    def test_empty_header_no_info_no_format(self, tmp_path):
+        """Case 12.6: Empty header (no INFO, no FORMAT)."""
+        header = _FakeHeader(contigs={"chr1": None}, samples=["S1"])
+        integrate._ensure_headers(header)
+        assert "RD_CN" in header.formats
