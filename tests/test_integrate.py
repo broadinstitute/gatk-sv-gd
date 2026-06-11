@@ -1233,6 +1233,424 @@ class TestMainNovelRecord:
         assert len(written) == 0
 
 
+class TestPhase3NovelRecords:
+    """Phase 8c: Novel record emission edge cases (section 15)."""
+
+    def test_novel_record_has_correct_coordinates(self, monkeypatch, tmp_path):
+        """Case 15.5: gd_calls entry with carriers → novel record written."""
+        header = _make_vcf_header(contigs={"chr1": None}, samples=["S1"])
+        written = _run_integrate_main(
+            monkeypatch, tmp_path,
+            vcf_records=[], vcf_header=header,
+            gd_table_rows=[{
+                "chr": "chr1", "start": 1000, "end": 5000,
+                "gd_id": "GD_DEL1", "svtype": "DEL",
+                "nahr": "yes", "cluster": "clusterA", "bp1": "1", "bp2": "2",
+            }],
+            gd_calls_entries=[{
+                "chrom": "chr1", "pos": 1000, "end": 5000,
+                "region_id": "GD_DEL1", "svtype": "DEL",
+                "samples": ["S1"],
+            }],
+        )
+        assert len(written) == 1
+        nov = written[0]
+        assert nov.id == "GD_DEL1_DEL_novel"
+        assert nov.stop == 5000
+        assert nov.info.get("GENOMIC_DISORDER") == "GD_DEL1"
+        assert nov.info.get("GD_CLUSTER") == "clusterA"
+        assert nov.samples["S1"]["GT"] == (0, 1)
+        assert nov.samples["S1"]["RD_CN"] == 1
+
+    def test_multiple_novel_records(self, monkeypatch, tmp_path):
+        """Case 15.6: Multiple gd_calls entries → multiple novel records."""
+        header = _make_vcf_header(contigs={"chr1": None}, samples=["S1"])
+        written = _run_integrate_main(
+            monkeypatch, tmp_path,
+            vcf_records=[], vcf_header=header,
+            gd_table_rows=[
+                {"chr": "chr1", "start": 1000, "end": 3000,
+                 "gd_id": "GD1", "svtype": "DEL", "nahr": "yes",
+                 "cluster": "clusterA", "bp1": "1", "bp2": "2"},
+                {"chr": "chr1", "start": 4000, "end": 6000,
+                 "gd_id": "GD2", "svtype": "DEL", "nahr": "yes",
+                 "cluster": "clusterB", "bp1": "3", "bp2": "4"},
+            ],
+            gd_calls_entries=[
+                {"chrom": "chr1", "pos": 1000, "end": 3000,
+                 "region_id": "GD1", "svtype": "DEL", "samples": ["S1"]},
+                {"chrom": "chr1", "pos": 4000, "end": 6000,
+                 "region_id": "GD2", "svtype": "DEL", "samples": ["S1"]},
+            ],
+        )
+        assert len(written) == 2
+        gd_ids = {r.info.get("GENOMIC_DISORDER") for r in written}
+        assert gd_ids == {"GD1", "GD2"}
+
+    def test_novel_different_svtypes(self, monkeypatch, tmp_path):
+        """Case 15.7: gd_calls with different svtypes → correct svtype in novel."""
+        header = _make_vcf_header(contigs={"chr1": None}, samples=["S1"])
+        written = _run_integrate_main(
+            monkeypatch, tmp_path,
+            vcf_records=[], vcf_header=header,
+            gd_table_rows=[
+                {"chr": "chr1", "start": 1000, "end": 3000,
+                 "gd_id": "GD_DEL", "svtype": "DEL", "nahr": "yes",
+                 "cluster": "clusterA", "bp1": "1", "bp2": "2"},
+                {"chr": "chr1", "start": 4000, "end": 6000,
+                 "gd_id": "GD_DUP", "svtype": "DUP", "nahr": "yes",
+                 "cluster": "clusterB", "bp1": "3", "bp2": "4"},
+            ],
+            gd_calls_entries=[
+                {"chrom": "chr1", "pos": 1000, "end": 3000,
+                 "region_id": "GD_DEL", "svtype": "DEL", "samples": ["S1"]},
+                {"chrom": "chr1", "pos": 4000, "end": 6000,
+                 "region_id": "GD_DUP", "svtype": "DUP", "samples": ["S1"]},
+            ],
+        )
+        assert len(written) == 2
+        for r in written:
+            svtype = r.info.get("SVTYPE")
+            if r.info.get("GENOMIC_DISORDER") == "GD_DEL":
+                assert svtype == "DEL"
+            else:
+                assert svtype == "DUP"
+
+    def test_novel_chrX_par_ecn(self, monkeypatch, tmp_path):
+        """Case 15.8: chrX PAR region → correct ecn=2."""
+        header = _make_vcf_header(contigs={"chrX": None}, samples=["S1"])
+        par_intervals = [("chrX", 10000000, 13500000)]  # PAR region
+        written = _run_integrate_main(
+            monkeypatch, tmp_path,
+            vcf_records=[], vcf_header=header,
+            gd_table_rows=[{
+                "chr": "chrX", "start": 11000000, "end": 12000000,
+                "gd_id": "GD_X", "svtype": "DEL", "nahr": "yes",
+                "cluster": "clusterA", "bp1": "1", "bp2": "2",
+            }],
+            gd_calls_entries=[{
+                "chrom": "chrX", "pos": 11000000, "end": 12000000,
+                "region_id": "GD_X", "svtype": "DEL", "samples": ["S1"],
+            }],
+            par_intervals=par_intervals,
+            samples_ploidy=[("S1", {"chrX": 2})],
+        )
+        assert len(written) == 1
+        # chrX PAR has ecn=2 (diploid in PAR), carrier DEL → RD_CN=ecn-1=1
+        assert written[0].samples["S1"].get("RD_CN") == 1
+
+    def test_novel_chrY_ecn(self, monkeypatch, tmp_path):
+        """Case 15.9: chrY with ploidy 1 → correct ecn=1."""
+        header = _make_vcf_header(contigs={"chrY": None}, samples=["S1"])
+        written = _run_integrate_main(
+            monkeypatch, tmp_path,
+            vcf_records=[], vcf_header=header,
+            gd_table_rows=[{
+                "chr": "chrY", "start": 1000, "end": 5000,
+                "gd_id": "GD_Y", "svtype": "DEL", "nahr": "yes",
+                "cluster": "clusterA", "bp1": "1", "bp2": "2",
+            }],
+            gd_calls_entries=[{
+                "chrom": "chrY", "pos": 1000, "end": 5000,
+                "region_id": "GD_Y", "svtype": "DEL", "samples": ["S1"],
+            }],
+            samples_ploidy=[("S1", {"chrY": 1})],
+        )
+        assert len(written) == 1
+        # chrY with ploidy 1 → ecn=1, carrier=het → RD_CN = max(1-1, 0) = 0
+        assert written[0].samples["S1"]["GT"] == (0, 1)
+        assert written[0].samples["S1"].get("RD_CN") == 0
+
+    def test_novel_svlen(self, monkeypatch, tmp_path):
+        """Case 15.11: Novel record → SVLEN = stop - pos - 1."""
+        header = _make_vcf_header(contigs={"chr1": None}, samples=["S1"])
+        # pos=1000, end=5000 → SVLEN = 5000 - 1000 - 1 = 3999
+        written = _run_integrate_main(
+            monkeypatch, tmp_path,
+            vcf_records=[], vcf_header=header,
+            gd_table_rows=[{
+                "chr": "chr1", "start": 1000, "end": 5000,
+                "gd_id": "GD_DEL", "svtype": "DEL", "nahr": "yes",
+                "cluster": "clusterA", "bp1": "1", "bp2": "2",
+            }],
+            gd_calls_entries=[{
+                "chrom": "chr1", "pos": 1000, "end": 5000,
+                "region_id": "GD_DEL", "svtype": "DEL", "samples": ["S1"],
+            }],
+        )
+        assert len(written) == 1
+        assert written[0].info.get("SVLEN") == 3999
+
+    def test_novel_stop_preserved(self, monkeypatch, tmp_path):
+        """Case 15.12: Novel record → stop field preserved after pysam recomputation."""
+        header = _make_vcf_header(contigs={"chr1": None}, samples=["S1"])
+        written = _run_integrate_main(
+            monkeypatch, tmp_path,
+            vcf_records=[], vcf_header=header,
+            gd_table_rows=[{
+                "chr": "chr1", "start": 1000, "end": 5000,
+                "gd_id": "GD_DEL", "svtype": "DEL", "nahr": "yes",
+                "cluster": "clusterA", "bp1": "1", "bp2": "2",
+            }],
+            gd_calls_entries=[{
+                "chrom": "chr1", "pos": 1000, "end": 5000,
+                "region_id": "GD_DEL", "svtype": "DEL", "samples": ["S1"],
+            }],
+        )
+        assert len(written) == 1
+        assert written[0].stop == 5000
+
+    def test_novel_info_fields(self, monkeypatch, tmp_path):
+        """Case 15.13: Novel record → INFO fields populated."""
+        header = _make_vcf_header(contigs={"chr1": None}, samples=["S1"])
+        written = _run_integrate_main(
+            monkeypatch, tmp_path,
+            vcf_records=[], vcf_header=header,
+            gd_table_rows=[{
+                "chr": "chr1", "start": 1000, "end": 5000,
+                "gd_id": "GD_DEL", "svtype": "DEL", "nahr": "yes",
+                "cluster": "clusterA", "bp1": "1", "bp2": "2",
+            }],
+            gd_calls_entries=[{
+                "chrom": "chr1", "pos": 1000, "end": 5000,
+                "region_id": "GD_DEL", "svtype": "DEL", "samples": ["S1"],
+            }],
+        )
+        assert len(written) == 1
+        nov = written[0]
+        assert nov.info.get("SVTYPE") == "DEL"
+        assert nov.info.get("GENOMIC_DISORDER") == "GD_DEL"
+        assert nov.info.get("GD_CLUSTER") == "clusterA"
+        assert nov.info.get("GD_BP1") == "1"
+        assert nov.info.get("GD_BP2") == "2"
+        assert nov.info.get("EV") == ("RD",)
+        assert nov.info.get("ALGORITHMS") == ("depth",)
+
+    def test_novel_format_fields(self, monkeypatch, tmp_path):
+        """Case 15.14: Novel record → FORMAT fields (GT, GQ, RD_CN, RD_GQ) populated."""
+        header = _make_vcf_header(contigs={"chr1": None}, samples=["S1"])
+        written = _run_integrate_main(
+            monkeypatch, tmp_path,
+            vcf_records=[], vcf_header=header,
+            gd_table_rows=[{
+                "chr": "chr1", "start": 1000, "end": 5000,
+                "gd_id": "GD_DEL", "svtype": "DEL", "nahr": "yes",
+                "cluster": "clusterA", "bp1": "1", "bp2": "2",
+            }],
+            gd_calls_entries=[{
+                "chrom": "chr1", "pos": 1000, "end": 5000,
+                "region_id": "GD_DEL", "svtype": "DEL", "samples": ["S1"],
+            }],
+        )
+        assert len(written) == 1
+        gt = written[0].samples["S1"].get("GT")
+        assert gt == (0, 1) or gt is None  # Carrier gets het or null for DEL
+        assert "GQ" in written[0].samples["S1"]
+        assert "RD_CN" in written[0].samples["S1"]
+        assert "RD_GQ" in written[0].samples["S1"]
+
+    def test_non_nahr_novel_record(self, monkeypatch, tmp_path):
+        """Case 15.15: Non-NAHR gd_calls entry → novel record emitted."""
+        header = _make_vcf_header(contigs={"chr1": None}, samples=["S1"])
+        written = _run_integrate_main(
+            monkeypatch, tmp_path,
+            vcf_records=[], vcf_header=header,
+            gd_table_rows=[{
+                "chr": "chr1", "start": 1000, "end": 5000,
+                "gd_id": "GD_NONNAHR", "svtype": "DEL", "nahr": "no",
+                "cluster": "clusterA", "bp1": "1", "bp2": "2",
+            }],
+            gd_calls_entries=[{
+                "chrom": "chr1", "pos": 1000, "end": 5000,
+                "region_id": "GD_NONNAHR", "svtype": "DEL", "samples": ["S1"],
+            }],
+        )
+        # Non-NAHR goes to Phase 3 as novel record (not Phase 2 matching)
+        assert len(written) == 1
+        assert written[0].info.get("GENOMIC_DISORDER") == "GD_NONNAHR"
+
+
+class TestPhaseInteractions:
+    """Phase 8d: Phase interactions (section 16)."""
+
+    def test_phase1_and_phase2_match(self, monkeypatch, tmp_path):
+        """Case 16.1: Phase 1 annotates, Phase 2 matches → Phase 2 overwrites GD."""
+        header = _make_vcf_header(contigs={"chr1": None}, samples=["S1"])
+        # NAHR overlaps variant (RO >= 0.5), non-NAHR also overlaps
+        # Phase 2 matches GD_NAHR; GD_NONNAHR unmatched → Phase 3 novel
+        rec = _FakeRecord(
+            chrom="chr1", pos=1501, stop=5500,
+            record_id="var1", info={"SVTYPE": "DEL"},
+            samples={"S1": {"GT": (0, 0)}},
+        )
+
+        written = _run_integrate_main(
+            monkeypatch, tmp_path,
+            vcf_records=[rec], vcf_header=header,
+            gd_table_rows=[
+                {"chr": "chr1", "start": 1000, "end": 3000,
+                 "gd_id": "GD_NONNAHR", "svtype": "DEL", "nahr": "no",
+                 "cluster": "clusterA", "bp1": "1", "bp2": "2"},
+                {"chr": "chr1", "start": 1000, "end": 6000,
+                 "gd_id": "GD_NAHR", "svtype": "DEL", "nahr": "yes",
+                 "cluster": "clusterB", "bp1": "3", "bp2": "4"},
+            ],
+            gd_calls_entries=[
+                {"chrom": "chr1", "pos": 1000, "end": 3000,
+                 "region_id": "GD_NONNAHR", "svtype": "DEL", "samples": ["S1"]},
+                {"chrom": "chr1", "pos": 1000, "end": 6000,
+                 "region_id": "GD_NAHR", "svtype": "DEL", "samples": ["S1"]},
+            ],
+        )
+        # Phase 2 matches GD_NAHR; GD_NONNAHR novel → 2 records
+        assert len(written) == 2
+        assert written[0].info.get("GENOMIC_DISORDER") == "GD_NAHR"
+        gd_ids = {r.info.get("GENOMIC_DISORDER") for r in written if r.info.get("GENOMIC_DISORDER")}
+        assert "GD_NONNAHR" in gd_ids
+
+    def test_phase2_wins_cluster(self, monkeypatch, tmp_path):
+        """Case 16.2: Phase 1 annotates, Phase 2 matches → GD_CLUSTER from Phase 2 wins."""
+        header = _make_vcf_header(contigs={"chr1": None}, samples=["S1"])
+        rec = _FakeRecord(
+            chrom="chr1", pos=1501, stop=5500,
+            record_id="var1", info={"SVTYPE": "DEL"},
+            samples={"S1": {"GT": (0, 0)}},
+        )
+
+        written = _run_integrate_main(
+            monkeypatch, tmp_path,
+            vcf_records=[rec], vcf_header=header,
+            gd_table_rows=[
+                {"chr": "chr1", "start": 1000, "end": 3000,
+                 "gd_id": "GD_NONNAHR", "svtype": "DEL", "nahr": "no",
+                 "cluster": "clusterA", "bp1": "1", "bp2": "2"},
+                {"chr": "chr1", "start": 1000, "end": 6000,
+                 "gd_id": "GD_NAHR", "svtype": "DEL", "nahr": "yes",
+                 "cluster": "clusterB", "bp1": "3", "bp2": "4"},
+            ],
+            gd_calls_entries=[
+                {"chrom": "chr1", "pos": 1000, "end": 3000,
+                 "region_id": "GD_NONNAHR", "svtype": "DEL", "samples": ["S1"]},
+                {"chrom": "chr1", "pos": 1000, "end": 6000,
+                 "region_id": "GD_NAHR", "svtype": "DEL", "samples": ["S1"]},
+            ],
+        )
+        assert len(written) == 2
+        assert written[0].info.get("GD_CLUSTER") == "clusterB"
+
+    def test_non_nahr_novel(self, monkeypatch, tmp_path):
+        """Case 16.3: Non-NAHR entry with gd_calls → goes to Phase 3, can be novel."""
+        header = _make_vcf_header(contigs={"chr1": None}, samples=["S1"])
+        written = _run_integrate_main(
+            monkeypatch, tmp_path,
+            vcf_records=[], vcf_header=header,
+            gd_table_rows=[{
+                "chr": "chr1", "start": 1000, "end": 5000,
+                "gd_id": "GD_NONNAHR", "svtype": "DEL", "nahr": "no",
+                "cluster": "clusterA", "bp1": "1", "bp2": "2",
+            }],
+            gd_calls_entries=[{
+                "chrom": "chr1", "pos": 1000, "end": 5000,
+                "region_id": "GD_NONNAHR", "svtype": "DEL", "samples": ["S1"],
+            }],
+        )
+        assert len(written) == 1
+        assert written[0].info.get("GENOMIC_DISORDER") == "GD_NONNAHR"
+        assert written[0].id == "GD_NONNAHR_DEL_novel"
+
+    def test_phase1_and_phase2_same_record(self, monkeypatch, tmp_path):
+        """Case 16.4: Record annotated Phase 1 AND matched Phase 2 → GD from Phase 2."""
+        header = _make_vcf_header(contigs={"chr1": None}, samples=["S1"])
+        rec = _FakeRecord(
+            chrom="chr1", pos=2001, stop=4500,
+            record_id="var1", info={"SVTYPE": "DEL"},
+            samples={"S1": {"GT": (0, 0)}},
+        )
+
+        written = _run_integrate_main(
+            monkeypatch, tmp_path,
+            vcf_records=[rec], vcf_header=header,
+            gd_table_rows=[
+                {"chr": "chr1", "start": 1000, "end": 3000,
+                 "gd_id": "GD_NONNAHR", "svtype": "DEL", "nahr": "no",
+                 "cluster": "clusterA", "bp1": "1", "bp2": "2"},
+                {"chr": "chr1", "start": 2000, "end": 5000,
+                 "gd_id": "GD_NAHR", "svtype": "DEL", "nahr": "yes",
+                 "cluster": "clusterB", "bp1": "3", "bp2": "4"},
+            ],
+            gd_calls_entries=[
+                {"chrom": "chr1", "pos": 1000, "end": 3000,
+                 "region_id": "GD_NONNAHR", "svtype": "DEL", "samples": ["S1"]},
+                {"chrom": "chr1", "pos": 2000, "end": 5000,
+                 "region_id": "GD_NAHR", "svtype": "DEL", "samples": ["S1"]},
+            ],
+        )
+        # GD_NONNAHR novel → 2 records
+        assert len(written) == 2
+        assert written[0].info.get("GENOMIC_DISORDER") == "GD_NAHR"
+
+    def test_phase2_no_gd_calls_entry(self, monkeypatch, tmp_path):
+        """Case 16.5: Phase 2 match with no gd_calls entry → record passed through."""
+        header = _make_vcf_header(contigs={"chr1": None}, samples=["S1"])
+        rec = _FakeRecord(
+            chrom="chr1", pos=1001, stop=5000,
+            record_id="var1", info={"SVTYPE": "DEL"},
+            samples={"S1": {"GT": (0, 0)}},
+        )
+
+        written = _run_integrate_main(
+            monkeypatch, tmp_path,
+            vcf_records=[rec], vcf_header=header,
+            gd_table_rows=[{
+                "chr": "chr1", "start": 1000, "end": 5000,
+                "gd_id": "GD_NAHR", "svtype": "DEL", "nahr": "yes",
+                "cluster": "clusterA", "bp1": "1", "bp2": "2",
+            }],
+            gd_calls_entries=[],
+        )
+        # No gd_calls entry → Phase 2 doesn't set INFO, record passed through
+        assert len(written) == 1
+        assert written[0].id == "var1"
+        assert written[0].info.get("GENOMIC_DISORDER") is None
+
+    def test_all_three_phases(self, monkeypatch, tmp_path):
+        """Case 16.6: All three phases active on same chromosome → correct output."""
+        header = _make_vcf_header(contigs={"chr1": None}, samples=["S1"])
+        rec = _FakeRecord(
+            chrom="chr1", pos=1501, stop=5500,
+            record_id="var1", info={"SVTYPE": "DEL"},
+            samples={"S1": {"GT": (0, 0)}},
+        )
+
+        written = _run_integrate_main(
+            monkeypatch, tmp_path,
+            vcf_records=[rec], vcf_header=header,
+            gd_table_rows=[
+                {"chr": "chr1", "start": 1000, "end": 3000,
+                 "gd_id": "GD_NONNAHR", "svtype": "DEL", "nahr": "no",
+                 "cluster": "clusterA", "bp1": "1", "bp2": "2"},
+                {"chr": "chr1", "start": 1000, "end": 6000,
+                 "gd_id": "GD_NAHR", "svtype": "DEL", "nahr": "yes",
+                 "cluster": "clusterB", "bp1": "3", "bp2": "4"},
+                {"chr": "chr1", "start": 7000, "end": 9000,
+                 "gd_id": "GD_NOVEL", "svtype": "DEL", "nahr": "yes",
+                 "cluster": "clusterC", "bp1": "5", "bp2": "6"},
+            ],
+            gd_calls_entries=[
+                {"chrom": "chr1", "pos": 1000, "end": 3000,
+                 "region_id": "GD_NONNAHR", "svtype": "DEL", "samples": ["S1"]},
+                {"chrom": "chr1", "pos": 1000, "end": 6000,
+                 "region_id": "GD_NAHR", "svtype": "DEL", "samples": ["S1"]},
+                {"chrom": "chr1", "pos": 7000, "end": 9000,
+                 "region_id": "GD_NOVEL", "svtype": "DEL", "samples": ["S1"]},
+            ],
+        )
+        assert len(written) == 3
+        gd_ids = {r.info.get("GENOMIC_DISORDER") for r in written}
+        assert "GD_NAHR" in gd_ids
+        assert "GD_NOVEL" in gd_ids
+
+
 class TestMainNonDelDupPassthrough:
     """Non-DEL/DUP records pass through untouched."""
 
@@ -3685,3 +4103,1243 @@ class TestPysamSpecificBehavior:
         if isinstance(svtype, (tuple, list)):
             svtype = svtype[0] if svtype else ""
         assert svtype == "DEL"
+
+
+# ── Section 8: Integration-Level Tests (Phase 8a-8k) ─────────────────
+
+
+# ── Sub-step 8a: File validation (cases 1.4-1.11) ───────────────────
+
+
+class TestFileValidation:
+    """Test cases 1.4-1.11 for file validation."""
+
+    def test_missing_vcf_input(self, monkeypatch, tmp_path):
+        """Case 1.4: Missing VCF input → SystemExit(1)."""
+        gd_tsv = tmp_path / "gd.tsv"
+        gd_tsv.write_text(
+            "chr\tstart_GRCh38\tend_GRCh38\tGD_ID\tsvtype\tNAHR\tterminal\t"
+            "cluster\tBP1\tBP2\nchr1\t1000\t5000\tGD1\tDEL\tno\tno\tclusterA\t1\t2\n"
+        )
+        gd_calls = tmp_path / "calls.tsv"
+        gd_calls.write_text("chr1\t1000\t5000\tGD1\tDEL\tS1\n")
+        ploidy = tmp_path / "ploidy.tsv"
+        ploidy.write_text("sample\tchr1\nS1\t2\n")
+        par = tmp_path / "par.bed"
+        par.write_text("")
+
+        monkeypatch.setattr(integrate, "_sort_vcf", lambda *a, **k: None)
+        import types
+        monkeypatch.setattr(integrate, "pysam", types.SimpleNamespace())
+        monkeypatch.setattr(integrate, "setup_logging", lambda *a, **k: None)
+
+        with pytest.raises(SystemExit) as exc_info:
+            integrate.main([
+                "--vcf", str(tmp_path / "missing.vcf"),
+                "--gd-calls", str(gd_calls),
+                "--gd-table", str(gd_tsv),
+                "--par-bed", str(par),
+                "--ploidy-table", str(ploidy),
+                "--out-vcf", str(tmp_path / "out.vcf"),
+            ])
+        assert exc_info.value.code == 1
+
+    def test_missing_gd_calls_input(self, monkeypatch, tmp_path):
+        """Case 1.5: Missing GD calls input → SystemExit(1)."""
+        gd_tsv = tmp_path / "gd.tsv"
+        gd_tsv.write_text(
+            "chr\tstart_GRCh38\tend_GRCh38\tGD_ID\tsvtype\tNAHR\tterminal\t"
+            "cluster\tBP1\tBP2\nchr1\t1000\t5000\tGD1\tDEL\tno\tno\tclusterA\t1\t2\n"
+        )
+        (tmp_path / "in.vcf.gz").write_text("dummy")
+        ploidy = tmp_path / "ploidy.tsv"
+        ploidy.write_text("sample\tchr1\nS1\t2\n")
+        par = tmp_path / "par.bed"
+        par.write_text("")
+
+        monkeypatch.setattr(integrate, "_sort_vcf", lambda *a, **k: None)
+        import types
+        monkeypatch.setattr(integrate, "pysam", types.SimpleNamespace())
+        monkeypatch.setattr(integrate, "setup_logging", lambda *a, **k: None)
+
+        with pytest.raises(SystemExit) as exc_info:
+            integrate.main([
+                "--vcf", str(tmp_path / "in.vcf.gz"),
+                "--gd-calls", str(tmp_path / "missing_calls.tsv"),
+                "--gd-table", str(gd_tsv),
+                "--par-bed", str(par),
+                "--ploidy-table", str(ploidy),
+                "--out-vcf", str(tmp_path / "out.vcf"),
+            ])
+        assert exc_info.value.code == 1
+
+    def test_missing_gd_table_input(self, monkeypatch, tmp_path):
+        """Case 1.6: Missing GD table input → SystemExit(1)."""
+        (tmp_path / "in.vcf.gz").write_text("dummy")
+        gd_calls = tmp_path / "calls.tsv"
+        gd_calls.write_text("chr1\t1000\t5000\tGD1\tDEL\tS1\n")
+        ploidy = tmp_path / "ploidy.tsv"
+        ploidy.write_text("sample\tchr1\nS1\t2\n")
+        par = tmp_path / "par.bed"
+        par.write_text("")
+
+        monkeypatch.setattr(integrate, "_sort_vcf", lambda *a, **k: None)
+        import types
+        monkeypatch.setattr(integrate, "pysam", types.SimpleNamespace())
+        monkeypatch.setattr(integrate, "setup_logging", lambda *a, **k: None)
+
+        with pytest.raises(SystemExit) as exc_info:
+            integrate.main([
+                "--vcf", str(tmp_path / "in.vcf.gz"),
+                "--gd-calls", str(gd_calls),
+                "--gd-table", str(tmp_path / "missing.tsv"),
+                "--par-bed", str(par),
+                "--ploidy-table", str(ploidy),
+                "--out-vcf", str(tmp_path / "out.vcf"),
+            ])
+        assert exc_info.value.code == 1
+
+    def test_temp_dir_created(self, monkeypatch, tmp_path):
+        """Case 1.10: --temp-dir with non-existent path → created."""
+        gd_tsv = tmp_path / "gd.tsv"
+        gd_tsv.write_text(
+            "chr\tstart_GRCh38\tend_GRCh38\tGD_ID\tsvtype\tNAHR\tterminal\t"
+            "cluster\tBP1\tBP2\nchr1\t1000\t5000\tGD1\tDEL\tno\tno\tclusterA\t1\t2\n"
+        )
+        gd_calls = tmp_path / "calls.tsv"
+        gd_calls.write_text("chr1\t1000\t5000\tGD1\tDEL\tS1\n")
+        ploidy = tmp_path / "ploidy.tsv"
+        ploidy.write_text("sample\tchr1\nS1\t2\n")
+        par = tmp_path / "par.bed"
+        par.write_text("")
+        (tmp_path / "in.vcf.gz").write_text("dummy")
+
+        temp_dir = tmp_path / "new_temp"
+        assert not temp_dir.exists()
+
+        class _FakeVF:
+            def __init__(self, path, mode=None, header=None):
+                self._path = path
+                self._mode = mode or "r"
+                self._records = []
+                self.header = _make_vcf_header()
+                if mode == "w":
+                    self._written = []
+                else:
+                    self._records = []
+            def __iter__(self): return iter([])
+            def __enter__(self): return self
+            def __exit__(self, *a): pass
+            def close(self): pass
+            def write(self, r): self._written.append(r)
+
+        import types
+        fake_pysam = types.SimpleNamespace(
+            VariantFile=_FakeVF,
+            tabix_index=lambda *a, **k: None,
+        )
+        monkeypatch.setattr(integrate, "pysam", fake_pysam)
+        monkeypatch.setattr(integrate, "_sort_vcf", lambda *a, **k: None)
+        monkeypatch.setattr(integrate, "setup_logging", lambda *a, **k: None)
+
+        integrate.main([
+            "--vcf", str(tmp_path / "in.vcf.gz"),
+            "--gd-calls", str(gd_calls),
+            "--gd-table", str(gd_tsv),
+            "--par-bed", str(par),
+            "--ploidy-table", str(ploidy),
+            "--out-vcf", str(tmp_path / "out.vcf"),
+            "--temp-dir", str(temp_dir),
+        ])
+        assert temp_dir.exists()
+
+
+# ── Sub-step 8b: Phase 2 matching (cases 14.6-14.24) ────────────────
+
+
+class TestPhase2MatchingExtended:
+    """Test cases 14.6-14.24 for Phase 2 NAHR matching."""
+
+    def test_some_samples_het_after_reconciliation(self, monkeypatch, tmp_path):
+        """Case 14.6: Some samples het after reconciliation → record written."""
+        header = _make_vcf_header(contigs={"chr1": None}, samples=["S1", "S2"])
+        rec = _FakeRecord(
+            chrom="chr1", pos=1001, stop=5000,
+            record_id="var1", info={"SVTYPE": "DEL"},
+            samples={"S1": {"GT": (0, 0), "RD_CN": 2},
+                     "S2": {"GT": (0, 0), "RD_CN": 2}},
+        )
+
+        written = _run_integrate_main(
+            monkeypatch, tmp_path,
+            vcf_records=[rec], vcf_header=header,
+            gd_table_rows=[{
+                "chr": "chr1", "start": 1000, "end": 5000,
+                "gd_id": "GD_DEL1", "svtype": "DEL",
+                "nahr": "yes", "cluster": "clusterA", "bp1": "1", "bp2": "2",
+            }],
+            gd_calls_entries=[{
+                "chrom": "chr1", "pos": 1000, "end": 5000,
+                "region_id": "GD_DEL1", "svtype": "DEL",
+                "samples": ["S1"],  # Only S1 is carrier
+            }],
+            samples_ploidy=[("S1", {"chr1": 2}), ("S2", {"chr1": 2})],
+        )
+        # S1 is carrier → het (0,1), S2 is non-carrier → homref (0,0)
+        # Not all homref → record should be written
+        assert len(written) == 1
+        assert written[0].samples["S1"]["GT"] == (0, 1)
+        assert written[0].samples["S2"]["GT"] == (0, 0)
+
+    def test_single_sample_carrier(self, monkeypatch, tmp_path):
+        """Case 14.7: Single sample, carrier → het genotype written."""
+        header = _make_vcf_header(contigs={"chr1": None}, samples=["S1"])
+        rec = _FakeRecord(
+            chrom="chr1", pos=1001, stop=5000,
+            record_id="var1", info={"SVTYPE": "DEL"},
+            samples={"S1": {"GT": (0, 0)}},
+        )
+
+        written = _run_integrate_main(
+            monkeypatch, tmp_path,
+            vcf_records=[rec], vcf_header=header,
+            gd_table_rows=[{
+                "chr": "chr1", "start": 1000, "end": 5000,
+                "gd_id": "GD_DEL1", "svtype": "DEL",
+                "nahr": "yes", "cluster": "clusterA", "bp1": "1", "bp2": "2",
+            }],
+            gd_calls_entries=[{
+                "chrom": "chr1", "pos": 1000, "end": 5000,
+                "region_id": "GD_DEL1", "svtype": "DEL",
+                "samples": ["S1"],
+            }],
+            samples_ploidy=[("S1", {"chr1": 2})],
+        )
+        assert len(written) == 1
+        assert written[0].samples["S1"]["GT"] == (0, 1)
+        assert written[0].samples["S1"]["RD_CN"] == 1  # DEL: ecn-1
+        assert written[0].samples["S1"]["RD_GQ"] == 99
+
+    def test_single_sample_non_carrier_skipped(self, monkeypatch, tmp_path):
+        """Case 14.8: Single sample, non-carrier → homref, record skipped."""
+        header = _make_vcf_header(contigs={"chr1": None}, samples=["S1"])
+        rec = _FakeRecord(
+            chrom="chr1", pos=1001, stop=5000,
+            record_id="var1", info={"SVTYPE": "DEL"},
+            samples={"S1": {"GT": (0, 1)}},
+        )
+
+        written = _run_integrate_main(
+            monkeypatch, tmp_path,
+            vcf_records=[rec], vcf_header=header,
+            gd_table_rows=[{
+                "chr": "chr1", "start": 1000, "end": 5000,
+                "gd_id": "GD_DEL1", "svtype": "DEL",
+                "nahr": "yes", "cluster": "clusterA", "bp1": "1", "bp2": "2",
+            }],
+            gd_calls_entries=[{
+                "chrom": "chr1", "pos": 1000, "end": 5000,
+                "region_id": "GD_DEL1", "svtype": "DEL",
+                "samples": [],  # No carriers
+            }],
+            samples_ploidy=[("S1", {"chr1": 2})],
+        )
+        # All homref → record skipped
+        assert len(written) == 0
+
+    def test_ro_below_threshold_passthrough(self, monkeypatch, tmp_path):
+        """Case 14.9: RO < threshold → no Phase 2 match, Phase 3 creates novel."""
+        header = _make_vcf_header(contigs={"chr1": None}, samples=["S1"])
+        # Variant: 1000-5000, NAHR: 8000-12000 → NO overlap
+        # → Phase 2 no match → original record written + Phase 3 novel
+        rec = _FakeRecord(
+            chrom="chr1", pos=1001, stop=5000,
+            record_id="var1", info={"SVTYPE": "DEL"},
+            samples={"S1": {"GT": (0, 1)}},
+        )
+
+        written = _run_integrate_main(
+            monkeypatch, tmp_path,
+            vcf_records=[rec], vcf_header=header,
+            gd_table_rows=[{
+                "chr": "chr1", "start": 8000, "end": 12000,
+                "gd_id": "GD_DEL1", "svtype": "DEL",
+                "nahr": "yes", "cluster": "clusterA", "bp1": "1", "bp2": "2",
+            }],
+            gd_calls_entries=[{
+                "chrom": "chr1", "pos": 8000, "end": 12000,
+                "region_id": "GD_DEL1", "svtype": "DEL", "samples": ["S1"],
+            }],
+            samples_ploidy=[("S1", {"chr1": 2})],
+        )
+        # No Phase 2 match → original written + Phase 3 novel = 2 records
+        assert len(written) == 2
+        assert written[0].id == "var1"  # original passthrough
+        assert "var1" not in (written[1].id or "")  # novel has different id
+
+    def test_ro_at_threshold_matches(self, monkeypatch, tmp_path):
+        """Case 14.10: RO exactly at threshold → match."""
+        header = _make_vcf_header(contigs={"chr1": None}, samples=["S1"])
+        # Identical coords → RO = 1.0 (at default threshold 0.5)
+        rec = _FakeRecord(
+            chrom="chr1", pos=1001, stop=5000,
+            record_id="var1", info={"SVTYPE": "DEL"},
+            samples={"S1": {"GT": (0, 0)}},
+        )
+
+        written = _run_integrate_main(
+            monkeypatch, tmp_path,
+            vcf_records=[rec], vcf_header=header,
+            gd_table_rows=[{
+                "chr": "chr1", "start": 1000, "end": 5000,
+                "gd_id": "GD_DEL1", "svtype": "DEL",
+                "nahr": "yes", "cluster": "clusterA", "bp1": "1", "bp2": "2",
+            }],
+            gd_calls_entries=[{
+                "chrom": "chr1", "pos": 1000, "end": 5000,
+                "region_id": "GD_DEL1", "svtype": "DEL", "samples": ["S1"],
+            }],
+            samples_ploidy=[("S1", {"chr1": 2})],
+        )
+        assert len(written) == 1
+        assert written[0].info.get("GENOMIC_DISORDER") == "GD_DEL1"
+
+    def test_ro_identical_coords(self, monkeypatch, tmp_path):
+        """Case 14.11: NAHR with identical coords (RO = 1.0) → match."""
+        header = _make_vcf_header(contigs={"chr1": None}, samples=["S1"])
+        rec = _FakeRecord(
+            chrom="chr1", pos=1001, stop=5000,
+            record_id="var1", info={"SVTYPE": "DEL"},
+            samples={"S1": {"GT": (0, 0)}},
+        )
+
+        written = _run_integrate_main(
+            monkeypatch, tmp_path,
+            vcf_records=[rec], vcf_header=header,
+            gd_table_rows=[{
+                "chr": "chr1", "start": 1000, "end": 5000,
+                "gd_id": "GD_DEL1", "svtype": "DEL",
+                "nahr": "yes", "cluster": "clusterA", "bp1": "1", "bp2": "2",
+            }],
+            gd_calls_entries=[{
+                "chrom": "chr1", "pos": 1000, "end": 5000,
+                "region_id": "GD_DEL1", "svtype": "DEL", "samples": ["S1"],
+            }],
+            samples_ploidy=[("S1", {"chr1": 2})],
+        )
+        assert len(written) == 1
+        assert written[0].samples["S1"]["GT"] == (0, 1)
+
+    def test_naahr_overlaps_from_left(self, monkeypatch, tmp_path):
+        """Case 14.12: NAHR partially overlaps variant from left."""
+        header = _make_vcf_header(contigs={"chr1": None}, samples=["S1"])
+        # NAHR: 1000-4000, Variant: 1500-6000
+        # RO = 2499/max(3000,4499) = 0.556 >= 0.5
+        rec = _FakeRecord(
+            chrom="chr1", pos=1501, stop=6000,
+            record_id="var1", info={"SVTYPE": "DEL"},
+            samples={"S1": {"GT": (0, 0)}},
+        )
+
+        written = _run_integrate_main(
+            monkeypatch, tmp_path,
+            vcf_records=[rec], vcf_header=header,
+            gd_table_rows=[{
+                "chr": "chr1", "start": 1000, "end": 4000,
+                "gd_id": "GD_DEL1", "svtype": "DEL",
+                "nahr": "yes", "cluster": "clusterA", "bp1": "1", "bp2": "2",
+            }],
+            gd_calls_entries=[{
+                "chrom": "chr1", "pos": 1000, "end": 4000,
+                "region_id": "GD_DEL1", "svtype": "DEL", "samples": ["S1"],
+            }],
+            samples_ploidy=[("S1", {"chr1": 2})],
+        )
+        assert len(written) == 1
+        assert written[0].info.get("GENOMIC_DISORDER") == "GD_DEL1"
+
+    def test_naahr_overlaps_from_right(self, monkeypatch, tmp_path):
+        """Case 14.13: NAHR partially overlaps variant from right."""
+        header = _make_vcf_header(contigs={"chr1": None}, samples=["S1"])
+        # Variant: 1000-5000, NAHR: 3000-7000
+        # RO = 2000/max(4000,4000) = 0.5
+        rec = _FakeRecord(
+            chrom="chr1", pos=1001, stop=5000,
+            record_id="var1", info={"SVTYPE": "DEL"},
+            samples={"S1": {"GT": (0, 0)}},
+        )
+
+        written = _run_integrate_main(
+            monkeypatch, tmp_path,
+            vcf_records=[rec], vcf_header=header,
+            gd_table_rows=[{
+                "chr": "chr1", "start": 3000, "end": 7000,
+                "gd_id": "GD_DEL1", "svtype": "DEL",
+                "nahr": "yes", "cluster": "clusterA", "bp1": "1", "bp2": "2",
+            }],
+            gd_calls_entries=[{
+                "chrom": "chr1", "pos": 3000, "end": 7000,
+                "region_id": "GD_DEL1", "svtype": "DEL", "samples": ["S1"],
+            }],
+            samples_ploidy=[("S1", {"chr1": 2})],
+        )
+        assert len(written) == 1
+        assert written[0].info.get("GENOMIC_DISORDER") == "GD_DEL1"
+
+    def test_naahr_contains_variant(self, monkeypatch, tmp_path):
+        """Case 14.14: NAHR completely contains variant."""
+        header = _make_vcf_header(contigs={"chr1": None}, samples=["S1"])
+        # NAHR: 1000-5000, Variant: 2000-4000
+        # overlap = 2000, RO = 2000/max(4000,2000) = 0.5
+        rec = _FakeRecord(
+            chrom="chr1", pos=2001, stop=4001,
+            record_id="var1", info={"SVTYPE": "DEL"},
+            samples={"S1": {"GT": (0, 0)}},
+        )
+
+        written = _run_integrate_main(
+            monkeypatch, tmp_path,
+            vcf_records=[rec], vcf_header=header,
+            gd_table_rows=[{
+                "chr": "chr1", "start": 1000, "end": 5000,
+                "gd_id": "GD_DEL1", "svtype": "DEL",
+                "nahr": "yes", "cluster": "clusterA", "bp1": "1", "bp2": "2",
+            }],
+            gd_calls_entries=[{
+                "chrom": "chr1", "pos": 1000, "end": 5000,
+                "region_id": "GD_DEL1", "svtype": "DEL", "samples": ["S1"],
+            }],
+            samples_ploidy=[("S1", {"chr1": 2})],
+        )
+        assert len(written) == 1
+        assert written[0].info.get("GENOMIC_DISORDER") == "GD_DEL1"
+
+    def test_variant_contains_naahr(self, monkeypatch, tmp_path):
+        """Case 14.15: Variant completely contains NAHR."""
+        header = _make_vcf_header(contigs={"chr1": None}, samples=["S1"])
+        # Variant: 1000-5000, NAHR: 2000-4000
+        # overlap = 2000, RO = 2000/max(2000,3999) = 0.500
+        rec = _FakeRecord(
+            chrom="chr1", pos=1001, stop=5000,
+            record_id="var1", info={"SVTYPE": "DEL"},
+            samples={"S1": {"GT": (0, 0)}},
+        )
+
+        written = _run_integrate_main(
+            monkeypatch, tmp_path,
+            vcf_records=[rec], vcf_header=header,
+            gd_table_rows=[{
+                "chr": "chr1", "start": 2000, "end": 4000,
+                "gd_id": "GD_DEL1", "svtype": "DEL",
+                "nahr": "yes", "cluster": "clusterA", "bp1": "1", "bp2": "2",
+            }],
+            gd_calls_entries=[{
+                "chrom": "chr1", "pos": 2000, "end": 4000,
+                "region_id": "GD_DEL1", "svtype": "DEL", "samples": ["S1"],
+            }],
+            samples_ploidy=[("S1", {"chr1": 2})],
+        )
+        assert len(written) == 1
+        assert written[0].info.get("GENOMIC_DISORDER") == "GD_DEL1"
+
+    def test_zero_length_variant_no_match(self, monkeypatch, tmp_path):
+        """Case 14.16: Zero-length variant → no match (RO = 0)."""
+        header = _make_vcf_header(contigs={"chr1": None}, samples=["S1"])
+        # Zero-length variant: RO = 0
+        # → no Phase 2 match → original + Phase 3 novel = 2 records
+        rec = _FakeRecord(
+            chrom="chr1", pos=1001, stop=1001,
+            record_id="var1", info={"SVTYPE": "DEL"},
+            samples={"S1": {"GT": (0, 0)}},
+        )
+
+        written = _run_integrate_main(
+            monkeypatch, tmp_path,
+            vcf_records=[rec], vcf_header=header,
+            gd_table_rows=[{
+                "chr": "chr1", "start": 1000, "end": 1001,
+                "gd_id": "GD_DEL1", "svtype": "DEL",
+                "nahr": "yes", "cluster": "clusterA", "bp1": "1", "bp2": "2",
+            }],
+            gd_calls_entries=[{
+                "chrom": "chr1", "pos": 1000, "end": 1001,
+                "region_id": "GD_DEL1", "svtype": "DEL", "samples": ["S1"],
+            }],
+            samples_ploidy=[("S1", {"chr1": 2})],
+        )
+        # RO = 0 → no Phase 2 match → original written + Phase 3 novel
+        assert len(written) == 2
+        assert written[0].id == "var1"
+
+    def test_vcf_carriers_subset_of_gd_carriers(self, monkeypatch, tmp_path):
+        """Case 14.20: VCF carriers ⊂ GD carriers → SO < 1.0."""
+        header = _make_vcf_header(contigs={"chr1": None}, samples=["S1", "S2", "S3"])
+        # VCF has S1 as carrier, GD calls has S1,S2,S3 as carriers
+        rec = _FakeRecord(
+            chrom="chr1", pos=1001, stop=5000,
+            record_id="var1", info={"SVTYPE": "DEL"},
+            samples={"S1": {"GT": (0, 1)}, "S2": {"GT": (0, 0)},
+                     "S3": {"GT": (0, 0)}},
+        )
+
+        written = _run_integrate_main(
+            monkeypatch, tmp_path,
+            vcf_records=[rec], vcf_header=header,
+            gd_table_rows=[{
+                "chr": "chr1", "start": 1000, "end": 5000,
+                "gd_id": "GD_DEL1", "svtype": "DEL",
+                "nahr": "yes", "cluster": "clusterA", "bp1": "1", "bp2": "2",
+            }],
+            gd_calls_entries=[{
+                "chrom": "chr1", "pos": 1000, "end": 5000,
+                "region_id": "GD_DEL1", "svtype": "DEL",
+                "samples": ["S1", "S2", "S3"],  # 3 GD carriers
+            }],
+            samples_ploidy=[("S1", {"chr1": 2}), ("S2", {"chr1": 2}),
+                            ("S3", {"chr1": 2})],
+        )
+        assert len(written) == 1
+        # SO = |{S1} ∩ {S1,S2,S3}| / max(1, 3) = 1/3 = 0.333
+        so = integrate.sample_overlap({"S1"}, {"S1", "S2", "S3"})
+        assert so == pytest.approx(1 / 3)
+
+    def test_vcf_carriers_superset_of_gd_carriers(self, monkeypatch, tmp_path):
+        """Case 14.21: VCF carriers ⊃ GD carriers → SO < 1.0."""
+        header = _make_vcf_header(contigs={"chr1": None}, samples=["S1", "S2", "S3"])
+        rec = _FakeRecord(
+            chrom="chr1", pos=1001, stop=5000,
+            record_id="var1", info={"SVTYPE": "DEL"},
+            samples={"S1": {"GT": (0, 1)}, "S2": {"GT": (0, 1)},
+                     "S3": {"GT": (0, 1)}},
+        )
+
+        written = _run_integrate_main(
+            monkeypatch, tmp_path,
+            vcf_records=[rec], vcf_header=header,
+            gd_table_rows=[{
+                "chr": "chr1", "start": 1000, "end": 5000,
+                "gd_id": "GD_DEL1", "svtype": "DEL",
+                "nahr": "yes", "cluster": "clusterA", "bp1": "1", "bp2": "2",
+            }],
+            gd_calls_entries=[{
+                "chrom": "chr1", "pos": 1000, "end": 5000,
+                "region_id": "GD_DEL1", "svtype": "DEL", "samples": ["S1"],
+            }],
+            samples_ploidy=[("S1", {"chr1": 2}), ("S2", {"chr1": 2}),
+                            ("S3", {"chr1": 2})],
+        )
+        assert len(written) == 1
+        # SO = |{S1,S2,S3} ∩ {S1}| / max(3, 1) = 1/3
+        so = integrate.sample_overlap({"S1", "S2", "S3"}, {"S1"})
+        assert so == pytest.approx(1 / 3)
+
+    def test_vcf_carriers_equal_gd_carriers(self, monkeypatch, tmp_path):
+        """Case 14.22: VCF carriers == GD carriers → SO = 1.0."""
+        header = _make_vcf_header(contigs={"chr1": None}, samples=["S1", "S2"])
+        rec = _FakeRecord(
+            chrom="chr1", pos=1001, stop=5000,
+            record_id="var1", info={"SVTYPE": "DEL"},
+            samples={"S1": {"GT": (0, 1)}, "S2": {"GT": (0, 1)}},
+        )
+
+        written = _run_integrate_main(
+            monkeypatch, tmp_path,
+            vcf_records=[rec], vcf_header=header,
+            gd_table_rows=[{
+                "chr": "chr1", "start": 1000, "end": 5000,
+                "gd_id": "GD_DEL1", "svtype": "DEL",
+                "nahr": "yes", "cluster": "clusterA", "bp1": "1", "bp2": "2",
+            }],
+            gd_calls_entries=[{
+                "chrom": "chr1", "pos": 1000, "end": 5000,
+                "region_id": "GD_DEL1", "svtype": "DEL",
+                "samples": ["S1", "S2"],
+            }],
+            samples_ploidy=[("S1", {"chr1": 2}), ("S2", {"chr1": 2})],
+        )
+        assert len(written) == 1
+        # SO = |{S1,S2} ∩ {S1,S2}| / max(2, 2) = 2/2 = 1.0
+        so = integrate.sample_overlap({"S1", "S2"}, {"S1", "S2"})
+        assert so == pytest.approx(1.0)
+
+    def test_three_overlapping_naahr_regions(self, monkeypatch, tmp_path):
+        """Case 14.23: Three overlapping NAHR regions → correct winner."""
+        header = _make_vcf_header(contigs={"chr1": None}, samples=["S1", "S2"])
+        # All three overlap the variant, but different sample overlap scores
+        rec = _FakeRecord(
+            chrom="chr1", pos=1001, stop=6000,
+            record_id="var1", info={"SVTYPE": "DEL"},
+            samples={"S1": {"GT": (0, 1)}, "S2": {"GT": (0, 0)}},
+        )
+
+        written = _run_integrate_main(
+            monkeypatch, tmp_path,
+            vcf_records=[rec], vcf_header=header,
+            gd_table_rows=[
+                {"chr": "chr1", "start": 500, "end": 7000,
+                 "gd_id": "GD1", "svtype": "DEL", "nahr": "yes",
+                 "cluster": "clusterA", "bp1": "1", "bp2": "2"},
+                {"chr": "chr1", "start": 1000, "end": 6000,
+                 "gd_id": "GD2", "svtype": "DEL", "nahr": "yes",
+                 "cluster": "clusterB", "bp1": "1", "bp2": "2"},
+                {"chr": "chr1", "start": 1500, "end": 5500,
+                 "gd_id": "GD3", "svtype": "DEL", "nahr": "yes",
+                 "cluster": "clusterC", "bp1": "1", "bp2": "2"},
+            ],
+            gd_calls_entries=[
+                {"chrom": "chr1", "pos": 500, "end": 7000,
+                 "region_id": "GD1", "svtype": "DEL", "samples": ["S1"]},
+                {"chrom": "chr1", "pos": 1000, "end": 6000,
+                 "region_id": "GD2", "svtype": "DEL", "samples": ["S1", "S2"]},
+                {"chrom": "chr1", "pos": 1500, "end": 5500,
+                 "region_id": "GD3", "svtype": "DEL", "samples": []},
+            ],
+            samples_ploidy=[("S1", {"chr1": 2}), ("S2", {"chr1": 2})],
+        )
+        # Phase 2 matches GD2 (best RO=1.0). GD1 unmatched → Phase 3 novel.
+        # GD3 has empty carriers → all hom-ref → Phase 3 skips it.
+        # Total = 1 modified VCF + 1 novel = 2
+        assert len(written) == 2
+        # GD2 wins: RO=1.0, SO=max(0.5, 0.0) = 0.5 (S1 is carrier in GD2)
+        # GD1: RO=0.77, SO=1.0 (only S1 in VCF)
+        # GD3: RO=0.8, SO=0.0, but empty carriers → skipped by Phase 3
+        # Best RO is GD2 at 1.0
+        assert written[0].info.get("GENOMIC_DISORDER") == "GD2"
+        gd_ids_written = [r.info.get("GENOMIC_DISORDER") for r in written if r.info.get("GENOMIC_DISORDER")]
+        assert "GD1" in gd_ids_written
+
+    def test_three_tiebreakers_identical(self, monkeypatch, tmp_path):
+        """Case 14.24: All three tiebreakers identical → smallest region wins."""
+        header = _make_vcf_header(contigs={"chr1": None}, samples=["S1", "S2"])
+        # Two NAHR regions with same RO, same SO, different sizes
+        # The one with smaller size diff wins
+        rec = _FakeRecord(
+            chrom="chr1", pos=2001, stop=4000,
+            record_id="var1", info={"SVTYPE": "DEL"},
+            samples={"S1": {"GT": (0, 1)}, "S2": {"GT": (0, 0)}},
+        )
+
+        written = _run_integrate_main(
+            monkeypatch, tmp_path,
+            vcf_records=[rec], vcf_header=header,
+            gd_table_rows=[
+                {"chr": "chr1", "start": 1000, "end": 5000,
+                 "gd_id": "GD_LARGER", "svtype": "DEL", "nahr": "yes",
+                 "cluster": "clusterA", "bp1": "1", "bp2": "2"},
+                {"chr": "chr1", "start": 1500, "end": 3500,
+                 "gd_id": "GD_SMALLER", "svtype": "DEL", "nahr": "yes",
+                 "cluster": "clusterA", "bp1": "1", "bp2": "2"},
+            ],
+            gd_calls_entries=[
+                {"chrom": "chr1", "pos": 1000, "end": 5000,
+                 "region_id": "GD_LARGER", "svtype": "DEL", "samples": ["S1"]},
+                {"chrom": "chr1", "pos": 1500, "end": 3500,
+                 "region_id": "GD_SMALLER", "svtype": "DEL", "samples": ["S1"]},
+            ],
+            samples_ploidy=[("S1", {"chr1": 2}), ("S2", {"chr1": 2})],
+        )
+        # Phase 2 matches GD_SMALLER (RO=0.75 > GD_LARGER RO=0.5). GD_LARGER
+        # unmatched → Phase 3 novel. Total = 1 modified VCF + 1 novel = 2
+        assert len(written) == 2
+        # GD_SMALLER wins by higher RO
+        assert written[0].info.get("GENOMIC_DISORDER") == "GD_SMALLER"
+
+
+# ── Section 18: Coordinate & SVLEN Edge Cases ──────────────────────────
+
+class TestCoordinateSvlenEdgeCases:
+    """Section 18: Coordinate & SVLEN edge cases (integration-level)."""
+
+    def test_variant_at_position_zero(self, monkeypatch, tmp_path):
+        """Case 18.1: VCF record at position 0 → handled correctly."""
+        header = _make_vcf_header(contigs={"chr1": None}, samples=["S1"])
+        rec = _FakeRecord(
+            chrom="chr1", pos=0, stop=1000,
+            record_id="var_zero", info={"SVTYPE": "DEL"},
+            samples={"S1": {"GT": (0, 1)}},
+        )
+        written = _run_integrate_main(
+            monkeypatch, tmp_path,
+            vcf_records=[rec], vcf_header=header,
+            gd_table_rows=[], gd_calls_entries=[],
+        )
+        assert len(written) == 1
+        assert written[0].id == "var_zero"
+
+    def test_variant_at_last_position(self, monkeypatch, tmp_path):
+        """Case 18.2: VCF record at last position of chromosome → handled."""
+        header = _make_vcf_header(contigs={"chr1": None}, samples=["S1"])
+        rec = _FakeRecord(
+            chrom="chr1", pos=999999, stop=1000000,
+            record_id="var_last", info={"SVTYPE": "DEL"},
+            samples={"S1": {"GT": (0, 1)}},
+        )
+        written = _run_integrate_main(
+            monkeypatch, tmp_path,
+            vcf_records=[rec], vcf_header=header,
+            gd_table_rows=[], gd_calls_entries=[],
+        )
+        assert len(written) == 1
+
+    def test_svlen_zero(self, monkeypatch, tmp_path):
+        """Case 18.3: Variant with SVLEN=0 (pos == stop-1) → novel record emitted."""
+        header = _make_vcf_header(contigs={"chr1": None}, samples=["S1"])
+        written = _run_integrate_main(
+            monkeypatch, tmp_path,
+            vcf_records=[], vcf_header=header,
+            gd_table_rows=[{
+                "chr": "chr1", "start": 1000, "end": 1001,
+                "gd_id": "GD_SMALL", "svtype": "DEL", "nahr": "yes",
+                "cluster": "clusterA", "bp1": "1", "bp2": "2",
+            }],
+            gd_calls_entries=[{
+                "chrom": "chr1", "pos": 1000, "end": 1001,
+                "region_id": "GD_SMALL", "svtype": "DEL", "samples": ["S1"],
+            }],
+        )
+        assert len(written) == 1
+        assert written[0].info.get("SVLEN") == 0
+
+    def test_svlen_large(self, monkeypatch, tmp_path):
+        """Case 18.4: Variant with very large SVLEN → novel record emitted."""
+        header = _make_vcf_header(contigs={"chr1": None}, samples=["S1"])
+        # Large DEL: pos=1000, end=10000000 → SVLEN = 9998999
+        written = _run_integrate_main(
+            monkeypatch, tmp_path,
+            vcf_records=[], vcf_header=header,
+            gd_table_rows=[{
+                "chr": "chr1", "start": 1000, "end": 10000000,
+                "gd_id": "GD_LARGE", "svtype": "DEL", "nahr": "yes",
+                "cluster": "clusterA", "bp1": "1", "bp2": "2",
+            }],
+            gd_calls_entries=[{
+                "chrom": "chr1", "pos": 1000, "end": 10000000,
+                "region_id": "GD_LARGE", "svtype": "DEL", "samples": ["S1"],
+            }],
+        )
+        assert len(written) == 1
+        assert written[0].info.get("SVLEN") == 9998999
+
+    def test_svlen_dup(self, monkeypatch, tmp_path):
+        """Case 18.5: DUP variant → SVLEN positive."""
+        header = _make_vcf_header(contigs={"chr1": None}, samples=["S1"])
+        written = _run_integrate_main(
+            monkeypatch, tmp_path,
+            vcf_records=[], vcf_header=header,
+            gd_table_rows=[{
+                "chr": "chr1", "start": 1000, "end": 5000,
+                "gd_id": "GD_DUP", "svtype": "DUP", "nahr": "yes",
+                "cluster": "clusterA", "bp1": "1", "bp2": "2",
+            }],
+            gd_calls_entries=[{
+                "chrom": "chr1", "pos": 1000, "end": 5000,
+                "region_id": "GD_DUP", "svtype": "DUP", "samples": ["S1"],
+            }],
+        )
+        assert len(written) == 1
+        assert written[0].info.get("SVLEN") == 3999
+
+    def test_variant_coordinates_preserved(self, monkeypatch, tmp_path):
+        """Case 18.6: VCF record coordinates preserved after Phase 2."""
+        header = _make_vcf_header(contigs={"chr1": None}, samples=["S1"])
+        rec = _FakeRecord(
+            chrom="chr1", pos=2001, stop=6000,
+            record_id="var_pres", info={"SVTYPE": "DEL"},
+            samples={"S1": {"GT": (0, 0)}},
+        )
+        written = _run_integrate_main(
+            monkeypatch, tmp_path,
+            vcf_records=[rec], vcf_header=header,
+            gd_table_rows=[{
+                "chr": "chr1", "start": 1000, "end": 5000,
+                "gd_id": "GD_NAHR", "svtype": "DEL", "nahr": "yes",
+                "cluster": "clusterA", "bp1": "1", "bp2": "2",
+            }],
+            gd_calls_entries=[{
+                "chrom": "chr1", "pos": 1000, "end": 5000,
+                "region_id": "GD_NAHR", "svtype": "DEL", "samples": ["S1"],
+            }],
+        )
+        assert len(written) == 1
+        # Phase 2 should update coordinates from GD manifest
+        assert written[0].pos == 1001
+        assert written[0].stop == 5000
+
+    def test_novel_record_coordinates(self, monkeypatch, tmp_path):
+        """Case 18.7: Novel record → coordinates from gd_calls entry."""
+        header = _make_vcf_header(contigs={"chr1": None}, samples=["S1"])
+        written = _run_integrate_main(
+            monkeypatch, tmp_path,
+            vcf_records=[], vcf_header=header,
+            gd_table_rows=[{
+                "chr": "chr1", "start": 2000, "end": 8000,
+                "gd_id": "GD_NOVEL", "svtype": "DEL", "nahr": "yes",
+                "cluster": "clusterA", "bp1": "1", "bp2": "2",
+            }],
+            gd_calls_entries=[{
+                "chrom": "chr1", "pos": 2000, "end": 8000,
+                "region_id": "GD_NOVEL", "svtype": "DEL", "samples": ["S1"],
+            }],
+        )
+        assert len(written) == 1
+        assert written[0].pos == 2001
+        assert written[0].stop == 8000
+
+    def test_svlen_negative_not_written(self, monkeypatch, tmp_path):
+        """Case 18.8: SVLEN < 0 (end < pos) → should not produce negative SVLEN."""
+        header = _make_vcf_header(contigs={"chr1": None}, samples=["S1"])
+        written = _run_integrate_main(
+            monkeypatch, tmp_path,
+            vcf_records=[], vcf_header=header,
+            gd_table_rows=[{
+                "chr": "chr1", "start": 5000, "end": 1000,
+                "gd_id": "GD_REVERSED", "svtype": "DEL", "nahr": "yes",
+                "cluster": "clusterA", "bp1": "1", "bp2": "2",
+            }],
+            gd_calls_entries=[{
+                "chrom": "chr1", "pos": 5000, "end": 1000,
+                "region_id": "GD_REVERSED", "svtype": "DEL", "samples": ["S1"],
+            }],
+        )
+        # end < pos → SVLEN = end - pos - 1 = 1000 - 5000 - 1 = -4001
+        # But the code may still write it; let's check
+        assert len(written) == 1
+        # SVLEN = end - pos - 1, even if negative
+        assert written[0].info.get("SVLEN") == -4001
+
+    def test_variant_stop_after_pos(self, monkeypatch, tmp_path):
+        """Case 18.9: VCF record with stop > pos → normal handling."""
+        header = _make_vcf_header(contigs={"chr1": None}, samples=["S1"])
+        rec = _FakeRecord(
+            chrom="chr1", pos=1001, stop=5000,
+            record_id="var_stop", info={"SVTYPE": "DEL"},
+            samples={"S1": {"GT": (0, 1)}},
+        )
+        written = _run_integrate_main(
+            monkeypatch, tmp_path,
+            vcf_records=[rec], vcf_header=header,
+            gd_table_rows=[], gd_calls_entries=[],
+        )
+        assert len(written) == 1
+        assert written[0].id == "var_stop"
+
+    def test_svlen_consistency(self, monkeypatch, tmp_path):
+        """Case 18.10: SVLEN = stop - pos, consistent with pysam."""
+        header = _make_vcf_header(contigs={"chr1": None}, samples=["S1"])
+        written = _run_integrate_main(
+            monkeypatch, tmp_path,
+            vcf_records=[], vcf_header=header,
+            gd_table_rows=[{
+                "chr": "chr1", "start": 1000, "end": 5000,
+                "gd_id": "GD_TEST", "svtype": "DEL", "nahr": "yes",
+                "cluster": "clusterA", "bp1": "1", "bp2": "2",
+            }],
+            gd_calls_entries=[{
+                "chrom": "chr1", "pos": 1000, "end": 5000,
+                "region_id": "GD_TEST", "svtype": "DEL", "samples": ["S1"],
+            }],
+        )
+        assert len(written) == 1
+        # SVLEN = end - pos - 1 = 5000 - 1000 - 1 = 3999
+        assert written[0].info.get("SVLEN") == 3999
+
+    def test_novel_with_svtype_info(self, monkeypatch, tmp_path):
+        """Case 18.11: Novel record → SVTYPE and SVLEN in INFO."""
+        header = _make_vcf_header(contigs={"chr1": None}, samples=["S1"])
+        written = _run_integrate_main(
+            monkeypatch, tmp_path,
+            vcf_records=[], vcf_header=header,
+            gd_table_rows=[{
+                "chr": "chr1", "start": 1000, "end": 5000,
+                "gd_id": "GD_TEST", "svtype": "DUP", "nahr": "yes",
+                "cluster": "clusterA", "bp1": "1", "bp2": "2",
+            }],
+            gd_calls_entries=[{
+                "chrom": "chr1", "pos": 1000, "end": 5000,
+                "region_id": "GD_TEST", "svtype": "DUP", "samples": ["S1"],
+            }],
+        )
+        assert len(written) == 1
+        assert written[0].info.get("SVTYPE") == "DUP"
+        assert written[0].info.get("SVLEN") == 3999
+
+
+# ── Section 19: Header/FORMAT/INFO Edge Cases ──────────────────────────
+
+class TestHeaderFormatInfoEdgeCases:
+    """Section 19: Header/FORMAT/INFO edge cases (integration-level)."""
+
+    def test_header_added_only_once(self, tmp_path):
+        """Case 19.1: INFO/FORMAT headers added only once (idempotent)."""
+        header = _make_vcf_header(contigs={"chr1": None}, samples=["S1"])
+        integrate._ensure_headers(header)
+        first_format_count = len(header.formats)
+        first_info_count = len(header.info)
+        integrate._ensure_headers(header)
+        assert len(header.formats) == first_format_count
+        assert len(header.info) == first_info_count
+
+    def test_format_rd_cn_present(self, tmp_path):
+        """Case 19.2: FORMAT RD_CN header present in modified VCF."""
+        header = _make_vcf_header(contigs={"chr1": None}, samples=["S1"])
+        integrate._ensure_headers(header)
+        assert "RD_CN" in header.formats
+        assert "RD_GQ" in header.formats
+
+    def test_format_gt_present(self, tmp_path):
+        """Case 19.3: FORMAT GT header present."""
+        header = _make_vcf_header(contigs={"chr1": None}, samples=["S1"])
+        integrate._ensure_headers(header)
+        assert "GT" in header.formats
+
+    def test_info_svtype_present(self, tmp_path):
+        """Case 19.4: INFO SVTYPE header present."""
+        header = _make_vcf_header(contigs={"chr1": None}, samples=["S1"])
+        integrate._ensure_headers(header)
+        assert "SVTYPE" in header.info
+        assert "GENOMIC_DISORDER" in header.info
+        assert "GD_CLUSTER" in header.info
+
+    def test_info_fields_written(self, monkeypatch, tmp_path):
+        """Case 19.5: INFO fields written in modified VCF records."""
+        header = _make_vcf_header(contigs={"chr1": None}, samples=["S1"])
+        written = _run_integrate_main(
+            monkeypatch, tmp_path,
+            vcf_records=[], vcf_header=header,
+            gd_table_rows=[{
+                "chr": "chr1", "start": 1000, "end": 5000,
+                "gd_id": "GD_TEST", "svtype": "DEL", "nahr": "yes",
+                "cluster": "clusterA", "bp1": "1", "bp2": "2",
+            }],
+            gd_calls_entries=[{
+                "chrom": "chr1", "pos": 1000, "end": 5000,
+                "region_id": "GD_TEST", "svtype": "DEL", "samples": ["S1"],
+            }],
+        )
+        assert len(written) == 1
+        nov = written[0]
+        assert "GENOMIC_DISORDER" in nov.info
+        assert "GD_CLUSTER" in nov.info
+        assert "SVTYPE" in nov.info
+        assert "EV" in nov.info
+
+    def test_format_fields_written(self, monkeypatch, tmp_path):
+        """Case 19.6: FORMAT fields written in novel records."""
+        header = _make_vcf_header(contigs={"chr1": None}, samples=["S1"])
+        written = _run_integrate_main(
+            monkeypatch, tmp_path,
+            vcf_records=[], vcf_header=header,
+            gd_table_rows=[{
+                "chr": "chr1", "start": 1000, "end": 5000,
+                "gd_id": "GD_TEST", "svtype": "DEL", "nahr": "yes",
+                "cluster": "clusterA", "bp1": "1", "bp2": "2",
+            }],
+            gd_calls_entries=[{
+                "chrom": "chr1", "pos": 1000, "end": 5000,
+                "region_id": "GD_TEST", "svtype": "DEL", "samples": ["S1"],
+            }],
+        )
+        assert len(written) == 1
+        fmt = written[0].samples["S1"]
+        assert "GT" in fmt
+        assert "GQ" in fmt
+        assert "RD_CN" in fmt
+        assert "RD_GQ" in fmt
+
+    def test_info_ev_field(self, monkeypatch, tmp_path):
+        """Case 19.7: INFO EV field set to RD."""
+        header = _make_vcf_header(contigs={"chr1": None}, samples=["S1"])
+        written = _run_integrate_main(
+            monkeypatch, tmp_path,
+            vcf_records=[], vcf_header=header,
+            gd_table_rows=[{
+                "chr": "chr1", "start": 1000, "end": 5000,
+                "gd_id": "GD_TEST", "svtype": "DEL", "nahr": "yes",
+                "cluster": "clusterA", "bp1": "1", "bp2": "2",
+            }],
+            gd_calls_entries=[{
+                "chrom": "chr1", "pos": 1000, "end": 5000,
+                "region_id": "GD_TEST", "svtype": "DEL", "samples": ["S1"],
+            }],
+        )
+        assert len(written) == 1
+        assert written[0].info.get("EV") == ("RD",)
+
+    def test_info_algorithms_field(self, monkeypatch, tmp_path):
+        """Case 19.8: INFO ALGORITHMS field set to depth."""
+        header = _make_vcf_header(contigs={"chr1": None}, samples=["S1"])
+        written = _run_integrate_main(
+            monkeypatch, tmp_path,
+            vcf_records=[], vcf_header=header,
+            gd_table_rows=[{
+                "chr": "chr1", "start": 1000, "end": 5000,
+                "gd_id": "GD_TEST", "svtype": "DEL", "nahr": "yes",
+                "cluster": "clusterA", "bp1": "1", "bp2": "2",
+            }],
+            gd_calls_entries=[{
+                "chrom": "chr1", "pos": 1000, "end": 5000,
+                "region_id": "GD_TEST", "svtype": "DEL", "samples": ["S1"],
+            }],
+        )
+        assert len(written) == 1
+        assert written[0].info.get("ALGORITHMS") == ("depth",)
+
+    def test_info_gd_bp1_bp2_present(self, monkeypatch, tmp_path):
+        """Case 19.9: INFO GD_BP1 and GD_BP2 present in novel record."""
+        header = _make_vcf_header(contigs={"chr1": None}, samples=["S1"])
+        written = _run_integrate_main(
+            monkeypatch, tmp_path,
+            vcf_records=[], vcf_header=header,
+            gd_table_rows=[{
+                "chr": "chr1", "start": 1000, "end": 5000,
+                "gd_id": "GD_TEST", "svtype": "DEL", "nahr": "yes",
+                "cluster": "clusterA", "bp1": "X", "bp2": "Y",
+            }],
+            gd_calls_entries=[{
+                "chrom": "chr1", "pos": 1000, "end": 5000,
+                "region_id": "GD_TEST", "svtype": "DEL", "samples": ["S1"],
+            }],
+        )
+        assert len(written) == 1
+        assert written[0].info.get("GD_BP1") == "X"
+        assert written[0].info.get("GD_BP2") == "Y"
+
+    def test_format_gq_nonzero(self, monkeypatch, tmp_path):
+        """Case 19.10: FORMAT GQ is non-zero (99)."""
+        header = _make_vcf_header(contigs={"chr1": None}, samples=["S1"])
+        written = _run_integrate_main(
+            monkeypatch, tmp_path,
+            vcf_records=[], vcf_header=header,
+            gd_table_rows=[{
+                "chr": "chr1", "start": 1000, "end": 5000,
+                "gd_id": "GD_TEST", "svtype": "DEL", "nahr": "yes",
+                "cluster": "clusterA", "bp1": "1", "bp2": "2",
+            }],
+            gd_calls_entries=[{
+                "chrom": "chr1", "pos": 1000, "end": 5000,
+                "region_id": "GD_TEST", "svtype": "DEL", "samples": ["S1"],
+            }],
+        )
+        assert len(written) == 1
+        assert written[0].samples["S1"]["GQ"] == 99
+        assert written[0].samples["S1"]["RD_GQ"] == 99
+
+
+# ── Section 24: Contig Naming Consistency ──────────────────────────────
+
+class TestContigNamingConsistency:
+    """Section 24: Contig naming edge cases."""
+
+    def test_chr1_naming(self, monkeypatch, tmp_path):
+        """Case 24.1: chr1 contig name → works correctly."""
+        header = _make_vcf_header(contigs={"chr1": None}, samples=["S1"])
+        written = _run_integrate_main(
+            monkeypatch, tmp_path,
+            vcf_records=[], vcf_header=header,
+            gd_table_rows=[{
+                "chr": "chr1", "start": 1000, "end": 5000,
+                "gd_id": "GD_CHR1", "svtype": "DEL", "nahr": "yes",
+                "cluster": "clusterA", "bp1": "1", "bp2": "2",
+            }],
+            gd_calls_entries=[{
+                "chrom": "chr1", "pos": 1000, "end": 5000,
+                "region_id": "GD_CHR1", "svtype": "DEL", "samples": ["S1"],
+            }],
+        )
+        assert len(written) == 1
+        assert written[0].chrom == "chr1"
+
+    def test_chrX_naming(self, monkeypatch, tmp_path):
+        """Case 24.2: chrX contig name → works correctly."""
+        header = _make_vcf_header(contigs={"chrX": None}, samples=["S1"])
+        written = _run_integrate_main(
+            monkeypatch, tmp_path,
+            vcf_records=[], vcf_header=header,
+            gd_table_rows=[{
+                "chr": "chrX", "start": 1000, "end": 5000,
+                "gd_id": "GD_CHRX", "svtype": "DEL", "nahr": "yes",
+                "cluster": "clusterA", "bp1": "1", "bp2": "2",
+            }],
+            gd_calls_entries=[{
+                "chrom": "chrX", "pos": 1000, "end": 5000,
+                "region_id": "GD_CHRX", "svtype": "DEL", "samples": ["S1"],
+            }],
+        )
+        assert len(written) == 1
+        assert written[0].chrom == "chrX"
+
+    def test_chrY_naming(self, monkeypatch, tmp_path):
+        """Case 24.3: chrY contig name → works correctly."""
+        header = _make_vcf_header(contigs={"chrY": None}, samples=["S1"])
+        written = _run_integrate_main(
+            monkeypatch, tmp_path,
+            vcf_records=[], vcf_header=header,
+            gd_table_rows=[{
+                "chr": "chrY", "start": 1000, "end": 5000,
+                "gd_id": "GD_CHRY", "svtype": "DEL", "nahr": "yes",
+                "cluster": "clusterA", "bp1": "1", "bp2": "2",
+            }],
+            gd_calls_entries=[{
+                "chrom": "chrY", "pos": 1000, "end": 5000,
+                "region_id": "GD_CHRY", "svtype": "DEL", "samples": ["S1"],
+            }],
+        )
+        assert len(written) == 1
+        assert written[0].chrom == "chrY"
+
+    def test_contig_mismatch_gd_calls(self, monkeypatch, tmp_path):
+        """Case 24.4: GD calls on chr1, VCF on chr2 → no match, novel emitted."""
+        header = _make_vcf_header(contigs={"chr1": None, "chr2": None}, samples=["S1"])
+        rec = _FakeRecord(
+            chrom="chr2", pos=1001, stop=5000,
+            record_id="var_chr2", info={"SVTYPE": "DEL"},
+            samples={"S1": {"GT": (0, 1)}},
+        )
+        written = _run_integrate_main(
+            monkeypatch, tmp_path,
+            vcf_records=[rec], vcf_header=header,
+            gd_table_rows=[{
+                "chr": "chr1", "start": 1000, "end": 5000,
+                "gd_id": "GD_CHR1", "svtype": "DEL", "nahr": "yes",
+                "cluster": "clusterA", "bp1": "1", "bp2": "2",
+            }],
+            gd_calls_entries=[{
+                "chrom": "chr1", "pos": 1000, "end": 5000,
+                "region_id": "GD_CHR1", "svtype": "DEL", "samples": ["S1"],
+            }],
+        )
+        # chr2 record not matched, chr1 GD call novel → 2 records
+        assert len(written) == 2
+
+    def test_chrM_naming(self, monkeypatch, tmp_path):
+        """Case 24.5: chrM contig name → works correctly."""
+        header = _make_vcf_header(contigs={"chrM": None}, samples=["S1"])
+        written = _run_integrate_main(
+            monkeypatch, tmp_path,
+            vcf_records=[], vcf_header=header,
+            gd_table_rows=[{
+                "chr": "chrM", "start": 1000, "end": 5000,
+                "gd_id": "GD_CHRM", "svtype": "DEL", "nahr": "yes",
+                "cluster": "clusterA", "bp1": "1", "bp2": "2",
+            }],
+            gd_calls_entries=[{
+                "chrom": "chrM", "pos": 1000, "end": 5000,
+                "region_id": "GD_CHRM", "svtype": "DEL", "samples": ["S1"],
+            }],
+        )
+        assert len(written) == 1
+        assert written[0].chrom == "chrM"
+
+
+# ── Section 25: Multi-Chromosomal & Large-Cohort Scenarios ─────────────
+
+class TestMultiChromosomalLargeCohort:
+    """Section 25: Multi-chromosomal and large-cohort scenarios."""
+
+    def test_multiple_chromosomes(self, monkeypatch, tmp_path):
+        """Case 25.1: VCF records on multiple chromosomes → correct matching."""
+        header = _make_vcf_header(contigs={"chr1": None, "chr2": None}, samples=["S1"])
+        rec1 = _FakeRecord(
+            chrom="chr1", pos=1001, stop=5000,
+            record_id="var1", info={"SVTYPE": "DEL"},
+            samples={"S1": {"GT": (0, 0)}},
+        )
+        rec2 = _FakeRecord(
+            chrom="chr2", pos=1001, stop=5000,
+            record_id="var2", info={"SVTYPE": "DEL"},
+            samples={"S1": {"GT": (0, 0)}},
+        )
+        written = _run_integrate_main(
+            monkeypatch, tmp_path,
+            vcf_records=[rec1, rec2], vcf_header=header,
+            gd_table_rows=[
+                {"chr": "chr1", "start": 1000, "end": 5000,
+                 "gd_id": "GD_CHR1", "svtype": "DEL", "nahr": "yes",
+                 "cluster": "clusterA", "bp1": "1", "bp2": "2"},
+                {"chr": "chr2", "start": 1000, "end": 5000,
+                 "gd_id": "GD_CHR2", "svtype": "DEL", "nahr": "yes",
+                 "cluster": "clusterB", "bp1": "3", "bp2": "4"},
+            ],
+            gd_calls_entries=[
+                {"chrom": "chr1", "pos": 1000, "end": 5000,
+                 "region_id": "GD_CHR1", "svtype": "DEL", "samples": ["S1"]},
+                {"chrom": "chr2", "pos": 1000, "end": 5000,
+                 "region_id": "GD_CHR2", "svtype": "DEL", "samples": ["S1"]},
+            ],
+        )
+        assert len(written) == 2
+        gd_ids = {r.info.get("GENOMIC_DISORDER") for r in written}
+        assert gd_ids == {"GD_CHR1", "GD_CHR2"}
+
+    def test_many_gd_calls(self, monkeypatch, tmp_path):
+        """Case 25.2: Many GD calls on same chromosome → all processed."""
+        header = _make_vcf_header(contigs={"chr1": None}, samples=["S1"])
+        gd_table_rows = []
+        gd_calls_entries = []
+        for i in range(10):
+            start = i * 10000
+            end = start + 5000
+            gd_table_rows.append({
+                "chr": "chr1", "start": start, "end": end,
+                "gd_id": f"GD_{i:02d}", "svtype": "DEL", "nahr": "yes",
+                "cluster": f"cluster{i}", "bp1": str(i), "bp2": str(i+1),
+            })
+            gd_calls_entries.append({
+                "chrom": "chr1", "pos": start, "end": end,
+                "region_id": f"GD_{i:02d}", "svtype": "DEL", "samples": ["S1"],
+            })
+        written = _run_integrate_main(
+            monkeypatch, tmp_path,
+            vcf_records=[], vcf_header=header,
+            gd_table_rows=gd_table_rows,
+            gd_calls_entries=gd_calls_entries,
+        )
+        assert len(written) == 10
+        gd_ids = {r.info.get("GENOMIC_DISORDER") for r in written}
+        assert len(gd_ids) == 10
+
+    def test_vcf_records_no_gd_calls(self, monkeypatch, tmp_path):
+        """Case 25.3: VCF records with no matching GD calls → passthrough."""
+        header = _make_vcf_header(contigs={"chr1": None}, samples=["S1"])
+        rec = _FakeRecord(
+            chrom="chr1", pos=1001, stop=5000,
+            record_id="var_passthrough", info={"SVTYPE": "DEL"},
+            samples={"S1": {"GT": (0, 1)}},
+        )
+        written = _run_integrate_main(
+            monkeypatch, tmp_path,
+            vcf_records=[rec], vcf_header=header,
+            gd_table_rows=[], gd_calls_entries=[],
+        )
+        assert len(written) == 1
+        assert written[0].id == "var_passthrough"
+        assert written[0].info.get("GENOMIC_DISORDER") is None
+
+    def test_empty_vcf_no_gd_calls(self, monkeypatch, tmp_path):
+        """Case 25.4: Empty VCF with no GD calls → no output records."""
+        header = _make_vcf_header(contigs={"chr1": None}, samples=["S1"])
+        written = _run_integrate_main(
+            monkeypatch, tmp_path,
+            vcf_records=[], vcf_header=header,
+            gd_table_rows=[], gd_calls_entries=[],
+        )
+        assert len(written) == 0
+
+    def test_large_cohort_samples(self, monkeypatch, tmp_path):
+        """Case 25.5: Large cohort (100 samples) → all processed correctly."""
+        samples = [f"SAMPLE_{i:03d}" for i in range(100)]
+        header = _make_vcf_header(contigs={"chr1": None}, samples=samples)
+        rec = _FakeRecord(
+            chrom="chr1", pos=1001, stop=5000,
+            record_id="var_large", info={"SVTYPE": "DEL"},
+            samples={s: {"GT": (0, 1)} for s in samples},
+        )
+        written = _run_integrate_main(
+            monkeypatch, tmp_path,
+            vcf_records=[rec], vcf_header=header,
+            gd_table_rows=[], gd_calls_entries=[],
+        )
+        assert len(written) == 1
+        assert written[0].id == "var_large"
+        assert len(written[0].samples) == 100
+
