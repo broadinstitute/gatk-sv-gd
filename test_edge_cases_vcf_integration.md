@@ -285,21 +285,21 @@
 
 | # | Case | Covered |
 |---|------|---------|
-| 13.1 | Variant overlaps non-NAHR ≥ threshold → annotated | ❌ |
-| 13.2 | Variant overlaps non-NAHR < threshold → not annotated | ❌ |
-| 13.3 | Zero-length variant → no crash | ❌ |
-| 13.4 | DUP variant does NOT match DEL non-NAHR | ❌ |
-| 13.5 | Multiple non-NAHR overlaps (first wins) | ❌ |
-| 13.6 | Non-NAHR completely contained in variant | ❌ |
-| 13.7 | Variant completely contained in non-NAHR | ❌ |
-| 13.8 | Partial overlap from left side only | ❌ |
-| 13.9 | Partial overlap from right side only | ❌ |
-| 13.10 | Fraction exactly at threshold (e.g., 0.5 ≥ 0.5) | ❌ |
-| 13.11 | 100% overlap (variant == non-NAHR coords) | ❌ |
-| 13.12 | Non-NAHR on different chromosome | ❌ |
-| 13.13 | Svtype-aware: DUP non-NAHR matches DUP variant | ❌ |
-| 13.14 | Multiple non-NAHR at different coords | ❌ |
-| 13.15 | Custom `--non-nahr-overlap` value | ❌ |
+| 13.1 | Variant overlaps non-NAHR ≥ threshold → annotated | ✅ |
+| 13.2 | Variant overlaps non-NAHR < threshold → not annotated | ✅ |
+| 13.3 | Zero-length variant → no crash | ✅ |
+| 13.4 | DUP variant does NOT match DEL non-NAHR | ✅ |
+| 13.5 | Multiple non-NAHR overlaps (first wins) | ✅ |
+| 13.6 | Non-NAHR completely contained in variant | ✅ |
+| 13.7 | Variant completely contained in non-NAHR | ✅ |
+| 13.8 | Partial overlap from left side only | ✅ |
+| 13.9 | Partial overlap from right side only | ✅ |
+| 13.10 | Fraction exactly at threshold (e.g., 0.5 ≥ 0.5) | ✅ |
+| 13.11 | 100% overlap (variant == non-NAHR coords) | ✅ |
+| 13.12 | Non-NAHR on different chromosome | ✅ |
+| 13.13 | Svtype-aware: DUP non-NAHR matches DUP variant | ✅ |
+| 13.14 | Multiple non-NAHR at different coords | ✅ |
+| 13.15 | Custom `--non-nahr-overlap` value | ✅ |
 
 ---
 
@@ -541,7 +541,7 @@
 | Category | Total Cases | ✅ Covered | ❌ Not Covered | ⚠️ Partial |
 |----------|:-----------:|:----------:|:--------------:|:----------:|
 | Input Validation & CLI | 15 | 9 | 6 | 0 |
-| GD Table Loading | 13 | 9 | 4 | 0 |
+| GD Table Loading | 13 | 12 | 1 | 0 |
 | GDTable Class Internals | 10 | 9 | 1 | 0 |
 | GD Calls Reading | 26 | 14 | 12 | 0 |
 | Ploidy Table Reading | 10 | 6 | 4 | 0 |
@@ -552,7 +552,7 @@
 | Sample Overlap Scoring | 12 | 12 | 0 | 0 |
 | Genotype Update | 13 | 13 | 0 | 0 |
 | Header Management | 6 | 4 | 2 | 0 |
-| Phase 1: Non-NAHR | 15 | 0 | 15 | 0 |
+| Phase 1: Non-NAHR | 15 | 15 | 0 | 0 |
 | Phase 2: NAHR Matching | 28 | 28 | 0 | 0 |
 | Phase 3: Novel Records | 16 | 10 | 6 | 0 |
 | Phase Interactions | 7 | 6 | 1 | 0 |
@@ -565,9 +565,9 @@
 | pysam-Specific Behavior | 7 | 7 | 0 | 0 |
 | Contig Naming | 5 | 5 | 0 | 0 |
 | Multi-Chromosomal | 10 | 5 | 5 | 0 |
-| **TOTAL** | **291** | **198** | **93** | **0** |
+| **TOTAL** | **291** | **215** | **76** | **0** |
 
-Coverage: ~68% of identified edge cases have tests. 
+Coverage: ~74% of identified edge cases have tests. 
 
 Each step is a single test. All should complete in ≤ 10s and use only in-memory mocks (no real bcftools/pysam I/O).
 
