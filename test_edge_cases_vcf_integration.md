@@ -57,7 +57,7 @@
 | 1.9 | bcftools sort returns non-zero exit | ❌ |
 | 1.10 | Custom `--temp-dir` that doesn't exist (should be created) | ✅ |
 | 1.11 | `--temp-dir` with insufficient permissions | ❌ |
-| 1.12 | Output directory doesn't exist (no `os.makedirs` for output dir) | ❌ |
+| 1.12 | Output directory doesn't exist (no `os.makedirs` for output dir) | ✅ |
 | 1.13 | Output file path with nested directories | ✅ |
 | 1.14 | All args provided via `--help` (exit 0) | ✅ |
 | 1.15 | `--temp-dir` created via `os.makedirs(exist_ok=True)` | ✅ |
@@ -145,12 +145,12 @@
 
 | # | Case | Covered |
 |---|------|---------|
-| 5.1 | Standard wide format, multiple samples | ❌ |
-| 5.2 | Comment lines skipped | ❌ |
+| 5.1 | Standard wide format, multiple samples | ✅ |
+| 5.2 | Comment lines skipped | ✅ |
 | 5.3 | Multiple chromosomes per sample | ✅ |
 | 5.4 | Empty ploidy table | ✅ |
-| 5.5 | Sample not in ploidy table → default 2 | ❌ |
-| 5.6 | Chrom not in sample's ploidy row → default 2 | ❌ |
+| 5.5 | Sample not in ploidy table → default 2 | ✅ |
+| 5.6 | Chrom not in sample's ploidy row → default 2 | ✅ |
 | 5.7 | Malformed row (too few columns) | ✅ |
 | 5.8 | Extra whitespace / tabs | ✅ |
 | 5.9 | Non-integer ploidy value → `ValueError` from `int()` | ✅ |
@@ -540,11 +540,11 @@
 
 | Category | Total Cases | ✅ Covered | ❌ Not Covered | ⚠️ Partial |
 |----------|:-----------:|:----------:|:--------------:|:----------:|
-| Input Validation & CLI | 15 | 10 | 5 | 0 |
+| Input Validation & CLI | 15 | 11 | 4 | 0 |
 | GD Table Loading | 13 | 13 | 0 | 0 |
 | GDTable Class Internals | 10 | 10 | 0 | 0 |
 | GD Calls Reading | 26 | 15 | 11 | 0 |
-| Ploidy Table Reading | 10 | 7 | 3 | 0 |
+| Ploidy Table Reading | 10 | 10 | 0 | 0 |
 | PAR BED Reading | 8 | 5 | 3 | 0 |
 | PAR Region Detection | 10 | 6 | 4 | 0 |
 | Expected Copy Number | 8 | 4 | 4 | 0 |
@@ -565,9 +565,9 @@
 | pysam-Specific Behavior | 7 | 7 | 0 | 0 |
 | Contig Naming | 5 | 5 | 0 | 0 |
 | Multi-Chromosomal | 10 | 5 | 5 | 0 |
-| **TOTAL** | **291** | **249** | **42** | **0** |
+| **TOTAL** | **291** | **259** | **32** | **0** |
 
-Coverage: ~86% of identified edge cases have tests. 
+Coverage: ~89% of identified edge cases have tests. 
 
 Each step is a single test. All should complete in ≤ 10s and use only in-memory mocks (no real bcftools/pysam I/O).
 
