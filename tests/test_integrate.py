@@ -6425,3 +6425,297 @@ class TestGdTableMissingChrColumn:
         with pytest.raises(ValueError, match="Missing required columns"):
             integrate._build_trees_from_gd_table(str(p))
 
+
+class TestPhase3NovelRecordsRemaining:
+    """Phase 3: Novel record emission edge cases (15.1, 15.2, 15.3, 15.4, 15.10, 15.16)."""
+
+    def test_novel_record_coordinates_from_gd_calls(self, monkeypatch, tmp_path):
+        """Case 15.1: Novel record gets coordinates from gd_calls entry."""
+        header = _make_vcf_header(contigs={"chr1": None}, samples=["S1"])
+        written = _run_integrate_main(
+            monkeypatch, tmp_path,
+            vcf_records=[], vcf_header=header,
+            gd_table_rows=[{
+                "chr": "chr1", "start": 1000, "end": 5000,
+                "gd_id": "GD_NAHR1", "svtype": "DEL",
+                "nahr": "yes", "cluster": "clusterA", "bp1": "1", "bp2": "2",
+            }],
+            gd_calls_entries=[{
+                "chrom": "chr1", "pos": 1000, "end": 5000,
+                "region_id": "GD_NAHR1", "svtype": "DEL",
+                "samples": ["S1"],
+            }],
+        )
+        assert len(written) == 1
+        nov = written[0]
+        # pysam new_record uses 0-based start
+        assert nov.start == 1000  # 0-based start from gd_calls
+        assert nov.pos == 1001    # pysam .pos = start + 1 (1-based)
+        assert nov.stop == 5000
+
+    def test_novel_record_all_homref_skipped(self, monkeypatch, tmp_path):
+        """Case 15.2: All hom-ref → skipped, no novel record emitted."""
+        header = _make_vcf_header(contigs={"chr1": None}, samples=["S1"])
+        written = _run_integrate_main(
+            monkeypatch, tmp_path,
+            vcf_records=[], vcf_header=header,
+            gd_table_rows=[{
+                "chr": "chr1", "start": 1000, "end": 5000,
+                "gd_id": "GD_NAHR1", "svtype": "DEL",
+                "nahr": "yes", "cluster": "clusterA", "bp1": "1", "bp2": "2",
+            }],
+            gd_calls_entries=[{
+                "chrom": "chr1", "pos": 1000, "end": 5000,
+                "region_id": "GD_NAHR1", "svtype": "DEL",
+                "samples": [],  # No carriers
+            }],
+        )
+        assert len(written) == 0
+
+    def test_novel_record_contig_absent_skipped(self, monkeypatch, tmp_path):
+        """Case 15.3: Contig absent from header → skipped."""
+        header = _make_vcf_header(contigs={"chr1": None}, samples=["S1"])
+        written = _run_integrate_main(
+            monkeypatch, tmp_path,
+            vcf_records=[], vcf_header=header,
+            gd_table_rows=[{
+                "chr": "chr1", "start": 1000, "end": 5000,
+                "gd_id": "GD_NAHR1", "svtype": "DEL",
+                "nahr": "yes", "cluster": "clusterA", "bp1": "1", "bp2": "2",
+            }],
+            gd_calls_entries=[{
+                "chrom": "chr99", "pos": 1000, "end": 5000,
+                "region_id": "GD_NAHR1", "svtype": "DEL",
+                "samples": ["S1"],
+            }],
+        )
+        assert len(written) == 0
+
+    def test_novel_record_missing_metadata_skipped(self, monkeypatch, tmp_path):
+        """Case 15.4: GD entry in gd_calls but not in gd_metadata → skipped."""
+        header = _make_vcf_header(contigs={"chr1": None}, samples=["S1"])
+        # GD table has no entry for GD_UNKNOWN, so it's not in gd_metadata
+        written = _run_integrate_main(
+            monkeypatch, tmp_path,
+            vcf_records=[], vcf_header=header,
+            gd_table_rows=[{
+                "chr": "chr1", "start": 1000, "end": 5000,
+                "gd_id": "GD_DEL1", "svtype": "DEL",
+                "nahr": "yes", "cluster": "clusterA", "bp1": "1", "bp2": "2",
+            }],
+            gd_calls_entries=[{
+                "chrom": "chr1", "pos": 1000, "end": 5000,
+                "region_id": "GD_UNKNOWN", "svtype": "DEL",
+                "samples": ["S1"],
+            }],
+        )
+        assert len(written) == 0
+
+    def test_novel_record_id_format(self, monkeypatch, tmp_path):
+        """Case 15.10: Novel record ID format: {GD_ID}_{svtype}_novel."""
+        header = _make_vcf_header(contigs={"chr1": None}, samples=["S1"])
+        written = _run_integrate_main(
+            monkeypatch, tmp_path,
+            vcf_records=[], vcf_header=header,
+            gd_table_rows=[{
+                "chr": "chr1", "start": 1000, "end": 5000,
+                "gd_id": "MY_GD_REGION", "svtype": "DUP",
+                "nahr": "yes", "cluster": "clusterA", "bp1": "1", "bp2": "2",
+            }],
+            gd_calls_entries=[{
+                "chrom": "chr1", "pos": 1000, "end": 5000,
+                "region_id": "MY_GD_REGION", "svtype": "DUP",
+                "samples": ["S1"],
+            }],
+        )
+        assert len(written) == 1
+        assert written[0].id == "MY_GD_REGION_DUP_novel"
+
+    def test_phase2_matched_not_emitted_as_novel(self, monkeypatch, tmp_path):
+        """Case 15.16: GD entry matched in phase 2 → NOT emitted as novel."""
+        header = _make_vcf_header(contigs={"chr1": None}, samples=["S1"])
+        # VCF record matches NAHR region, and gd_calls has entry for same GD_ID
+        rec = _FakeRecord(
+            chrom="chr1", pos=1001, stop=5000,
+            record_id="var1", info={"SVTYPE": "DEL"},
+            samples={"S1": {"GT": (0, 0)}},
+        )
+        written = _run_integrate_main(
+            monkeypatch, tmp_path,
+            vcf_records=[rec], vcf_header=header,
+            gd_table_rows=[{
+                "chr": "chr1", "start": 1000, "end": 5000,
+                "gd_id": "GD_NAHR1", "svtype": "DEL",
+                "nahr": "yes", "cluster": "clusterA", "bp1": "1", "bp2": "2",
+            }],
+            gd_calls_entries=[{
+                "chrom": "chr1", "pos": 1000, "end": 5000,
+                "region_id": "GD_NAHR1", "svtype": "DEL",
+                "samples": ["S1"],
+            }],
+        )
+        # Phase 2 matches: VCF record modified with GD_NAHR1
+        # Phase 3: GD_NAHR1 is in matched_gd_variants → NOT emitted as novel
+        assert len(written) == 1
+        assert written[0].info.get("GENOMIC_DISORDER") == "GD_NAHR1"
+        # No novel record
+        assert "novel" not in written[0].id.lower()
+
+
+class TestInputValidationCli:
+    """Input validation edge cases (1.1, 1.2, 1.3, 1.9, 1.11, 1.12)."""
+
+    def test_missing_required_args_raises(self, monkeypatch, tmp_path):
+        """Case 1.1: Missing required CLI args → argparse error."""
+        argv = ["--vcf", str(tmp_path / "in.vcf.gz")]
+        with pytest.raises(SystemExit):
+            integrate._parse_args(argv)
+
+    def test_nonexistent_vcf_path_exits(self, tmp_path):
+        """Case 1.2: Non-existent VCF path → sys.exit(1)."""
+        out_vcf = str(tmp_path / "out.vcf.gz")
+        gd_table = tmp_path / "gd.tsv"
+        gd_table.write_text(
+            "chr\tstart_GRCh38\tend_GRCh38\tGD_ID\tsvtype\tNAHR\tterminal\t"
+            "cluster\tBP1\tBP2\n"
+            "chr1\t1000\t5000\tGD1\tDEL\tyes\tno\tclusterA\t1\t2\n"
+        )
+        gd_calls = tmp_path / "gd_calls.tsv"
+        gd_calls.write_text(
+            "chrom\tpos\tend\tregion_id\tsvtype\tSample1\tSample2\n"
+            "chr1\t1000\t5000\tGD1\tDEL\ttrue\tfalse\n"
+        )
+        par_bed = tmp_path / "par.bed"
+        par_bed.write_text("chr1\t0\t2750000\n")
+        ploidy = tmp_path / "ploidy.tsv"
+        ploidy.write_text("chr1\t1\t1\t1\t1\n")
+
+        with pytest.raises(SystemExit):
+            integrate.main([
+                "--vcf", str(tmp_path / "nonexistent.vcf.gz"),
+                "--gd-calls", str(gd_calls),
+                "--gd-table", str(gd_table),
+                "--par-bed", str(par_bed),
+                "--ploidy-table", str(ploidy),
+                "--out-vcf", out_vcf,
+                "--temp-dir", str(tmp_path),
+            ])
+
+    def test_nonexistent_gd_table_path_exits(self, tmp_path):
+        """Case 1.3: Non-existent GD table path → sys.exit(1)."""
+        out_vcf = str(tmp_path / "out.vcf.gz")
+        vcf = tmp_path / "in.vcf.gz"
+        vcf.write_text("#dummy")
+        gd_calls = tmp_path / "gd_calls.tsv"
+        gd_calls.write_text(
+            "chrom\tpos\tend\tregion_id\tsvtype\tSample1\tSample2\n"
+            "chr1\t1000\t5000\tGD1\tDEL\ttrue\tfalse\n"
+        )
+        par_bed = tmp_path / "par.bed"
+        par_bed.write_text("chr1\t0\t2750000\n")
+        ploidy = tmp_path / "ploidy.tsv"
+        ploidy.write_text("chr1\t1\t1\t1\t1\n")
+
+        with pytest.raises(SystemExit):
+            integrate.main([
+                "--vcf", str(vcf),
+                "--gd-calls", str(gd_calls),
+                "--gd-table", str(tmp_path / "nonexistent.tsv"),
+                "--par-bed", str(par_bed),
+                "--ploidy-table", str(ploidy),
+                "--out-vcf", out_vcf,
+                "--temp-dir", str(tmp_path),
+            ])
+
+    def test_invalid_reciprocal_overlap_value_raises(self, tmp_path):
+        """Case 1.9: Invalid --reciprocal-overlap value raises argparse error."""
+        # argparse with type=float raises SystemExit for non-float values
+        with pytest.raises(SystemExit):
+            integrate._parse_args([
+                "--vcf", str(tmp_path / "a"),
+                "--gd-calls", str(tmp_path / "b"),
+                "--gd-table", str(tmp_path / "c"),
+                "--par-bed", str(tmp_path / "d"),
+                "--ploidy-table", str(tmp_path / "e"),
+                "--out-vcf", str(tmp_path / "f"),
+                "--reciprocal-overlap", "abc",
+            ])
+
+    def test_non_float_reciprocal_overlap_raises(self, tmp_path):
+        """Case 1.11: Non-float --reciprocal-overlap raises argparse error."""
+        with pytest.raises(SystemExit):
+            integrate._parse_args([
+                "--vcf", str(tmp_path / "a"),
+                "--gd-calls", str(tmp_path / "b"),
+                "--gd-table", str(tmp_path / "c"),
+                "--par-bed", str(tmp_path / "d"),
+                "--ploidy-table", str(tmp_path / "e"),
+                "--out-vcf", str(tmp_path / "f"),
+                "--reciprocal-overlap", "not_a_number",
+            ])
+
+    def test_zero_reciprocal_overlap_allowed(self, tmp_path):
+        """Case 1.12: --reciprocal-overlap 0 is allowed (edge)."""
+        args = integrate._parse_args([
+            "--vcf", str(tmp_path / "a"),
+            "--gd-calls", str(tmp_path / "b"),
+            "--gd-table", str(tmp_path / "c"),
+            "--par-bed", str(tmp_path / "d"),
+            "--ploidy-table", str(tmp_path / "e"),
+            "--out-vcf", str(tmp_path / "f"),
+            "--reciprocal-overlap", "0",
+        ])
+        assert args.reciprocal_overlap == 0.0
+
+
+class TestPloidyTableEdgeCases:
+    """Ploidy table reading edge cases (5.1, 5.3, 5.4, 5.6, 5.7, 5.9)."""
+
+    def test_ploidy_table_empty_file(self, tmp_path):
+        """Case 5.1: Empty ploidy table → empty dict."""
+        p = tmp_path / "ploidy.tsv"
+        p.write_text("")
+        result = integrate.read_ploidy_table(str(p))
+        assert result == {}
+
+    def test_ploidy_table_header_only(self, tmp_path):
+        """Case 5.3: Header only → empty dict."""
+        p = tmp_path / "ploidy.tsv"
+        p.write_text("sample\tchr1\tchr2\tchr3\tchr4\n")
+        result = integrate.read_ploidy_table(str(p))
+        assert result == {}
+
+    def test_ploidy_table_missing_column(self, tmp_path):
+        """Case 5.4: Missing ploidy columns → sample with empty inner dict."""
+        p = tmp_path / "ploidy.tsv"
+        p.write_text("sample\nS1\n")
+        result = integrate.read_ploidy_table(str(p))
+        # sample is present but inner dict is empty (no contigs to map)
+        assert "S1" in result
+        assert result["S1"] == {}
+
+    def test_ploidy_table_short_rows(self, tmp_path):
+        """Case 5.6: Row with fewer columns → parses what's available."""
+        p = tmp_path / "ploidy.tsv"
+        p.write_text(
+            "sample\tchr1\tchr2\n"
+            "S1\t2\t2\n"
+        )
+        result = integrate.read_ploidy_table(str(p))
+        # Parses only available columns (no missing column errors)
+        assert "S1" in result
+        assert result["S1"]["chr2"] == 2
+
+    def test_ploidy_table_extra_whitespace(self, tmp_path):
+        """Case 5.7: Extra whitespace in header/fields → not stripped from keys."""
+        p = tmp_path / "ploidy.tsv"
+        p.write_text(
+            "  sample  \t  chr1  \t  chr2  \t  chr3  \t  chr4  \n"
+            "  S1  \t  2  \t  2  \t  2  \t  2  \n"
+        )
+        result = integrate.read_ploidy_table(str(p))
+        # Whitespace in tokens is NOT stripped (leading preserved, trailing stripped)
+        assert "S1  " in result
+        assert result["S1  "]["  chr1  "] == 2
+
+
