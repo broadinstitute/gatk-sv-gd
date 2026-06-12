@@ -32,7 +32,7 @@ python -m pip install -e '.[dev]'
 
 ### Primary Dependencies
 
-* **Core Numerics & Data Architecture:** `numpy`, `pandas`
+* **Core Numerics & Data Architecture:** `numpy`, `pandas`, `scipy`
 * **Genomic Format Parsers:** `pysam`, `intervaltree`
 * **Probabilistic Framework:** `torch`, `pyro-ppl`
 * **Visualization Layer:** `matplotlib`

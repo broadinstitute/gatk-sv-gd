@@ -340,12 +340,12 @@ def test_depth_data_subsamples_bins_and_samples_deterministically(monkeypatch):
         clamp_threshold=None,
     )
 
-    assert data.sample_ids == ["sample3", "sample1"]
+    assert data.sample_ids == ["sample1", "sample3"]
     assert data.chr.tolist() == ["chr1", "chr2"]
     assert data.start.tolist() == [100, 200]
     assert np.allclose(
         data.depth.detach().cpu().numpy(),
-        np.asarray([[3.0, 1.0], [3.2, 1.2]], dtype=np.float32),
+        np.asarray([[1.0, 3.0], [1.2, 3.2]], dtype=np.float32),
     )
     assert data.interval_sizes.detach().cpu().numpy().reshape(-1).tolist() == pytest.approx([50.0, 60.0])
 

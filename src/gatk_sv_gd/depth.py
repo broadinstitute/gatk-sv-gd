@@ -612,6 +612,7 @@ class DepthData:
                 sample_indices = np.random.choice(
                     len(sample_cols), size=subsample_samples, replace=False
                 )
+                sample_indices = np.sort(sample_indices)  # Keep sorted for interpretability
                 selected_samples = [sample_cols[i] for i in sample_indices]
                 sample_cols = selected_samples
 

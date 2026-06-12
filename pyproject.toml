@@ -12,6 +12,7 @@ license = {text = "BSD-3-Clause"}
 dependencies = [
     "numpy",
     "pandas",
+    "scipy",
     "pysam",
     "intervaltree",
     "torch",
@@ -59,3 +60,6 @@ skip_covered = true
 
 [tool.coverage.html]
 directory = "build/coverage-html"
+
+[tool.ruff]
+line-length = 120

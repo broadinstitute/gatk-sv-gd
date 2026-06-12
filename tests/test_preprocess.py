@@ -9,6 +9,42 @@ from gatk_sv_gd.models import GDTable, validate_gd_table_for_preprocess
 import gatk_sv_gd.preprocess as preprocess_module
 
 
+class _LocalFastaFile:
+    """In-memory FASTA reader (0-based, end-exclusive) replacing pysam.FastaFile.
+
+    Parses a small FASTA file directly in Python so GC tests stay hermetic and
+    require no external ``samtools`` binary. ``fetch`` raises ``KeyError`` for an
+    unknown contig, mirroring how ``compute_gc_fractions`` treats missing
+    sequence (caught and recorded as NaN).
+    """
+
+    def __init__(self, path):
+        self._seqs = {}
+        chrom = None
+        parts = []
+        with open(path) as handle:
+            for line in handle:
+                line = line.rstrip("\n")
+                if line.startswith(">"):
+                    if chrom is not None:
+                        self._seqs[chrom] = "".join(parts)
+                    chrom = line[1:].split()[0]
+                    parts = []
+                else:
+                    parts.append(line)
+        if chrom is not None:
+            self._seqs[chrom] = "".join(parts)
+
+    def fetch(self, chrom, start=None, end=None):
+        seq = self._seqs[chrom]  # KeyError for missing contig -> NaN
+        if start is None:
+            return seq
+        return seq[start:end]
+
+    def close(self):
+        pass
+
+
 class _FakeLocus:
     def __init__(self):
         self.chrom = "chr1"
@@ -1600,7 +1636,6 @@ def test_collect_all_locus_bins_uses_filtered_cache_and_skips_unassigned_bins(mo
 def test_compute_gc_fractions_computes_per_bin_gc(tmp_path, monkeypatch):
     """Test that compute_gc_fractions fetches sequences and computes GC fractions."""
     import pysam
-    import subprocess
 
     # Create a temporary FASTA file
     fasta_path = str(tmp_path / "test.fa")
@@ -1610,33 +1645,7 @@ def test_compute_gc_fractions_computes_per_bin_gc(tmp_path, monkeypatch):
         f.write(">chr2\n")
         f.write("TTTTTTTT\n")
 
-    # Index the FASTA (conftest stub is no-op, use samtools directly)
-    pysam.faidx(fasta_path)
-    subprocess.run(["samtools", "faidx", fasta_path], check=True, capture_output=True)
-
-    # Replace stub FastaFile with samtools-backed implementation
-    class SamtoolsFastaFile:
-        """FastaFile stub that uses samtools faidx (1-based) for pysam (0-based)."""
-        def __init__(self, path):
-            self._path = path
-
-        def fetch(self, chrom, start=None, end=None):
-            # pysam uses 0-based, samtools uses 1-based
-            if start is not None:
-                region = f"{chrom}:{start + 1}-{end}"
-            else:
-                region = chrom
-            result = subprocess.run(
-                ["samtools", "faidx", self._path, region],
-                capture_output=True, text=True, check=True,
-            )
-            lines = result.stdout.strip().split("\n")
-            return lines[1] if len(lines) > 1 else lines[0]
-
-        def close(self):
-            pass
-
-    monkeypatch.setattr(pysam, "FastaFile", SamtoolsFastaFile)
+    monkeypatch.setattr(pysam, "FastaFile", _LocalFastaFile)
 
     combined_df = pd.DataFrame({
         "Chr": ["chr1", "chr1", "chr2"],
@@ -1658,7 +1667,6 @@ def test_compute_gc_fractions_computes_per_bin_gc(tmp_path, monkeypatch):
 def test_compute_gc_fractions_handles_missing_sequence(tmp_path, monkeypatch):
     """Test that compute_gc_fractions returns NaN for missing sequences."""
     import pysam
-    import subprocess
 
     # Create a temporary FASTA file with only chr1
     fasta_path = str(tmp_path / "test.fa")
@@ -1666,31 +1674,7 @@ def test_compute_gc_fractions_handles_missing_sequence(tmp_path, monkeypatch):
         f.write(">chr1\n")
         f.write("AAAAAA\n")
 
-    pysam.faidx(fasta_path)
-    subprocess.run(["samtools", "faidx", fasta_path], check=True, capture_output=True)
-
-    class SamtoolsFastaFile:
-        """FastaFile stub that uses samtools faidx (1-based) for pysam (0-based)."""
-        def __init__(self, path):
-            self._path = path
-
-        def fetch(self, chrom, start=None, end=None):
-            # pysam uses 0-based, samtools uses 1-based
-            if start is not None:
-                region = f"{chrom}:{start + 1}-{end}"
-            else:
-                region = chrom
-            result = subprocess.run(
-                ["samtools", "faidx", self._path, region],
-                capture_output=True, text=True, check=True,
-            )
-            lines = result.stdout.strip().split("\n")
-            return lines[1] if len(lines) > 1 else lines[0]
-
-        def close(self):
-            pass
-
-    monkeypatch.setattr(pysam, "FastaFile", SamtoolsFastaFile)
+    monkeypatch.setattr(pysam, "FastaFile", _LocalFastaFile)
 
     combined_df = pd.DataFrame({
         "Chr": ["chr1", "chr_missing"],
@@ -1708,38 +1692,13 @@ def test_compute_gc_fractions_handles_missing_sequence(tmp_path, monkeypatch):
 def test_compute_gc_fractions_prints_summary(capsys, monkeypatch, tmp_path):
     """Test that compute_gc_fractions prints a summary message."""
     import pysam
-    import subprocess
 
     fasta_path = str(tmp_path / "test.fa")
     with open(fasta_path, "w") as f:
         f.write(">chr1\n")
         f.write("AAAAAA\n")
 
-    pysam.faidx(fasta_path)
-    subprocess.run(["samtools", "faidx", fasta_path], check=True, capture_output=True)
-
-    class SamtoolsFastaFile:
-        """FastaFile stub that uses samtools faidx (1-based) for pysam (0-based)."""
-        def __init__(self, path):
-            self._path = path
-
-        def fetch(self, chrom, start=None, end=None):
-            # pysam uses 0-based, samtools uses 1-based
-            if start is not None:
-                region = f"{chrom}:{start + 1}-{end}"
-            else:
-                region = chrom
-            result = subprocess.run(
-                ["samtools", "faidx", self._path, region],
-                capture_output=True, text=True, check=True,
-            )
-            lines = result.stdout.strip().split("\n")
-            return lines[1] if len(lines) > 1 else lines[0]
-
-        def close(self):
-            pass
-
-    monkeypatch.setattr(pysam, "FastaFile", SamtoolsFastaFile)
+    monkeypatch.setattr(pysam, "FastaFile", _LocalFastaFile)
 
     combined_df = pd.DataFrame({
         "Chr": ["chr1"],
