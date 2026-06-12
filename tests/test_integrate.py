@@ -4976,11 +4976,8 @@ class TestCoordinateSvlenEdgeCases:
                 "region_id": "GD_REVERSED", "svtype": "DEL", "samples": ["S1"],
             }],
         )
-        # end < pos → SVLEN = end - pos - 1 = 1000 - 5000 - 1 = -4001
-        # But the code may still write it; let's check
-        assert len(written) == 1
-        # SVLEN = end - pos - 1, even if negative
-        assert written[0].info.get("SVLEN") == -4001
+        # end < pos → inverted interval → rejected in Phase 1 → no output
+        assert len(written) == 0
 
     def test_variant_stop_after_pos(self, monkeypatch, tmp_path):
         """Case 18.9: VCF record with stop > pos → normal handling."""

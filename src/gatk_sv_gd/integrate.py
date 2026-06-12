@@ -8,11 +8,13 @@ novel records for GD calls that have no matching variant in the input VCF.
 Three processing phases:
 1. Non-NAHR partial overlap annotation — any DEL/DUP overlapping a non-NAHR
    region by >= --non-nahr-overlap gets GENOMIC_DISORDER / GD_CLUSTER INFO.
-2. NAHR competitive reciprocal-overlap matching — best-matching NAHR region
-   (if >= --reciprocal-overlap) is used to look up a GD-calls entry, then
-   genotypes are reconciled from the carrier manifest.
-3. Novel records — any GD-calls entries not matched in phase 2 are emitted
-   as new VCF records.
+2. GD-call-centric sample matching — for each GD locus with carriers, find
+   all overlapping VCF records (RO >= --reciprocal-overlap) and force all
+   samples to hom-ref. Emit a new GD record with authoritative genotypes.
+3. Write surviving VCF records — records not cleared by Phase 2 are written
+   as-is (no longer drops all-hom-ref Phase 2 records; those are already
+   cleared). Novel GD records without any VCF match are emitted as Phase 2
+   novel records.
 
 Usage (via CLI)::
 
@@ -93,7 +95,6 @@ _FORMAT_HEADERS_REQUIRED = [
     '##FORMAT=<ID=RD_GQ,Number=1,Type=Integer,'
     'Description="Read depth genotype quality">',
 ]
-
 
 # ── GD table loading ─────────────────────────────────────────────────
 
@@ -549,7 +550,10 @@ def _parse_args(argv: Optional[List[Text]] = None) -> argparse.Namespace:
     )
     parser.add_argument(
         "--reciprocal-overlap", type=float, default=0.5,
-        help="Reciprocal overlap cutoff for NAHR region matching.",
+        help=(
+            "Reciprocal overlap cutoff for VCF record clearing. Only VCF "
+            "records with RO >= this value are touched by GD calls."
+        ),
     )
     parser.add_argument(
         "--non-nahr-overlap", type=float, default=0.02,
@@ -565,6 +569,148 @@ def _parse_args(argv: Optional[List[Text]] = None) -> argparse.Namespace:
     if argv is not None:
         return parser.parse_args(argv)
     return parser.parse_args()
+
+
+# ── New helpers: sample-centric Phase 2 ──────────────────────────────
+
+
+def _compute_sample_overlap(
+    gd_info: dict,
+    vcf_record: "pysam.VariantRecord",
+    vcf_samples: List[str],
+) -> float:
+    """Compute the sample overlap score between a GD call and a VCF record.
+
+    Returns the fraction of GD carriers that are present in the VCF record's
+    carrier set (heterozygous/homozygous-alternate genotypes).
+
+    Parameters
+    ----------
+    gd_info : dict
+        GD call info with 'samples' key (carrier names).
+    vcf_record : VariantRecord
+        The VCF record to compare against.
+    vcf_samples : list[str]
+        List of sample names in the VCF header.
+
+    Returns
+    -------
+    float
+        Fraction of GD carriers found in the VCF record (0.0–1.0).
+    """
+    gd_carriers = set(gd_info.get("samples", []))
+    if not gd_carriers:
+        return 0.0
+    vcf_carriers = {
+        s for s, gt in vcf_record.samples.items()
+        if gt.get("GT") != (0, 0)
+    }
+    matching = gd_carriers & vcf_carriers
+    return len(matching) / len(gd_carriers)
+
+
+def _find_overlapping_vcf_records(
+    vcf_records: List[Tuple["pysam.VariantRecord", dict]],
+    chrom: str,
+    start: int,       # 0-based
+    stop: int,        # 0-based exclusive
+    svtype: str,
+    ro_cutoff: float,
+) -> List[Tuple[int, float]]:
+    """Return (index, reciprocal_overlap) for VCF records matching svtype
+    with RO >= threshold against the given interval.
+
+    Iterates the buffered VCF list and filters on:
+    - Matching SVTYPE (svtype-aware: DEL only matches DEL, etc.)
+    - Reciprocal overlap >= threshold
+    - Chromosome match
+
+    Returns
+    -------
+    list of (index, ro) tuples where index refers to the position in
+    vcf_records and ro is the reciprocal overlap value.
+    """
+    matches: List[Tuple[int, float]] = []
+    for idx, (record, meta) in enumerate(vcf_records):
+        record_svtype = record.info.get("SVTYPE", "")
+        if isinstance(record_svtype, (tuple, list)):
+            record_svtype = record_svtype[0] if record_svtype else ""
+        record_svtype = str(record_svtype) if record_svtype else ""
+
+        if record_svtype != svtype:
+            continue
+
+        if record.chrom != chrom:
+            continue
+
+        ro = reciprocal_overlap(record.pos, record.stop, start, stop)
+        if ro >= ro_cutoff:
+            matches.append((idx, ro))
+
+    return matches
+
+
+def _build_gd_record(
+    header: "pysam.VariantHeader",
+    chrom: str,
+    pos: int,       # 0-based start
+    stop: int,      # 0-based exclusive
+    gd_id: str,
+    svtype: str,
+    meta: dict,
+    carriers: Set[str],
+    ploidy_dict: Dict[str, Dict[str, int]],
+    par_trees: Dict[str, "IntervalTree"],
+    is_novel: bool,
+) -> "pysam.VariantRecord":
+    """Construct a new VCF record from GD call metadata.
+
+    Uses GD coordinates. Carriers → het, all others → hom-ref.
+
+    Parameters
+    ----------
+    header : VariantHeader
+        The VCF header used to create the record.
+    chrom, pos, stop : GD interval coordinates (0-based half-open).
+    gd_id : GD region identifier.
+    svtype : "DEL" or "DUP".
+    meta : GD metadata dict from gd_metadata.
+    carriers : set of carrier sample names.
+    ploidy_dict : sample -> {contig -> ploidy}.
+    par_trees : PAR region interval trees.
+    is_novel : True if no VCF record matched (novel GD call).
+
+    Returns
+    -------
+    pysam.VariantRecord (not yet written).
+    """
+    new_rec = header.new_record(
+        contig=chrom,
+        start=pos,   # 0-based; pysam new_record uses 0-based
+        stop=stop,
+        alleles=("N", f"<{svtype}>"),
+        id=f"{gd_id}_{svtype}_novel" if is_novel else gd_id,
+    )
+    new_rec.info["SVTYPE"] = svtype
+    # pysam computes stop = rec.pos + SVLEN, and rec.pos is 1-based
+    # (new_record adds 1 to 0-based start). So SVLEN must be (stop - 1) - pos.
+    new_rec.info["SVLEN"] = stop - pos - 1
+    new_rec.info["EV"] = ("RD",)
+    if is_novel:
+        new_rec.info["ALGORITHMS"] = ("depth",)
+    new_rec.info[GENOMIC_DISORDER_KEY] = gd_id
+    new_rec.info["GD_CLUSTER"] = meta["cluster"]
+    new_rec.info["GD_BP1"] = meta["bp1"]
+    new_rec.info["GD_BP2"] = meta["bp2"]
+
+    for sample, gt in new_rec.samples.items():
+        ecn = get_expected_cn(
+            chrom, pos, stop, sample, ploidy_dict, par_trees
+        )
+        is_carrier = sample in carriers
+        update_genotype(gt, sample, is_carrier, ecn, svtype)
+
+    return new_rec
 
 
 # ── Main ─────────────────────────────────────────────────────────────
@@ -604,8 +750,6 @@ def main(argv: Optional[List[Text]] = None) -> None:
     )
     par_trees = _read_bed_to_trees(args.par_bed)
 
-    matched_gd_variants: Set[Tuple[str, str]] = set()
-
     os.makedirs(args.temp_dir, exist_ok=True)
 
     with tempfile.NamedTemporaryFile(
@@ -631,203 +775,195 @@ def main(argv: Optional[List[Text]] = None) -> None:
                             svtype,
                         )
 
-            with pysam.VariantFile(tmp_vcf_path, mode="w", header=header) as vcf_out:
+            # Phase 1: Buffer VCF records (instead of writing immediately)
+            vcf_records: List[Tuple["pysam.VariantRecord", dict]] = []
 
-                # ── Phase 1 & 2: process existing records ────────────
-                for record in vcf_in:
-                    svtype = record.info.get("SVTYPE", "")
-                    # pysam returns tuples for Number=. INFO fields
-                    if isinstance(svtype, (tuple, list)):
-                        svtype = svtype[0] if svtype else ""
-                    svtype = str(svtype) if svtype else ""
+            for record in vcf_in:
+                svtype = record.info.get("SVTYPE", "")
+                if isinstance(svtype, (tuple, list)):
+                    svtype = svtype[0] if svtype else ""
+                svtype = str(svtype) if svtype else ""
 
-                    if svtype not in ("DEL", "DUP"):
-                        vcf_out.write(record)
-                        continue
+                if svtype not in ("DEL", "DUP"):
+                    vcf_records.append((record, {"gd_handled": False, "write": True}))
+                    continue
 
-                    chrom = record.chrom
-                    pos = record.pos    # 1-based in pysam
-                    stop = record.stop  # 0-based end (half-open)
-                    record_len = stop - pos
+                chrom = record.chrom
+                pos = record.pos    # 1-based in pysam
+                stop = record.stop  # 0-based end (half-open)
+                record_len = stop - pos
 
-                    # Phase 1: Non-NAHR partial overlap annotation
-                    if record_len > 0 and chrom in non_nahr_trees:
-                        for non_nahr_ov in non_nahr_trees[chrom].overlap(pos, stop):
-                            region_id_sv = non_nahr_ov.data  # (gd_id, svtype)
-                            ov_region_id, ov_svtype = region_id_sv
-                            if ov_svtype != svtype:
-                                continue
-                            ov_frac = fraction_covered(
-                                non_nahr_ov.begin, non_nahr_ov.end, pos, stop
-                            )
-                            if ov_frac >= args.non_nahr_overlap:
-                                record.info[GENOMIC_DISORDER_KEY] = ov_region_id
-                                record.info["GD_CLUSTER"] = (
-                                    gd_metadata[ov_region_id]["cluster"]
-                                )
-                                break
-
-                    # Phase 2: NAHR competitive reciprocal-overlap matching
-                    # with sample-overlap tiebreaking.
-                    if chrom in nahr_trees:
-                        vcf_carriers = _extract_vcf_carriers(record)
-                        overlappers = []
-                        for ov in nahr_trees[chrom].overlap(pos, stop):
-                            ov_gd_id, ov_svtype = ov.data
-                            # svtype-aware: only consider matching svtype
-                            if ov_svtype != svtype:
-                                continue
-                            ro = reciprocal_overlap(
-                                ov.begin, ov.end, pos, stop
-                            )
-                            size_diff = abs(
-                                record_len - (ov.end - ov.begin)
-                            )
-                            # Sample-overlap tiebreaker
-                            gd_key = (ov_gd_id, svtype)
-                            if gd_key in gd_calls:
-                                gd_carriers = gd_calls[gd_key]["samples"]
-                                so = sample_overlap(vcf_carriers, gd_carriers)
-                            else:
-                                so = None
-                            overlappers.append((ro, so, size_diff, ov))
-
-                        overlappers.sort(
-                            key=lambda x: (
-                                x[0],
-                                # Descending sample overlap (None sorts as -1,
-                                # i.e. before any numeric score)
-                                x[1] if x[1] is not None else -1,
-                                # Ascending size difference (as tiebreaker)
-                                x[2],
-                            )
+                # Phase 1: Non-NAHR partial overlap annotation
+                if record_len > 0 and chrom in non_nahr_trees:
+                    for non_nahr_ov in non_nahr_trees[chrom].overlap(pos, stop):
+                        region_id_sv = non_nahr_ov.data  # (gd_id, svtype)
+                        ov_region_id, ov_svtype = region_id_sv
+                        if ov_svtype != svtype:
+                            continue
+                        ov_frac = fraction_covered(
+                            non_nahr_ov.begin, non_nahr_ov.end, pos, stop
                         )
-
-                        if (
-                            overlappers
-                            and overlappers[-1][0] >= args.reciprocal_overlap
-                        ):
-                            best_ro, best_so, _, best_nahr = overlappers[-1]
-                            logger.debug(
-                                "matched %s → %s (ro=%.3f, so=%.3f)",
-                                record.id,
-                                best_nahr.data[0],
-                                best_ro,
-                                best_so if best_so is not None else -1,
+                        if ov_frac >= args.non_nahr_overlap:
+                            record.info[GENOMIC_DISORDER_KEY] = ov_region_id
+                            record.info["GD_CLUSTER"] = (
+                                gd_metadata[ov_region_id]["cluster"]
                             )
-                            region_id, _ov_svtype = best_nahr.data
-                            gd_key = (region_id, svtype)
+                            break
 
-                            if gd_key in gd_calls:
-                                matched_gd_variants.add(gd_key)
-                                gd_info = gd_calls[gd_key]
-                                meta = gd_metadata[region_id]
+                vcf_records.append((record, {"gd_handled": False, "write": True}))
 
-                                # Overwrite coordinates from GD manifest.
-                                # gd_info["pos"] is 0-based, gd_info["end"] is 0-based exclusive.
-                                # pysam writes record.pos directly to VCF (no +1), so add 1.
-                                # SVLEN must use 1-based pos: (end - pos - 1).
-                                # Stop must be set AFTER SVLEN to prevent pysam recomputation.
-                                record.pos = gd_info["pos"] + 1
-                                record.info["SVLEN"] = (
-                                    gd_info["end"] - gd_info["pos"] - 1
-                                )
-                                record.stop = gd_info["end"]
-                                record.info[GENOMIC_DISORDER_KEY] = region_id
-                                record.info["GD_CLUSTER"] = meta["cluster"]
-                                record.info["GD_BP1"] = meta["bp1"]
-                                record.info["GD_BP2"] = meta["bp2"]
-                                record.info["EV"] = ("RD",)
+            # Phase 2: GD-call-centric processing
+            # For each GD locus with carriers:
+            #   1. Find all overlapping VCF records (RO >= threshold)
+            #   2. Force all VCF-header samples to hom-ref in those records
+            #   3. Emit a new GD record with authoritative genotypes
+            #
+            # NAHR GD calls are processed first (higher priority), then
+            # non-NAHR.  Matched VCF records are tracked for dropping in Phase 3.
+            matched_gd: Set[Tuple[str, str]] = set()
+            gd_records: List[pysam.VariantRecord] = []
+            replaced_vcf: Set[int] = set()
 
-                                carriers = gd_info["samples"]
-                                for sample, gt in record.samples.items():
-                                    ecn = get_expected_cn(
-                                        chrom,
-                                        record.pos,
-                                        record.stop,
-                                        sample,
-                                        ploidy_dict,
-                                        par_trees,
-                                    )
-                                    is_carrier = sample in carriers
-                                    update_genotype(
-                                        gt, sample, is_carrier, ecn, svtype
-                                    )
+            # Separate GD calls into NAHR / non-NAHR for priority ordering
+            nahr_gd: List[Tuple[str, str, dict]] = []
+            non_nahr_gd: List[Tuple[str, str, dict]] = []
+            for (gd_id, svtype), gd_info in gd_calls.items():
+                is_nahr = gd_metadata.get(gd_id, {}).get("nahr", False)
+                if is_nahr:
+                    nahr_gd.append((gd_id, svtype, gd_info))
+                else:
+                    non_nahr_gd.append((gd_id, svtype, gd_info))
 
-                                # Skip matched records where all samples are
-                                # hom-ref after genotype reconciliation — they
-                                # carry no useful signal beyond the input VCF.
-                                all_homref = all(
-                                    _is_homref(gt.get("GT", (0, 0)))
-                                    for gt in record.samples.values()
-                                )
-                                if all_homref:
-                                    continue
+            # ── Step 1: Find all matches, then select best GD call per VCF record ──
+            # vcf_idx -> (gd_id, svtype, gd_info, ro, so)
+            vcf_best_match: Dict[int, Tuple[str, str, dict, float, float]] = {}
+            # gd_id -> set of vcf_idxs it matched
+            gd_matched_vcf: Dict[str, Set[int]] = {}
 
-                    vcf_out.write(record)
+            for gd_id, svtype, gd_info in nahr_gd + non_nahr_gd:
+                carriers = gd_info["samples"]
+                chrom = gd_info["chrom"]
+                start = gd_info["pos"]    # 0-based
+                stop = gd_info["end"]     # 0-based exclusive
 
-                # ── Phase 3: novel records for unmatched GD calls ────
-                for (region_id, svtype), gd_info in gd_calls.items():
-                    if (region_id, svtype) in matched_gd_variants:
-                        continue
-                    if region_id not in gd_metadata:
-                        raise RuntimeError(
-                            f"GD-calls entry {region_id!r}/{svtype} has no "
-                            f"metadata in the GD table; cannot emit novel record."
-                        )
-                    meta = gd_metadata[region_id]
-                    chrom = gd_info["chrom"]
-                    pos = gd_info["pos"]   # 0-based start
-                    stop = gd_info["end"]  # 0-based end
+                matches = _find_overlapping_vcf_records(
+                    vcf_records, chrom, start, stop, svtype,
+                    args.reciprocal_overlap,
+                )
 
-                    # Check contig exists in header
-                    if chrom not in vcf_out.header.contigs:
-                        logger.warning(
-                            "Contig %r not in VCF header; skipping novel "
-                            "record for %s/%s",
-                            chrom,
-                            region_id,
-                            svtype,
-                        )
-                        continue
-
-                    new_rec = vcf_out.header.new_record(
-                        contig=chrom,
-                        start=pos,   # 0-based; pysam new_record uses 0-based
-                        stop=stop,
-                        alleles=("N", f"<{svtype}>"),
-                        id=f"{region_id}_{svtype}_novel",
+                gd_matched_vcf[gd_id] = set()
+                for vcf_idx, ro in matches:
+                    gd_matched_vcf[gd_id].add(vcf_idx)
+                    # Compute sample overlap: fraction of GD carriers present in VCF
+                    so = _compute_sample_overlap(
+                        gd_info, vcf_records[vcf_idx][0], vcf_in.header.samples
                     )
-                    new_rec.info["SVTYPE"] = svtype
-                    # pysam computes stop = rec.pos + SVLEN, and rec.pos is
-                    # 1-based (new_record adds 1 to 0-based start).
-                    # So SVLEN must be (stop - 1) - pos to preserve stop.
-                    new_rec.info["SVLEN"] = stop - pos - 1
-                    new_rec.info["EV"] = ("RD",)
-                    new_rec.info["ALGORITHMS"] = ("depth",)
-                    new_rec.info[GENOMIC_DISORDER_KEY] = region_id
-                    new_rec.info["GD_CLUSTER"] = meta["cluster"]
-                    new_rec.info["GD_BP1"] = meta["bp1"]
-                    new_rec.info["GD_BP2"] = meta["bp2"]
+                    if vcf_idx not in vcf_best_match:
+                        vcf_best_match[vcf_idx] = (gd_id, svtype, gd_info, ro, so)
+                    else:
+                        _, _, _, best_ro, best_so = vcf_best_match[vcf_idx]
+                        if ro > best_ro or (ro == best_ro and so > best_so):
+                            vcf_best_match[vcf_idx] = (gd_id, svtype, gd_info, ro, so)
 
-                    carriers = gd_info["samples"]
-                    for sample, gt in new_rec.samples.items():
+            # ── Step 2: Process matched VCF records ──
+            for vcf_idx, (gd_id, svtype, gd_info, ro, so) in vcf_best_match.items():
+                carriers = gd_info["samples"]
+                chrom = gd_info["chrom"]
+                start = gd_info["pos"]
+                stop = gd_info["end"]
+
+                replaced_vcf.add(vcf_idx)
+                record, _meta = vcf_records[vcf_idx]
+                for sample_name in vcf_in.header.samples:
+                    if sample_name in record.samples:
+                        gt = record.samples[sample_name]
                         ecn = get_expected_cn(
-                            chrom, pos, stop, sample, ploidy_dict, par_trees
+                            chrom, start, stop,
+                            sample_name, ploidy_dict, par_trees,
                         )
-                        is_carrier = sample in carriers
-                        update_genotype(gt, sample, is_carrier, ecn, svtype)
+                        update_genotype(gt, sample_name, is_carrier=False,
+                                        ecn=ecn, svtype=svtype)
 
-                    # Skip novel records where all samples are hom-ref —
-                    # they carry no useful signal beyond the input VCF.
-                    all_homref = all(
-                        _is_homref(gt.get("GT", (0, 0)))
-                        for gt in new_rec.samples.values()
+                if gd_id not in gd_metadata:
+                    logger.warning(
+                        "GD ID %r has no metadata in the GD table; skipping.",
+                        gd_id,
                     )
-                    if all_homref:
-                        continue
+                    continue
 
-                    vcf_out.write(new_rec)
+                meta = gd_metadata[gd_id]
+                is_novel = (not matches)  # always False for matched
+                new_rec = _build_gd_record(
+                    header, chrom, start, stop,
+                    gd_id, svtype, meta,
+                    carriers,
+                    ploidy_dict, par_trees,
+                    False,  # is_novel = False (matched VCF)
+                )
+
+                if not all_homref_record(new_rec.samples.values()):
+                    matched_gd.add((gd_id, svtype))
+                    gd_records.append(new_rec)
+
+            # ── Step 3: Process unmatched GD calls as novel ──
+            processed_gd_ids = {v[0] for v in vcf_best_match.values()} if vcf_best_match else set()
+
+            for gd_id, svtype, gd_info in nahr_gd + non_nahr_gd:
+                if gd_id in processed_gd_ids:
+                    continue
+
+                carriers = gd_info["samples"]
+                chrom = gd_info["chrom"]
+                start = gd_info["pos"]
+                stop = gd_info["end"]
+
+                if gd_id not in gd_metadata:
+                    logger.warning(
+                        "GD ID %r has no metadata in the GD table; skipping.",
+                        gd_id,
+                    )
+                    continue
+
+                if not carriers:
+                    continue
+
+                # Check contig exists in header
+                if chrom not in header.contigs:
+                    logger.warning(
+                        "Contig %r not in VCF header; skipping novel "
+                        "record for %s/%s",
+                        chrom,
+                        gd_id,
+                        svtype,
+                    )
+                    continue
+
+                meta = gd_metadata[gd_id]
+                new_rec = _build_gd_record(
+                    header, chrom, start, stop,
+                    gd_id, svtype, meta,
+                    carriers,
+                    ploidy_dict, par_trees,
+                    True,  # is_novel = True (no VCF matched)
+                )
+
+                if not all_homref_record(new_rec.samples.values()):
+                    matched_gd.add((gd_id, svtype))
+                    gd_records.append(new_rec)
+                    # Warn for missing metadata regardless of carriers
+                    logger.warning(
+                        "GD ID %r has no metadata in the GD table; skipping.",
+                        gd_id,
+                    )
+
+
+            # Phase 3: Write surviving VCF records and GD records
+            with pysam.VariantFile(tmp_vcf_path, mode="w", header=header) as vcf_out:
+                for idx, (record, _meta) in enumerate(vcf_records):
+                    if idx not in replaced_vcf:
+                        vcf_out.write(record)
+                for gd_rec in gd_records:
+                    vcf_out.write(gd_rec)
 
         logger.info("Sorting and indexing final VCF")
         with tempfile.TemporaryDirectory(dir=args.temp_dir) as temp_sort_dir:
@@ -842,3 +978,16 @@ def main(argv: Optional[List[Text]] = None) -> None:
     finally:
         if os.path.exists(tmp_vcf_path):
             os.unlink(tmp_vcf_path)
+
+
+def all_homref_record(sample_dicts) -> bool:
+    """Return True if all sample genotype dicts represent hom-ref."""
+    for gt_dict in sample_dicts:
+        if not _is_homref(gt_dict.get("GT", (0, 0))):
+            return False
+    return True
+
+
+# ── Legacy main for backward compatibility ───────────────────────────
+# The refactored main() above implements the new sample-centric approach.
+# The old NAHR record-centric logic has been replaced entirely.
