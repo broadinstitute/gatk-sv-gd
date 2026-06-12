@@ -7597,4 +7597,289 @@ class TestPysamVersionBehavior:
         assert rec.stop == 5001
 
 
+# ── Section: Remaining uncovered branches (Plan items) ─────────────────
+
+
+class TestReadGdCallsEmptyFile:
+    """Edge cases for read_gd_calls with empty/edge-case files.
+
+    Covers uncovered branch 188→198 in integrate.py (for-loop exit with
+    empty first_line) and the narrow-format comment-skip continue at line 261.
+    """
+
+    def test_empty_file_returns_empty_dict(self, tmp_path):
+        """Empty gd_calls file → empty dict (no crash).
+
+        Exercises the `for line in fp:` loop that exits without finding any
+        non-comment line, leaving first_line as "". The narrow-format reader
+        then receives an empty first_line and returns {}.
+        """
+        p = tmp_path / "calls.tsv"
+        p.write_text("")
+        result = integrate.read_gd_calls(str(p))
+        assert result == {}
+
+    def test_comment_only_file_returns_empty_dict(self, tmp_path):
+        """File with only comment lines → empty dict (no crash).
+
+        Same loop-exit path as the empty-file test, but with comment lines
+        that are skipped by the loop's `stripped.startswith("#")` check.
+        """
+        p = tmp_path / "calls.tsv"
+        p.write_text("# only comments\n# another comment\n")
+        result = integrate.read_gd_calls(str(p))
+        assert result == {}
+
+    def test_narrow_format_with_comment_lines(self, tmp_path):
+        """Case 4.18, 261: Narrow format with comment lines → comments skipped.
+
+        Exercises the `if line.startswith("#\"): continue` branch at line 261
+        in _read_narrow_format.
+        """
+        p = tmp_path / "calls.tsv"
+        content = (
+            "# This is a comment\n"
+            "chr1\t1000\t5000\tGD1\tDEL\tS1,S2\n"
+            "# Another comment\n"
+            "chr1\t2000\t8000\tGD2\tDUP\tS3\n"
+        )
+        p.write_text(content)
+        result = integrate.read_gd_calls(str(p))
+        assert ("GD1", "DEL") in result
+        assert ("GD2", "DUP") in result
+        assert result[("GD1", "DEL")]["samples"] == {"S1", "S2"}
+        assert result[("GD2", "DUP")]["samples"] == {"S3"}
+
+    def test_narrow_format_comment_after_data(self, tmp_path):
+        """Comment line after data rows → still skipped correctly."""
+        p = tmp_path / "calls.tsv"
+        content = (
+            "chr1\t1000\t5000\tGD1\tDEL\tS1\n"
+            "# trailing comment\n"
+        )
+        p.write_text(content)
+        result = integrate.read_gd_calls(str(p))
+        assert ("GD1", "DEL") in result
+        assert result[("GD1", "DEL")]["samples"] == {"S1"}
+
+
+class TestTempFileCleanup:
+    """Case 21.8: Temporary file cleanup on exception.
+
+    Covers the `if os.path.exists(tmp_vcf_path):` branch at line 817 in
+    the finally block of main().
+    """
+
+    def test_temp_file_removed_on_exception(self, monkeypatch, tmp_path):
+        """When main() raises, the temp VCF file is cleaned up.
+
+        Exercises the `if os.path.exists(tmp_vcf_path):` branch at line 817
+        in the finally block of main().
+        """
+        import tempfile
+        import types
+
+        # Track temp file creation (NamedTemporaryFile is used by main())
+        created_paths = []
+        orig_named_temp = tempfile.NamedTemporaryFile
+
+        def track_named_temp(*args, **kwargs):
+            f = orig_named_temp(*args, **kwargs)
+            path_value = f.name
+            created_paths.append(path_value)
+            # Close and reopen so the caller can use it normally
+            f.close()
+            return open(path_value, "wb+")
+
+        # Make pysam write mode fail → exception → temp file should be cleaned up
+        class _FailWriteVF:
+            def __init__(self, path, mode=None, header=None):
+                self._path = path
+                self._mode = mode or "r"
+                if mode == "w":
+                    raise OSError("Write failed")
+                self._records = []
+                self.header = _make_vcf_header(contigs={"chr1": None}, samples=["S1"])
+
+            def __iter__(self):
+                return iter(self._records)
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                pass
+
+            def close(self):
+                pass
+
+        monkeypatch.setattr(integrate, "_sort_vcf", lambda *a, **k: None)
+        monkeypatch.setattr(integrate, "setup_logging", lambda *a, **k: None)
+        fake_pysam = types.SimpleNamespace(
+            VariantFile=_FailWriteVF,
+            tabix_index=lambda *a, **k: None,
+        )
+        monkeypatch.setattr(integrate, "pysam", fake_pysam)
+        monkeypatch.setattr(tempfile, "NamedTemporaryFile", track_named_temp)
+
+        gd_table_path = _make_gd_table_file(
+            tmp_path,
+            [{"chr": "chr1", "start": 1000, "end": 5000, "gd_id": "GD1",
+              "svtype": "DEL", "nahr": "yes", "cluster": "A", "bp1": "1", "bp2": "2"}],
+        )
+        gd_calls_path = _make_gd_calls_file(
+            tmp_path,
+            [{"chrom": "chr1", "pos": 1000, "end": 5000, "region_id": "GD1",
+              "svtype": "DEL", "samples": ["S1"]}],
+        )
+        ploidy_path = _make_ploidy_file(tmp_path, [("S1", {"chr1": 2})])
+        par_path = _make_par_file(tmp_path)
+        # Create a minimal VCF file so input validation passes
+        (tmp_path / "in.vcf.gz").write_text("# minimal VCF\n")
+        out_vcf = str(tmp_path / "out.vcf.gz")
+
+        with pytest.raises(OSError, match="Write"):
+            integrate.main([
+                "--vcf", str(tmp_path / "in.vcf.gz"),
+                "--gd-calls", gd_calls_path,
+                "--gd-table", gd_table_path,
+                "--par-bed", par_path,
+                "--ploidy-table", ploidy_path,
+                "--out-vcf", out_vcf,
+                "--temp-dir", str(tmp_path / "tmp"),
+            ])
+
+        # Verify temp file was cleaned up
+        for path in created_paths:
+            assert not os.path.exists(path), f"Temp file {path} was not cleaned up"
+
+    def test_no_temp_file_when_no_write(self, monkeypatch, tmp_path):
+        """When main() completes normally, no orphan temp files remain."""
+        import tempfile
+        import types
+        created_paths = []
+        orig_named_temp = tempfile.NamedTemporaryFile
+
+        def track_named_temp(*args, **kwargs):
+            f = orig_named_temp(*args, **kwargs)
+            path_value = f.name
+            created_paths.append(path_value)
+            f.close()
+            return open(path_value, "wb+")
+
+        written_records = []
+        _test_header = _make_vcf_header(contigs={"chr1": None}, samples=["S1"])
+
+        class _FakeVF:
+            def __init__(self, path, mode=None, header=None):
+                self._path = path
+                self._mode = mode or "r"
+                if mode == "w":
+                    self.header = header or _test_header
+                    self._written = written_records
+                else:
+                    self._records = []
+                    self.header = header or _test_header
+
+            def __iter__(self):
+                return iter(self._records)
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                pass
+
+            def close(self):
+                pass
+
+            def write(self, record):
+                written_records.append(record)
+
+        monkeypatch.setattr(integrate, "_sort_vcf", lambda *a, **k: None)
+        monkeypatch.setattr(integrate, "setup_logging", lambda *a, **k: None)
+        fake_pysam = types.SimpleNamespace(
+            VariantFile=_FakeVF,
+            tabix_index=lambda *a, **k: None,
+        )
+        monkeypatch.setattr(integrate, "pysam", fake_pysam)
+        monkeypatch.setattr(tempfile, "NamedTemporaryFile", track_named_temp)
+
+        gd_table_path = _make_gd_table_file(
+            tmp_path,
+            [{"chr": "chr1", "start": 1000, "end": 5000, "gd_id": "GD1",
+              "svtype": "DEL", "nahr": "yes", "cluster": "A", "bp1": "1", "bp2": "2"}],
+        )
+        gd_calls_path = _make_gd_calls_file(
+            tmp_path,
+            [{"chrom": "chr1", "pos": 1000, "end": 5000, "region_id": "GD1",
+              "svtype": "DEL", "samples": ["S1"]}],
+        )
+        ploidy_path = _make_ploidy_file(tmp_path, [("S1", {"chr1": 2})])
+        par_path = _make_par_file(tmp_path)
+        # Create a minimal VCF file so input validation passes
+        (tmp_path / "in.vcf.gz").write_text("# minimal VCF\n")
+        out_vcf = str(tmp_path / "out.vcf.gz")
+
+        # Normal completion — no exception
+        integrate.main([
+            "--vcf", str(tmp_path / "in.vcf.gz"),
+            "--gd-calls", gd_calls_path,
+            "--gd-table", gd_table_path,
+            "--par-bed", par_path,
+            "--ploidy-table", ploidy_path,
+            "--out-vcf", out_vcf,
+            "--temp-dir", str(tmp_path / "tmp"),
+        ])
+
+        # No temp files should remain
+        for path in created_paths:
+            assert not os.path.exists(path), f"Temp file {path} was not cleaned up"
+
+
+class TestBcftoolsSortBranchCoverage:
+    """Ensure the bcftools sort error path (line 476) is covered."""
+
+    def test_bcftools_sort_nonzero_exit_code(self, monkeypatch):
+        """Case 21.2: bcftools returns non-zero → RuntimeError raised.
+
+        Directly tests the `if proc.returncode != 0:` branch at line 476.
+        """
+        captured_cmd = []
+
+        class MockPopen:
+            def __init__(self, cmd, *a, **k):
+                captured_cmd.append(cmd)
+
+            def communicate(self):
+                return (b"", b"sort failed")
+
+            @property
+            def returncode(self):
+                return 2
+
+        monkeypatch.setattr(integrate.subprocess, "Popen", MockPopen)
+        with pytest.raises(RuntimeError, match="exit code: 2"):
+            integrate._sort_vcf("in.vcf.gz", "out.vcf.gz", "/tmp")
+
+        assert "bcftools" in captured_cmd[0]
+
+    def test_bcftools_sort_success(self, monkeypatch):
+        """bcftools returns 0 → no exception raised."""
+        class MockPopen:
+            def __init__(self, cmd, *a, **k):
+                pass
+
+            def communicate(self):
+                return (b"", b"")
+
+            @property
+            def returncode(self):
+                return 0
+
+        monkeypatch.setattr(integrate.subprocess, "Popen", MockPopen)
+        # Should not raise
+        integrate._sort_vcf("in.vcf.gz", "out.vcf.gz", "/tmp")
+
+
 

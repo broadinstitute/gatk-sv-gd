@@ -818,6 +818,8 @@ These require building a working `_FakeVF` that supports `__iter__`, `write`, `w
 | 139 | Write malformed PAR BED (non-numeric), call `_read_bed_to_trees`, assert `ValueError` | 21.7 |
 | 140 | Mock `tempfile.mkstemp` to succeed but `os.unlink` to raise → assert cleanup attempted | 21.8 |
 | 141 | Send `SIGINT` during `main()` → assert graceful exit | 21.10 |
+| 142 | Mock `subprocess.Popen` to return non-zero exit code → assert `RuntimeError` raised | 21.2 |
+| 143 | Verify temp file cleanup on exception via `NamedTemporaryFile` patch | 21.8-new |
 
 **Sub-step 8i: pysam-specific behavior (section 23)**
 
@@ -869,16 +871,25 @@ These require building a working `_FakeVF` that supports `__iter__`, `write`, `w
 | 5. _build_trees tests | 8 | 8 | ~5 min each |
 | 6. Genotype update edge cases | 4 | 4 | ~2 min each |
 | 7. VCF carrier edge cases | 3 | 3 | ~3 min each |
-| 8. Integration-level (hardest) | ~74 | ~94 | ~10 min each |
-| **Grand Total** | **~141 steps** | **~172 cases** | **~3–4 hours** |
+| 8. Integration-level (hardest) | ~76 | ~96 | ~10 min each |
+| **Grand Total** | **~143 steps** | **~174 cases** | **~3–4 hours** |
 
 ### Coverage target after all phases
 
 | Before | After |
 |--------|-------|
-| ✅ 97/280 (~35%) | ✅ ~269/280 (~96%) |
-| ❌ 172 | ❌ ~9 |
-| ⚠️ 11 | ⚠️ ~2 |
+| ✅ 97/280 (~35%) | ✅ 284/291 (~98%) |
+| ❌ 172 | ❌ 1 (unreachable branch 817→exit) |
+| ⚠️ 11 | ⚠️ 1 (scaling test 4.25) |
+
+### Current test statistics
+
+| Metric | Value |
+|--------|-------|
+| Total test functions | 375 |
+| integrate.py statements | 317, all covered |
+| integrate.py branches | 132, 131 covered (99%) |
+| One uncovered branch | `817→exit`: else-branch where `tmp_vcf_path` is unset (unreachable — always set before `try`) |
 
 ### Priority order recommendation
 
