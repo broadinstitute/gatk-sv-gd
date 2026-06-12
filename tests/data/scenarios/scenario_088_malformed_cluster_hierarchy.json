@@ -1,0 +1,105 @@
+{
+  "name": "malformed_cluster_hierarchy",
+  "description": "GD table has entries with inconsistent cluster/locus naming. Tests that the parser doesn't crash on malformed hierarchies.",
+  "vcf_header": {
+    "contigs": {
+      "chr1": null
+    },
+    "samples": [
+      "S1"
+    ]
+  },
+  "vcf_records": [
+    {
+      "chrom": "chr1",
+      "pos": 1001,
+      "stop": 5001,
+      "id": "var1",
+      "alts": [
+        "<DEL>"
+      ],
+      "info": {
+        "SVTYPE": "DEL"
+      },
+      "samples": {
+        "S1": {
+          "GT": [
+            0,
+            1
+          ],
+          "RD_CN": 1
+        }
+      }
+    }
+  ],
+  "gd_table_rows": [
+    {
+      "chr": "chr1",
+      "start": 1000,
+      "end": 5000,
+      "gd_id": "GD1",
+      "svtype": "DEL",
+      "nahr": "yes",
+      "cluster": "",
+      "bp1": "1",
+      "bp2": "2"
+    },
+    {
+      "chr": "chr1",
+      "start": 1000,
+      "end": 5000,
+      "gd_id": "GD2",
+      "svtype": "DEL",
+      "nahr": "yes",
+      "cluster": "   ",
+      "bp1": "1",
+      "bp2": "2"
+    },
+    {
+      "chr": "chr1",
+      "start": 1000,
+      "end": 5000,
+      "gd_id": "GD3",
+      "svtype": "DEL",
+      "nahr": "yes",
+      "cluster": "clusterA",
+      "bp1": "1",
+      "bp2": "2"
+    }
+  ],
+  "gd_calls": [
+    {
+      "chrom": "chr1",
+      "pos": 1000,
+      "end": 5000,
+      "region_id": "GD1",
+      "svtype": "DEL",
+      "samples": [
+        "S1"
+      ]
+    },
+    {
+      "chrom": "chr1",
+      "pos": 1000,
+      "end": 5000,
+      "region_id": "GD2",
+      "svtype": "DEL",
+      "samples": [
+        "S1"
+      ]
+    },
+    {
+      "chrom": "chr1",
+      "pos": 1000,
+      "end": 5000,
+      "region_id": "GD3",
+      "svtype": "DEL",
+      "samples": [
+        "S1"
+      ]
+    }
+  ],
+  "expected": {
+    "min_written": 1
+  }
+}

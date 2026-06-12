@@ -1,0 +1,108 @@
+{
+  "name": "weird_sample_names",
+  "description": "Sample names with spaces, special characters, and numbers. Tests that sample-identity logic handles arbitrary names.",
+  "vcf_header": {
+    "contigs": {
+      "chr1": null
+    },
+    "samples": [
+      "Sample 1",
+      "Sample-2",
+      "sample_3",
+      "S4"
+    ]
+  },
+  "vcf_records": [
+    {
+      "chrom": "chr1",
+      "pos": 1001,
+      "stop": 5001,
+      "id": "var1",
+      "alts": [
+        "<DEL>"
+      ],
+      "info": {
+        "SVTYPE": "DEL"
+      },
+      "samples": {
+        "Sample 1": {
+          "GT": [
+            0,
+            1
+          ],
+          "RD_CN": 1
+        },
+        "Sample-2": {
+          "GT": [
+            0,
+            0
+          ]
+        },
+        "sample_3": {
+          "GT": [
+            0,
+            0
+          ]
+        },
+        "S4": {
+          "GT": [
+            0,
+            0
+          ]
+        }
+      }
+    }
+  ],
+  "gd_table_rows": [
+    {
+      "chr": "chr1",
+      "start": 1000,
+      "end": 5000,
+      "gd_id": "GD_A",
+      "svtype": "DEL",
+      "nahr": "yes",
+      "cluster": "clusterA",
+      "bp1": "1",
+      "bp2": "2"
+    },
+    {
+      "chr": "chr1",
+      "start": 1000,
+      "end": 5000,
+      "gd_id": "GD_B",
+      "svtype": "DEL",
+      "nahr": "yes",
+      "cluster": "clusterA",
+      "bp1": "1",
+      "bp2": "2"
+    }
+  ],
+  "gd_calls": [
+    {
+      "chrom": "chr1",
+      "pos": 1000,
+      "end": 5000,
+      "region_id": "GD_A",
+      "svtype": "DEL",
+      "samples": [
+        "Sample 1",
+        "Sample-2",
+        "sample_3",
+        "S4"
+      ]
+    },
+    {
+      "chrom": "chr1",
+      "pos": 1000,
+      "end": 5000,
+      "region_id": "GD_B",
+      "svtype": "DEL",
+      "samples": [
+        "Sample 1"
+      ]
+    }
+  ],
+  "expected": {
+    "matched_id": "GD_B"
+  }
+}

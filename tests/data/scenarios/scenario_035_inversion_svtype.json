@@ -1,0 +1,62 @@
+{
+  "name": "inversion_svtype",
+  "description": "GD entry with svtype='INV' (neither DEL nor DUP). RD_CN should NOT be set for carriers.",
+  "vcf_header": {
+    "contigs": {
+      "chr1": null
+    },
+    "samples": [
+      "S1"
+    ]
+  },
+  "vcf_records": [
+    {
+      "chrom": "chr1",
+      "pos": 1001,
+      "stop": 5001,
+      "id": "var1",
+      "alts": [
+        "<DUP>"
+      ],
+      "info": {
+        "SVTYPE": "INV"
+      },
+      "samples": {
+        "S1": {
+          "GT": [
+            0,
+            0
+          ]
+        }
+      }
+    }
+  ],
+  "gd_table_rows": [
+    {
+      "chr": "chr1",
+      "start": 1000,
+      "end": 5000,
+      "gd_id": "GD_INV1",
+      "svtype": "INV",
+      "nahr": "yes",
+      "cluster": "clusterA",
+      "bp1": "1",
+      "bp2": "2"
+    }
+  ],
+  "gd_calls": [
+    {
+      "chrom": "chr1",
+      "pos": 1000,
+      "end": 5000,
+      "region_id": "GD_INV1",
+      "svtype": "INV",
+      "samples": [
+        "S1"
+      ]
+    }
+  ],
+  "expected": {
+    "written_count": 2
+  }
+}

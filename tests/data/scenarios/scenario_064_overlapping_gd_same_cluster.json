@@ -1,0 +1,115 @@
+{
+  "name": "overlapping_gd_same_cluster",
+  "description": "Multiple GD entries at the exact same coords in the same cluster. Tests that the interval tree returns all matches and tiebreaking chooses the right one.",
+  "vcf_header": {
+    "contigs": {
+      "chr1": null
+    },
+    "samples": [
+      "S1",
+      "S2",
+      "S3"
+    ]
+  },
+  "vcf_records": [
+    {
+      "chrom": "chr1",
+      "pos": 1001,
+      "stop": 5001,
+      "id": "var1",
+      "alts": [
+        "<DEL>"
+      ],
+      "info": {
+        "SVTYPE": "DEL"
+      },
+      "samples": {
+        "S1": {
+          "GT": [
+            0,
+            1
+          ],
+          "RD_CN": 1
+        },
+        "S2": {
+          "GT": [
+            0,
+            1
+          ],
+          "RD_CN": 1
+        }
+      }
+    }
+  ],
+  "gd_table_rows": [
+    {
+      "chr": "chr1",
+      "start": 1000,
+      "end": 5000,
+      "gd_id": "GD_A",
+      "svtype": "DEL",
+      "nahr": "yes",
+      "cluster": "clusterA",
+      "bp1": "1",
+      "bp2": "2"
+    },
+    {
+      "chr": "chr1",
+      "start": 1000,
+      "end": 5000,
+      "gd_id": "GD_B",
+      "svtype": "DEL",
+      "nahr": "yes",
+      "cluster": "clusterA",
+      "bp1": "3",
+      "bp2": "4"
+    },
+    {
+      "chr": "chr1",
+      "start": 1000,
+      "end": 5000,
+      "gd_id": "GD_C",
+      "svtype": "DEL",
+      "nahr": "yes",
+      "cluster": "clusterA",
+      "bp1": "5",
+      "bp2": "6"
+    }
+  ],
+  "gd_calls": [
+    {
+      "chrom": "chr1",
+      "pos": 1000,
+      "end": 5000,
+      "region_id": "GD_A",
+      "svtype": "DEL",
+      "samples": [
+        "S1",
+        "S2"
+      ]
+    },
+    {
+      "chrom": "chr1",
+      "pos": 1000,
+      "end": 5000,
+      "region_id": "GD_B",
+      "svtype": "DEL",
+      "samples": [
+        "S1"
+      ]
+    },
+    {
+      "chrom": "chr1",
+      "pos": 1000,
+      "end": 5000,
+      "region_id": "GD_C",
+      "svtype": "DEL",
+      "samples": [
+        "S3"
+      ]
+    }
+  ],
+  "expected": {
+    "matched_id": "GD_A"
+  }
+}

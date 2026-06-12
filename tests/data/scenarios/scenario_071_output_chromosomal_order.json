@@ -1,0 +1,84 @@
+{
+  "name": "output_chromosomal_order",
+  "description": "VCF records on multiple chromosomes in non-sorted order. Output should be in chromosomal order.",
+  "vcf_header": {
+    "contigs": {
+      "chr2": null,
+      "chr1": null,
+      "chr3": null
+    },
+    "samples": [
+      "S1"
+    ]
+  },
+  "vcf_records": [
+    {
+      "chrom": "chr3",
+      "pos": 1001,
+      "stop": 5001,
+      "id": "v3",
+      "alts": [
+        "<DEL>"
+      ],
+      "info": {
+        "SVTYPE": "DEL"
+      },
+      "samples": {
+        "S1": {
+          "GT": [
+            0,
+            1
+          ],
+          "RD_CN": 1
+        }
+      }
+    },
+    {
+      "chrom": "chr1",
+      "pos": 1001,
+      "stop": 5001,
+      "id": "v1",
+      "alts": [
+        "<DEL>"
+      ],
+      "info": {
+        "SVTYPE": "DEL"
+      },
+      "samples": {
+        "S1": {
+          "GT": [
+            0,
+            1
+          ],
+          "RD_CN": 1
+        }
+      }
+    },
+    {
+      "chrom": "chr2",
+      "pos": 1001,
+      "stop": 5001,
+      "id": "v2",
+      "alts": [
+        "<DEL>"
+      ],
+      "info": {
+        "SVTYPE": "DEL"
+      },
+      "samples": {
+        "S1": {
+          "GT": [
+            0,
+            1
+          ],
+          "RD_CN": 1
+        }
+      }
+    }
+  ],
+  "gd_table_rows": [],
+  "gd_calls": [],
+  "expected": {
+    "written_count": 3
+  }
+}

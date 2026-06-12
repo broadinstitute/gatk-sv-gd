@@ -1,0 +1,153 @@
+{
+  "name": "carrier_overlap_matrix",
+  "description": "4 NAHR regions, 4 VCF carriers (S1-S4). Each GD entry has a different subset of carriers. Tests sample_overlap computation with varying set sizes.",
+  "vcf_header": {
+    "contigs": {
+      "chr1": null
+    },
+    "samples": [
+      "S1",
+      "S2",
+      "S3",
+      "S4"
+    ]
+  },
+  "vcf_records": [
+    {
+      "chrom": "chr1",
+      "pos": 1001,
+      "stop": 5001,
+      "id": "var1",
+      "alts": [
+        "<DEL>"
+      ],
+      "info": {
+        "SVTYPE": "DEL"
+      },
+      "samples": {
+        "S1": {
+          "GT": [
+            0,
+            1
+          ],
+          "RD_CN": 1
+        },
+        "S2": {
+          "GT": [
+            0,
+            1
+          ],
+          "RD_CN": 1
+        },
+        "S3": {
+          "GT": [
+            0,
+            0
+          ]
+        },
+        "S4": {
+          "GT": [
+            0,
+            0
+          ]
+        }
+      }
+    }
+  ],
+  "gd_table_rows": [
+    {
+      "chr": "chr1",
+      "start": 1000,
+      "end": 5000,
+      "gd_id": "GD_ALL4",
+      "svtype": "DEL",
+      "nahr": "yes",
+      "cluster": "clusterA",
+      "bp1": "1",
+      "bp2": "2"
+    },
+    {
+      "chr": "chr1",
+      "start": 1000,
+      "end": 5000,
+      "gd_id": "GD_S1",
+      "svtype": "DEL",
+      "nahr": "yes",
+      "cluster": "clusterA",
+      "bp1": "1",
+      "bp2": "2"
+    },
+    {
+      "chr": "chr1",
+      "start": 1000,
+      "end": 5000,
+      "gd_id": "GD_S1S2",
+      "svtype": "DEL",
+      "nahr": "yes",
+      "cluster": "clusterA",
+      "bp1": "1",
+      "bp2": "2"
+    },
+    {
+      "chr": "chr1",
+      "start": 1000,
+      "end": 5000,
+      "gd_id": "GD_S1S3",
+      "svtype": "DEL",
+      "nahr": "yes",
+      "cluster": "clusterA",
+      "bp1": "1",
+      "bp2": "2"
+    }
+  ],
+  "gd_calls": [
+    {
+      "chrom": "chr1",
+      "pos": 1000,
+      "end": 5000,
+      "region_id": "GD_ALL4",
+      "svtype": "DEL",
+      "samples": [
+        "S1",
+        "S2",
+        "S3",
+        "S4"
+      ]
+    },
+    {
+      "chrom": "chr1",
+      "pos": 1000,
+      "end": 5000,
+      "region_id": "GD_S1",
+      "svtype": "DEL",
+      "samples": [
+        "S1"
+      ]
+    },
+    {
+      "chrom": "chr1",
+      "pos": 1000,
+      "end": 5000,
+      "region_id": "GD_S1S2",
+      "svtype": "DEL",
+      "samples": [
+        "S1",
+        "S2"
+      ]
+    },
+    {
+      "chrom": "chr1",
+      "pos": 1000,
+      "end": 5000,
+      "region_id": "GD_S1S3",
+      "svtype": "DEL",
+      "samples": [
+        "S1",
+        "S3"
+      ]
+    }
+  ],
+  "expected": {
+    "matched_id": "GD_S1S2"
+  }
+}

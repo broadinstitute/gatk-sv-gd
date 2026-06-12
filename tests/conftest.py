@@ -1,4 +1,5 @@
 from pathlib import Path
+import pytest
 import sys
 import types
 
@@ -15,26 +16,44 @@ def _install_test_stub_modules():
         sys.modules["tqdm"] = tqdm
 
     if "intervaltree" not in sys.modules:
-        intervaltree = types.ModuleType("intervaltree")
+        try:
+            import intervaltree
+        except ImportError:
+            intervaltree = types.ModuleType("intervaltree")
 
-        class _StubIntervalTree:
-            def __init__(self, *args, **kwargs):
-                pass
+            class _StubInterval:
+                def __init__(self, begin, end, data=None):
+                    self.begin = begin
+                    self.end = end
+                    self.data = data
 
-            def addi(self, *args, **kwargs):
-                return None
+            class _StubIntervalTree:
+                def __init__(self, *args, **kwargs):
+                    self._intervals = []
 
-            def merge_overlaps(self, *args, **kwargs):
-                return None
+                def addi(self, start, end, data=None):
+                    self._intervals.append(_StubInterval(start, end, data))
 
-            def overlap(self, *args, **kwargs):
-                return []
+                def merge_overlaps(self, *args, **kwargs):
+                    pass
 
-            def __len__(self):
-                return 0
+                def overlap(self, start, end):
+                    return [
+                        iv for iv in self._intervals
+                        if iv.begin < end and start < iv.end
+                    ]
 
-        intervaltree.IntervalTree = _StubIntervalTree
-        sys.modules["intervaltree"] = intervaltree
+                def __len__(self):
+                    return len(self._intervals)
+
+                def __iter__(self):
+                    return iter(self._intervals)
+
+                def __contains__(self, key):
+                    return key in [iv.data for iv in self._intervals]
+
+            intervaltree.IntervalTree = _StubIntervalTree
+            sys.modules["intervaltree"] = intervaltree
 
     if "pysam" not in sys.modules:
         pysam = types.ModuleType("pysam")
@@ -148,3 +167,36 @@ def _install_test_stub_modules():
 
 
 _install_test_stub_modules()
+
+
+# ── Scenario data loader ─────────────────────────────────────────────
+
+
+@pytest.fixture
+def load_scenario():
+    """Load a scenario JSON from ``tests/data/scenarios/``.
+
+    Usage in tests::
+
+        def test_foo(load_scenario):
+            scenario = load_scenario("scenario_001_twenty_overlapping_nahr")
+            assert scenario["name"] == "twenty_overlapping_nahr"
+
+    The fixture accepts either a full scenario filename (without directory)
+    or just the ``scenario_NNN_name.json`` stem.
+    """
+    scenarios_dir = Path(__file__).resolve().parents[1] / "tests" / "data" / "scenarios"
+
+    def _load_scenario(name_or_id):
+        path = scenarios_dir / name_or_id
+        if not path.exists():
+            raise FileNotFoundError(
+                f"Scenario not found: {path}\n"
+                f"Tried: {name_or_id}\n"
+                f"Available: {sorted(p.name for p in scenarios_dir.glob('scenario_*.json'))[:5]}..."
+            )
+        import json
+        with open(path) as f:
+            return json.load(f)
+
+    return _load_scenario

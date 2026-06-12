@@ -1,0 +1,120 @@
+{
+  "name": "par_and_chry_together",
+  "description": "chrX record in PAR region (ecn should be 2 regardless of ploidy). chrY record with ploidy=1 (ecn=1). Both with carriers.",
+  "vcf_header": {
+    "contigs": {
+      "chrX": null,
+      "chrY": null
+    },
+    "samples": [
+      "S1"
+    ]
+  },
+  "vcf_records": [
+    {
+      "chrom": "chrX",
+      "pos": 1001,
+      "stop": 5001,
+      "id": "vX",
+      "alts": [
+        "<DEL>"
+      ],
+      "info": {
+        "SVTYPE": "DEL"
+      },
+      "samples": {
+        "S1": {
+          "GT": [
+            0,
+            0
+          ]
+        }
+      }
+    },
+    {
+      "chrom": "chrY",
+      "pos": 1001,
+      "stop": 5001,
+      "id": "vY",
+      "alts": [
+        "<DEL>"
+      ],
+      "info": {
+        "SVTYPE": "DEL"
+      },
+      "samples": {
+        "S1": {
+          "GT": [
+            0,
+            0
+          ]
+        }
+      }
+    }
+  ],
+  "gd_table_rows": [
+    {
+      "chr": "chrX",
+      "start": 1000,
+      "end": 5000,
+      "gd_id": "GD_X",
+      "svtype": "DEL",
+      "nahr": "yes",
+      "cluster": "clusterX",
+      "bp1": "1",
+      "bp2": "2"
+    },
+    {
+      "chr": "chrY",
+      "start": 1000,
+      "end": 5000,
+      "gd_id": "GD_Y",
+      "svtype": "DEL",
+      "nahr": "yes",
+      "cluster": "clusterY",
+      "bp1": "1",
+      "bp2": "2"
+    }
+  ],
+  "gd_calls": [
+    {
+      "chrom": "chrX",
+      "pos": 1000,
+      "end": 5000,
+      "region_id": "GD_X",
+      "svtype": "DEL",
+      "samples": [
+        "S1"
+      ]
+    },
+    {
+      "chrom": "chrY",
+      "pos": 1000,
+      "end": 5000,
+      "region_id": "GD_Y",
+      "svtype": "DEL",
+      "samples": [
+        "S1"
+      ]
+    }
+  ],
+  "ploidy": [
+    [
+      "S1",
+      {
+        "chrX": 2,
+        "chrY": 1
+      }
+    ]
+  ],
+  "par_intervals": [
+    [
+      "chrX",
+      0,
+      27000000
+    ]
+  ],
+  "expected": {
+    "written_count": 2
+  }
+}

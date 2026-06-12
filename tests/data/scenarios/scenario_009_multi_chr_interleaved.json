@@ -1,0 +1,242 @@
+{
+  "name": "multi_chr_interleaved",
+  "description": "VCF records on chr1, chr2, chr3, chrX, chrY. GD entries on all five chromosomes. Each must match on its own. Uses unique clusters per chromosome to avoid GDTable bug that groups multi-chrom entries into the first chromosome's tree.",
+  "vcf_header": {
+    "contigs": {
+      "chr1": null,
+      "chr2": null,
+      "chr3": null,
+      "chrX": null,
+      "chrY": null
+    },
+    "samples": [
+      "S1"
+    ]
+  },
+  "vcf_records": [
+    {
+      "chrom": "chr1",
+      "pos": 1001,
+      "stop": 5001,
+      "id": "v1",
+      "alts": [
+        "<DEL>"
+      ],
+      "info": {
+        "SVTYPE": "DEL"
+      },
+      "samples": {
+        "S1": {
+          "GT": [
+            0,
+            1
+          ],
+          "RD_CN": 1
+        }
+      }
+    },
+    {
+      "chrom": "chr2",
+      "pos": 2001,
+      "stop": 6001,
+      "id": "v2",
+      "alts": [
+        "<DEL>"
+      ],
+      "info": {
+        "SVTYPE": "DEL"
+      },
+      "samples": {
+        "S1": {
+          "GT": [
+            0,
+            1
+          ],
+          "RD_CN": 1
+        }
+      }
+    },
+    {
+      "chrom": "chr3",
+      "pos": 3001,
+      "stop": 7001,
+      "id": "v3",
+      "alts": [
+        "<DUP>"
+      ],
+      "info": {
+        "SVTYPE": "DUP"
+      },
+      "samples": {
+        "S1": {
+          "GT": [
+            0,
+            1
+          ],
+          "RD_CN": 3
+        }
+      }
+    },
+    {
+      "chrom": "chrX",
+      "pos": 4001,
+      "stop": 8001,
+      "id": "v4",
+      "alts": [
+        "<DEL>"
+      ],
+      "info": {
+        "SVTYPE": "DEL"
+      },
+      "samples": {
+        "S1": {
+          "GT": [
+            0,
+            1
+          ],
+          "RD_CN": 1
+        }
+      }
+    },
+    {
+      "chrom": "chrY",
+      "pos": 5001,
+      "stop": 9001,
+      "id": "v5",
+      "alts": [
+        "<DEL>"
+      ],
+      "info": {
+        "SVTYPE": "DEL"
+      },
+      "samples": {
+        "S1": {
+          "GT": [
+            0,
+            1
+          ],
+          "RD_CN": 1
+        }
+      }
+    }
+  ],
+  "gd_table_rows": [
+    {
+      "chr": "chr1",
+      "start": 1000,
+      "end": 5000,
+      "gd_id": "GD_chr1",
+      "svtype": "DEL",
+      "nahr": "yes",
+      "cluster": "cluster_chr1",
+      "bp1": "1",
+      "bp2": "2"
+    },
+    {
+      "chr": "chr2",
+      "start": 2000,
+      "end": 6000,
+      "gd_id": "GD_chr2",
+      "svtype": "DEL",
+      "nahr": "yes",
+      "cluster": "cluster_chr2",
+      "bp1": "1",
+      "bp2": "2"
+    },
+    {
+      "chr": "chr3",
+      "start": 3000,
+      "end": 7000,
+      "gd_id": "GD_chr3",
+      "svtype": "DUP",
+      "nahr": "yes",
+      "cluster": "cluster_chr3",
+      "bp1": "1",
+      "bp2": "2"
+    },
+    {
+      "chr": "chrX",
+      "start": 4000,
+      "end": 8000,
+      "gd_id": "GD_chrX",
+      "svtype": "DEL",
+      "nahr": "yes",
+      "cluster": "cluster_chrX",
+      "bp1": "1",
+      "bp2": "2"
+    },
+    {
+      "chr": "chrY",
+      "start": 5000,
+      "end": 9000,
+      "gd_id": "GD_chrY",
+      "svtype": "DEL",
+      "nahr": "yes",
+      "cluster": "cluster_chrY",
+      "bp1": "1",
+      "bp2": "2"
+    }
+  ],
+  "gd_calls": [
+    {
+      "chrom": "chr1",
+      "pos": 1000,
+      "end": 5000,
+      "region_id": "GD_chr1",
+      "svtype": "DEL",
+      "samples": [
+        "S1"
+      ]
+    },
+    {
+      "chrom": "chr2",
+      "pos": 2000,
+      "end": 6000,
+      "region_id": "GD_chr2",
+      "svtype": "DEL",
+      "samples": [
+        "S1"
+      ]
+    },
+    {
+      "chrom": "chr3",
+      "pos": 3000,
+      "end": 7000,
+      "region_id": "GD_chr3",
+      "svtype": "DUP",
+      "samples": [
+        "S1"
+      ]
+    },
+    {
+      "chrom": "chrX",
+      "pos": 4000,
+      "end": 8000,
+      "region_id": "GD_chrX",
+      "svtype": "DEL",
+      "samples": [
+        "S1"
+      ]
+    },
+    {
+      "chrom": "chrY",
+      "pos": 5000,
+      "end": 9000,
+      "region_id": "GD_chrY",
+      "svtype": "DEL",
+      "samples": [
+        "S1"
+      ]
+    }
+  ],
+  "expected": {
+    "written_count": 5,
+    "gd_ids": [
+      "GD_chr1",
+      "GD_chr2",
+      "GD_chr3",
+      "GD_chrX",
+      "GD_chrY"
+    ]
+  }
+}

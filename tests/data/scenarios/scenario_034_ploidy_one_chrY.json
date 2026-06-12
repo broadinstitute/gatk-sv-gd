@@ -1,0 +1,70 @@
+{
+  "name": "ploidy_one_chrY",
+  "description": "chrY with ploidy=1. DEL carrier → ecn=0 → GT=(None,None), RD_CN=0. Tests the ecn=0 branch.",
+  "vcf_header": {
+    "contigs": {
+      "chrY": null
+    },
+    "samples": [
+      "S1"
+    ]
+  },
+  "vcf_records": [
+    {
+      "chrom": "chrY",
+      "pos": 1001,
+      "stop": 5001,
+      "id": "var1",
+      "alts": [
+        "<DEL>"
+      ],
+      "info": {
+        "SVTYPE": "DEL"
+      },
+      "samples": {
+        "S1": {
+          "GT": [
+            0,
+            0
+          ]
+        }
+      }
+    }
+  ],
+  "gd_table_rows": [
+    {
+      "chr": "chrY",
+      "start": 1000,
+      "end": 5000,
+      "gd_id": "GD_Y1",
+      "svtype": "DEL",
+      "nahr": "yes",
+      "cluster": "clusterY",
+      "bp1": "1",
+      "bp2": "2"
+    }
+  ],
+  "gd_calls": [
+    {
+      "chrom": "chrY",
+      "pos": 1000,
+      "end": 5000,
+      "region_id": "GD_Y1",
+      "svtype": "DEL",
+      "samples": [
+        "S1"
+      ]
+    }
+  ],
+  "ploidy": [
+    [
+      "S1",
+      {
+        "chrY": 1
+      }
+    ]
+  ],
+  "expected": {
+    "written_count": 1
+  }
+}

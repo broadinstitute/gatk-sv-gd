@@ -1,0 +1,42 @@
+{
+  "name": "dup_novel_emission",
+  "description": "No VCF records. Only DUP GD entries with carriers. Should emit novel DUP records with correct svtype.",
+  "vcf_header": {
+    "contigs": {
+      "chr1": null
+    },
+    "samples": [
+      "S1"
+    ]
+  },
+  "vcf_records": [],
+  "gd_table_rows": [
+    {
+      "chr": "chr1",
+      "start": 1000,
+      "end": 5000,
+      "gd_id": "GD_DUP1",
+      "svtype": "DUP",
+      "nahr": "yes",
+      "cluster": "clusterA",
+      "bp1": "1",
+      "bp2": "2"
+    }
+  ],
+  "gd_calls": [
+    {
+      "chrom": "chr1",
+      "pos": 1000,
+      "end": 5000,
+      "region_id": "GD_DUP1",
+      "svtype": "DUP",
+      "samples": [
+        "S1"
+      ]
+    }
+  ],
+  "expected": {
+    "written_count": 1,
+    "svtype": "DUP"
+  }
+}

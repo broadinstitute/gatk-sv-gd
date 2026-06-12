@@ -1,0 +1,80 @@
+{
+  "name": "genotype_reconciliation_cascade",
+  "description": "VCF record has mixed genotypes: S1=het(0,1), S2=hom-ref(0,0), S3=no-call(None,None). GD entry has carriers S1 and S2. S2 should become het; S3 (no carrier) stays hom-ref; S1 stays het. At least one carrier remains → record written.",
+  "vcf_header": {
+    "contigs": {
+      "chr1": null
+    },
+    "samples": [
+      "S1",
+      "S2",
+      "S3"
+    ]
+  },
+  "vcf_records": [
+    {
+      "chrom": "chr1",
+      "pos": 1001,
+      "stop": 5001,
+      "id": "var1",
+      "alts": [
+        "<DEL>"
+      ],
+      "info": {
+        "SVTYPE": "DEL"
+      },
+      "samples": {
+        "S1": {
+          "GT": [
+            0,
+            1
+          ],
+          "RD_CN": 1
+        },
+        "S2": {
+          "GT": [
+            0,
+            0
+          ],
+          "RD_CN": 2
+        },
+        "S3": {
+          "GT": [
+            null,
+            null
+          ]
+        }
+      }
+    }
+  ],
+  "gd_table_rows": [
+    {
+      "chr": "chr1",
+      "start": 1000,
+      "end": 5000,
+      "gd_id": "GD1",
+      "svtype": "DEL",
+      "nahr": "yes",
+      "cluster": "clusterA",
+      "bp1": "1",
+      "bp2": "2"
+    }
+  ],
+  "gd_calls": [
+    {
+      "chrom": "chr1",
+      "pos": 1000,
+      "end": 5000,
+      "region_id": "GD1",
+      "svtype": "DEL",
+      "samples": [
+        "S1",
+        "S2"
+      ]
+    }
+  ],
+  "expected": {
+    "written_count": 1,
+    "matched_id": "GD1"
+  }
+}

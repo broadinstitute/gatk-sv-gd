@@ -1,0 +1,52 @@
+{
+  "name": "non_nahr_no_gd_calls",
+  "description": "Non-NAHR GD entry overlaps variant (Phase 1 annotates) but has no gd_calls entry → no novel record emitted. Only the VCF record passes through.",
+  "vcf_header": {
+    "contigs": {
+      "chr1": null
+    },
+    "samples": [
+      "S1"
+    ]
+  },
+  "vcf_records": [
+    {
+      "chrom": "chr1",
+      "pos": 1501,
+      "stop": 3501,
+      "id": "var1",
+      "alts": [
+        "<DEL>"
+      ],
+      "info": {
+        "SVTYPE": "DEL"
+      },
+      "samples": {
+        "S1": {
+          "GT": [
+            0,
+            1
+          ],
+          "RD_CN": 1
+        }
+      }
+    }
+  ],
+  "gd_table_rows": [
+    {
+      "chr": "chr1",
+      "start": 1000,
+      "end": 2000,
+      "gd_id": "GD_NNAHR",
+      "svtype": "DEL",
+      "nahr": "no",
+      "cluster": "clusterX",
+      "bp1": "1",
+      "bp2": "2"
+    }
+  ],
+  "gd_calls": [],
+  "expected": {
+    "written_count": 1
+  }
+}

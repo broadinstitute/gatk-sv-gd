@@ -1,0 +1,41 @@
+{
+  "name": "contig_missing_from_header",
+  "description": "GD entry on chrM but chrM is not in VCF header. Novel record emission should skip this entry.",
+  "vcf_header": {
+    "contigs": {
+      "chr1": null
+    },
+    "samples": [
+      "S1"
+    ]
+  },
+  "vcf_records": [],
+  "gd_table_rows": [
+    {
+      "chr": "chrM",
+      "start": 1000,
+      "end": 5000,
+      "gd_id": "GD_M",
+      "svtype": "DEL",
+      "nahr": "yes",
+      "cluster": "clusterM",
+      "bp1": "1",
+      "bp2": "2"
+    }
+  ],
+  "gd_calls": [
+    {
+      "chrom": "chrM",
+      "pos": 1000,
+      "end": 5000,
+      "region_id": "GD_M",
+      "svtype": "DEL",
+      "samples": [
+        "S1"
+      ]
+    }
+  ],
+  "expected": {
+    "written_count": 0
+  }
+}

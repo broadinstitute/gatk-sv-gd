@@ -1,0 +1,146 @@
+{
+  "name": "variant_contains_all_regions",
+  "description": "One giant VCF variant (0-10000) contains 10 NAHR regions of varying sizes. All have same carriers. Smallest wins.",
+  "vcf_header": {
+    "contigs": {
+      "chr1": null
+    },
+    "samples": [
+      "S1"
+    ]
+  },
+  "vcf_records": [
+    {
+      "chrom": "chr1",
+      "pos": 1,
+      "stop": 10001,
+      "id": "giant_var",
+      "alts": [
+        "<DEL>"
+      ],
+      "info": {
+        "SVTYPE": "DEL"
+      },
+      "samples": {
+        "S1": {
+          "GT": [
+            0,
+            0
+          ]
+        }
+      }
+    }
+  ],
+  "gd_table_rows": [
+    {
+      "chr": "chr1",
+      "start": 0,
+      "end": 10000,
+      "gd_id": "GD_FULL",
+      "svtype": "DEL",
+      "nahr": "yes",
+      "cluster": "clusterA",
+      "bp1": "1",
+      "bp2": "2"
+    },
+    {
+      "chr": "chr1",
+      "start": 500,
+      "end": 9500,
+      "gd_id": "GD_LARGE",
+      "svtype": "DEL",
+      "nahr": "yes",
+      "cluster": "clusterA",
+      "bp1": "1",
+      "bp2": "2"
+    },
+    {
+      "chr": "chr1",
+      "start": 2000,
+      "end": 8000,
+      "gd_id": "GD_MED",
+      "svtype": "DEL",
+      "nahr": "yes",
+      "cluster": "clusterA",
+      "bp1": "1",
+      "bp2": "2"
+    },
+    {
+      "chr": "chr1",
+      "start": 4000,
+      "end": 6000,
+      "gd_id": "GD_SMALL",
+      "svtype": "DEL",
+      "nahr": "yes",
+      "cluster": "clusterA",
+      "bp1": "1",
+      "bp2": "2"
+    },
+    {
+      "chr": "chr1",
+      "start": 4500,
+      "end": 5500,
+      "gd_id": "GD_TINY",
+      "svtype": "DEL",
+      "nahr": "yes",
+      "cluster": "clusterA",
+      "bp1": "1",
+      "bp2": "2"
+    }
+  ],
+  "gd_calls": [
+    {
+      "chrom": "chr1",
+      "pos": 0,
+      "end": 10000,
+      "region_id": "GD_FULL",
+      "svtype": "DEL",
+      "samples": [
+        "S1"
+      ]
+    },
+    {
+      "chrom": "chr1",
+      "pos": 500,
+      "end": 9500,
+      "region_id": "GD_LARGE",
+      "svtype": "DEL",
+      "samples": [
+        "S1"
+      ]
+    },
+    {
+      "chrom": "chr1",
+      "pos": 2000,
+      "end": 8000,
+      "region_id": "GD_MED",
+      "svtype": "DEL",
+      "samples": [
+        "S1"
+      ]
+    },
+    {
+      "chrom": "chr1",
+      "pos": 4000,
+      "end": 6000,
+      "region_id": "GD_SMALL",
+      "svtype": "DEL",
+      "samples": [
+        "S1"
+      ]
+    },
+    {
+      "chrom": "chr1",
+      "pos": 4500,
+      "end": 5500,
+      "region_id": "GD_TINY",
+      "svtype": "DEL",
+      "samples": [
+        "S1"
+      ]
+    }
+  ],
+  "expected": {
+    "matched_id": "GD_TINY"
+  }
+}

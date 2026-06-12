@@ -1,0 +1,1186 @@
+{
+  "name": "large_cohort_100_samples",
+  "description": "100-sample VCF with 3 competing NAHR regions. Carriers spread across samples: GD1 has SAMPLE_051-070 (20 carriers, highest overlap wins), GD2 has SAMPLE_071-080 (10), GD3 has SAMPLE_051-060 (10). Sample overlap tiebreaker selects GD1. VCF record written with GD1 annotation.",
+  "vcf_header": {
+    "contigs": {
+      "chr1": null
+    },
+    "samples": [
+      "SAMPLE_000",
+      "SAMPLE_001",
+      "SAMPLE_002",
+      "SAMPLE_003",
+      "SAMPLE_004",
+      "SAMPLE_005",
+      "SAMPLE_006",
+      "SAMPLE_007",
+      "SAMPLE_008",
+      "SAMPLE_009",
+      "SAMPLE_010",
+      "SAMPLE_011",
+      "SAMPLE_012",
+      "SAMPLE_013",
+      "SAMPLE_014",
+      "SAMPLE_015",
+      "SAMPLE_016",
+      "SAMPLE_017",
+      "SAMPLE_018",
+      "SAMPLE_019",
+      "SAMPLE_020",
+      "SAMPLE_021",
+      "SAMPLE_022",
+      "SAMPLE_023",
+      "SAMPLE_024",
+      "SAMPLE_025",
+      "SAMPLE_026",
+      "SAMPLE_027",
+      "SAMPLE_028",
+      "SAMPLE_029",
+      "SAMPLE_030",
+      "SAMPLE_031",
+      "SAMPLE_032",
+      "SAMPLE_033",
+      "SAMPLE_034",
+      "SAMPLE_035",
+      "SAMPLE_036",
+      "SAMPLE_037",
+      "SAMPLE_038",
+      "SAMPLE_039",
+      "SAMPLE_040",
+      "SAMPLE_041",
+      "SAMPLE_042",
+      "SAMPLE_043",
+      "SAMPLE_044",
+      "SAMPLE_045",
+      "SAMPLE_046",
+      "SAMPLE_047",
+      "SAMPLE_048",
+      "SAMPLE_049",
+      "SAMPLE_050",
+      "SAMPLE_051",
+      "SAMPLE_052",
+      "SAMPLE_053",
+      "SAMPLE_054",
+      "SAMPLE_055",
+      "SAMPLE_056",
+      "SAMPLE_057",
+      "SAMPLE_058",
+      "SAMPLE_059",
+      "SAMPLE_060",
+      "SAMPLE_061",
+      "SAMPLE_062",
+      "SAMPLE_063",
+      "SAMPLE_064",
+      "SAMPLE_065",
+      "SAMPLE_066",
+      "SAMPLE_067",
+      "SAMPLE_068",
+      "SAMPLE_069",
+      "SAMPLE_070",
+      "SAMPLE_071",
+      "SAMPLE_072",
+      "SAMPLE_073",
+      "SAMPLE_074",
+      "SAMPLE_075",
+      "SAMPLE_076",
+      "SAMPLE_077",
+      "SAMPLE_078",
+      "SAMPLE_079",
+      "SAMPLE_080",
+      "SAMPLE_081",
+      "SAMPLE_082",
+      "SAMPLE_083",
+      "SAMPLE_084",
+      "SAMPLE_085",
+      "SAMPLE_086",
+      "SAMPLE_087",
+      "SAMPLE_088",
+      "SAMPLE_089",
+      "SAMPLE_090",
+      "SAMPLE_091",
+      "SAMPLE_092",
+      "SAMPLE_093",
+      "SAMPLE_094",
+      "SAMPLE_095",
+      "SAMPLE_096",
+      "SAMPLE_097",
+      "SAMPLE_098",
+      "SAMPLE_099"
+    ]
+  },
+  "vcf_records": [
+    {
+      "chrom": "chr1",
+      "pos": 1001,
+      "stop": 5001,
+      "id": "var1",
+      "alts": [
+        "<DEL>"
+      ],
+      "info": {
+        "SVTYPE": "DEL"
+      },
+      "samples": {
+        "SAMPLE_050": {
+          "GT": [
+            0,
+            1
+          ],
+          "RD_CN": 1
+        },
+        "SAMPLE_051": {
+          "GT": [
+            0,
+            1
+          ],
+          "RD_CN": 1
+        },
+        "SAMPLE_052": {
+          "GT": [
+            0,
+            1
+          ],
+          "RD_CN": 1
+        },
+        "SAMPLE_053": {
+          "GT": [
+            0,
+            1
+          ],
+          "RD_CN": 1
+        },
+        "SAMPLE_054": {
+          "GT": [
+            0,
+            1
+          ],
+          "RD_CN": 1
+        },
+        "SAMPLE_055": {
+          "GT": [
+            0,
+            1
+          ],
+          "RD_CN": 1
+        },
+        "SAMPLE_056": {
+          "GT": [
+            0,
+            1
+          ],
+          "RD_CN": 1
+        },
+        "SAMPLE_057": {
+          "GT": [
+            0,
+            1
+          ],
+          "RD_CN": 1
+        },
+        "SAMPLE_058": {
+          "GT": [
+            0,
+            1
+          ],
+          "RD_CN": 1
+        },
+        "SAMPLE_059": {
+          "GT": [
+            0,
+            1
+          ],
+          "RD_CN": 1
+        },
+        "SAMPLE_060": {
+          "GT": [
+            0,
+            1
+          ],
+          "RD_CN": 1
+        },
+        "SAMPLE_061": {
+          "GT": [
+            0,
+            1
+          ],
+          "RD_CN": 1
+        },
+        "SAMPLE_062": {
+          "GT": [
+            0,
+            1
+          ],
+          "RD_CN": 1
+        },
+        "SAMPLE_063": {
+          "GT": [
+            0,
+            1
+          ],
+          "RD_CN": 1
+        },
+        "SAMPLE_064": {
+          "GT": [
+            0,
+            1
+          ],
+          "RD_CN": 1
+        },
+        "SAMPLE_065": {
+          "GT": [
+            0,
+            1
+          ],
+          "RD_CN": 1
+        },
+        "SAMPLE_066": {
+          "GT": [
+            0,
+            1
+          ],
+          "RD_CN": 1
+        },
+        "SAMPLE_067": {
+          "GT": [
+            0,
+            1
+          ],
+          "RD_CN": 1
+        },
+        "SAMPLE_068": {
+          "GT": [
+            0,
+            1
+          ],
+          "RD_CN": 1
+        },
+        "SAMPLE_069": {
+          "GT": [
+            0,
+            1
+          ],
+          "RD_CN": 1
+        },
+        "SAMPLE_070": {
+          "GT": [
+            0,
+            1
+          ],
+          "RD_CN": 1
+        },
+        "SAMPLE_071": {
+          "GT": [
+            0,
+            1
+          ],
+          "RD_CN": 1
+        },
+        "SAMPLE_072": {
+          "GT": [
+            0,
+            1
+          ],
+          "RD_CN": 1
+        },
+        "SAMPLE_073": {
+          "GT": [
+            0,
+            1
+          ],
+          "RD_CN": 1
+        },
+        "SAMPLE_074": {
+          "GT": [
+            0,
+            1
+          ],
+          "RD_CN": 1
+        },
+        "SAMPLE_075": {
+          "GT": [
+            0,
+            1
+          ],
+          "RD_CN": 1
+        },
+        "SAMPLE_076": {
+          "GT": [
+            0,
+            1
+          ],
+          "RD_CN": 1
+        },
+        "SAMPLE_077": {
+          "GT": [
+            0,
+            1
+          ],
+          "RD_CN": 1
+        },
+        "SAMPLE_078": {
+          "GT": [
+            0,
+            1
+          ],
+          "RD_CN": 1
+        },
+        "SAMPLE_079": {
+          "GT": [
+            0,
+            1
+          ],
+          "RD_CN": 1
+        },
+        "SAMPLE_080": {
+          "GT": [
+            0,
+            1
+          ],
+          "RD_CN": 1
+        },
+        "SAMPLE_081": {
+          "GT": [
+            0,
+            1
+          ],
+          "RD_CN": 1
+        },
+        "SAMPLE_082": {
+          "GT": [
+            0,
+            1
+          ],
+          "RD_CN": 1
+        },
+        "SAMPLE_083": {
+          "GT": [
+            0,
+            1
+          ],
+          "RD_CN": 1
+        },
+        "SAMPLE_084": {
+          "GT": [
+            0,
+            1
+          ],
+          "RD_CN": 1
+        },
+        "SAMPLE_085": {
+          "GT": [
+            0,
+            1
+          ],
+          "RD_CN": 1
+        },
+        "SAMPLE_086": {
+          "GT": [
+            0,
+            1
+          ],
+          "RD_CN": 1
+        },
+        "SAMPLE_087": {
+          "GT": [
+            0,
+            1
+          ],
+          "RD_CN": 1
+        },
+        "SAMPLE_088": {
+          "GT": [
+            0,
+            1
+          ],
+          "RD_CN": 1
+        },
+        "SAMPLE_089": {
+          "GT": [
+            0,
+            1
+          ],
+          "RD_CN": 1
+        },
+        "SAMPLE_090": {
+          "GT": [
+            0,
+            1
+          ],
+          "RD_CN": 1
+        },
+        "SAMPLE_091": {
+          "GT": [
+            0,
+            1
+          ],
+          "RD_CN": 1
+        },
+        "SAMPLE_092": {
+          "GT": [
+            0,
+            1
+          ],
+          "RD_CN": 1
+        },
+        "SAMPLE_093": {
+          "GT": [
+            0,
+            1
+          ],
+          "RD_CN": 1
+        },
+        "SAMPLE_094": {
+          "GT": [
+            0,
+            1
+          ],
+          "RD_CN": 1
+        },
+        "SAMPLE_095": {
+          "GT": [
+            0,
+            1
+          ],
+          "RD_CN": 1
+        },
+        "SAMPLE_096": {
+          "GT": [
+            0,
+            1
+          ],
+          "RD_CN": 1
+        },
+        "SAMPLE_097": {
+          "GT": [
+            0,
+            1
+          ],
+          "RD_CN": 1
+        },
+        "SAMPLE_098": {
+          "GT": [
+            0,
+            1
+          ],
+          "RD_CN": 1
+        },
+        "SAMPLE_099": {
+          "GT": [
+            0,
+            1
+          ],
+          "RD_CN": 1
+        }
+      }
+    }
+  ],
+  "gd_table_rows": [
+    {
+      "chr": "chr1",
+      "start": 1000,
+      "end": 5000,
+      "gd_id": "GD1",
+      "svtype": "DEL",
+      "nahr": "yes",
+      "cluster": "clusterA",
+      "bp1": "1",
+      "bp2": "2"
+    },
+    {
+      "chr": "chr1",
+      "start": 1000,
+      "end": 5000,
+      "gd_id": "GD2",
+      "svtype": "DEL",
+      "nahr": "yes",
+      "cluster": "clusterA",
+      "bp1": "1",
+      "bp2": "2"
+    },
+    {
+      "chr": "chr1",
+      "start": 1000,
+      "end": 5000,
+      "gd_id": "GD3",
+      "svtype": "DEL",
+      "nahr": "yes",
+      "cluster": "clusterA",
+      "bp1": "1",
+      "bp2": "2"
+    }
+  ],
+  "gd_calls": [
+    {
+      "chrom": "chr1",
+      "pos": 1000,
+      "end": 5000,
+      "region_id": "GD1",
+      "svtype": "DEL",
+      "samples": [
+        "SAMPLE_050",
+        "SAMPLE_051",
+        "SAMPLE_052",
+        "SAMPLE_053",
+        "SAMPLE_054",
+        "SAMPLE_055",
+        "SAMPLE_056",
+        "SAMPLE_057",
+        "SAMPLE_058",
+        "SAMPLE_059",
+        "SAMPLE_060",
+        "SAMPLE_061",
+        "SAMPLE_062",
+        "SAMPLE_063",
+        "SAMPLE_064",
+        "SAMPLE_065",
+        "SAMPLE_066",
+        "SAMPLE_067",
+        "SAMPLE_068",
+        "SAMPLE_069"
+      ]
+    },
+    {
+      "chrom": "chr1",
+      "pos": 1000,
+      "end": 5000,
+      "region_id": "GD2",
+      "svtype": "DEL",
+      "samples": [
+        "SAMPLE_070",
+        "SAMPLE_071",
+        "SAMPLE_072",
+        "SAMPLE_073",
+        "SAMPLE_074",
+        "SAMPLE_075",
+        "SAMPLE_076",
+        "SAMPLE_077",
+        "SAMPLE_078",
+        "SAMPLE_079"
+      ]
+    },
+    {
+      "chrom": "chr1",
+      "pos": 1000,
+      "end": 5000,
+      "region_id": "GD3",
+      "svtype": "DEL",
+      "samples": [
+        "SAMPLE_050",
+        "SAMPLE_051",
+        "SAMPLE_052",
+        "SAMPLE_053",
+        "SAMPLE_054",
+        "SAMPLE_055",
+        "SAMPLE_056",
+        "SAMPLE_057",
+        "SAMPLE_058",
+        "SAMPLE_059"
+      ]
+    }
+  ],
+  "ploidy": [
+    [
+      "SAMPLE_000",
+      {
+        "chr1": 2
+      }
+    ],
+    [
+      "SAMPLE_001",
+      {
+        "chr1": 2
+      }
+    ],
+    [
+      "SAMPLE_002",
+      {
+        "chr1": 2
+      }
+    ],
+    [
+      "SAMPLE_003",
+      {
+        "chr1": 2
+      }
+    ],
+    [
+      "SAMPLE_004",
+      {
+        "chr1": 2
+      }
+    ],
+    [
+      "SAMPLE_005",
+      {
+        "chr1": 2
+      }
+    ],
+    [
+      "SAMPLE_006",
+      {
+        "chr1": 2
+      }
+    ],
+    [
+      "SAMPLE_007",
+      {
+        "chr1": 2
+      }
+    ],
+    [
+      "SAMPLE_008",
+      {
+        "chr1": 2
+      }
+    ],
+    [
+      "SAMPLE_009",
+      {
+        "chr1": 2
+      }
+    ],
+    [
+      "SAMPLE_010",
+      {
+        "chr1": 2
+      }
+    ],
+    [
+      "SAMPLE_011",
+      {
+        "chr1": 2
+      }
+    ],
+    [
+      "SAMPLE_012",
+      {
+        "chr1": 2
+      }
+    ],
+    [
+      "SAMPLE_013",
+      {
+        "chr1": 2
+      }
+    ],
+    [
+      "SAMPLE_014",
+      {
+        "chr1": 2
+      }
+    ],
+    [
+      "SAMPLE_015",
+      {
+        "chr1": 2
+      }
+    ],
+    [
+      "SAMPLE_016",
+      {
+        "chr1": 2
+      }
+    ],
+    [
+      "SAMPLE_017",
+      {
+        "chr1": 2
+      }
+    ],
+    [
+      "SAMPLE_018",
+      {
+        "chr1": 2
+      }
+    ],
+    [
+      "SAMPLE_019",
+      {
+        "chr1": 2
+      }
+    ],
+    [
+      "SAMPLE_020",
+      {
+        "chr1": 2
+      }
+    ],
+    [
+      "SAMPLE_021",
+      {
+        "chr1": 2
+      }
+    ],
+    [
+      "SAMPLE_022",
+      {
+        "chr1": 2
+      }
+    ],
+    [
+      "SAMPLE_023",
+      {
+        "chr1": 2
+      }
+    ],
+    [
+      "SAMPLE_024",
+      {
+        "chr1": 2
+      }
+    ],
+    [
+      "SAMPLE_025",
+      {
+        "chr1": 2
+      }
+    ],
+    [
+      "SAMPLE_026",
+      {
+        "chr1": 2
+      }
+    ],
+    [
+      "SAMPLE_027",
+      {
+        "chr1": 2
+      }
+    ],
+    [
+      "SAMPLE_028",
+      {
+        "chr1": 2
+      }
+    ],
+    [
+      "SAMPLE_029",
+      {
+        "chr1": 2
+      }
+    ],
+    [
+      "SAMPLE_030",
+      {
+        "chr1": 2
+      }
+    ],
+    [
+      "SAMPLE_031",
+      {
+        "chr1": 2
+      }
+    ],
+    [
+      "SAMPLE_032",
+      {
+        "chr1": 2
+      }
+    ],
+    [
+      "SAMPLE_033",
+      {
+        "chr1": 2
+      }
+    ],
+    [
+      "SAMPLE_034",
+      {
+        "chr1": 2
+      }
+    ],
+    [
+      "SAMPLE_035",
+      {
+        "chr1": 2
+      }
+    ],
+    [
+      "SAMPLE_036",
+      {
+        "chr1": 2
+      }
+    ],
+    [
+      "SAMPLE_037",
+      {
+        "chr1": 2
+      }
+    ],
+    [
+      "SAMPLE_038",
+      {
+        "chr1": 2
+      }
+    ],
+    [
+      "SAMPLE_039",
+      {
+        "chr1": 2
+      }
+    ],
+    [
+      "SAMPLE_040",
+      {
+        "chr1": 2
+      }
+    ],
+    [
+      "SAMPLE_041",
+      {
+        "chr1": 2
+      }
+    ],
+    [
+      "SAMPLE_042",
+      {
+        "chr1": 2
+      }
+    ],
+    [
+      "SAMPLE_043",
+      {
+        "chr1": 2
+      }
+    ],
+    [
+      "SAMPLE_044",
+      {
+        "chr1": 2
+      }
+    ],
+    [
+      "SAMPLE_045",
+      {
+        "chr1": 2
+      }
+    ],
+    [
+      "SAMPLE_046",
+      {
+        "chr1": 2
+      }
+    ],
+    [
+      "SAMPLE_047",
+      {
+        "chr1": 2
+      }
+    ],
+    [
+      "SAMPLE_048",
+      {
+        "chr1": 2
+      }
+    ],
+    [
+      "SAMPLE_049",
+      {
+        "chr1": 2
+      }
+    ],
+    [
+      "SAMPLE_050",
+      {
+        "chr1": 2
+      }
+    ],
+    [
+      "SAMPLE_051",
+      {
+        "chr1": 2
+      }
+    ],
+    [
+      "SAMPLE_052",
+      {
+        "chr1": 2
+      }
+    ],
+    [
+      "SAMPLE_053",
+      {
+        "chr1": 2
+      }
+    ],
+    [
+      "SAMPLE_054",
+      {
+        "chr1": 2
+      }
+    ],
+    [
+      "SAMPLE_055",
+      {
+        "chr1": 2
+      }
+    ],
+    [
+      "SAMPLE_056",
+      {
+        "chr1": 2
+      }
+    ],
+    [
+      "SAMPLE_057",
+      {
+        "chr1": 2
+      }
+    ],
+    [
+      "SAMPLE_058",
+      {
+        "chr1": 2
+      }
+    ],
+    [
+      "SAMPLE_059",
+      {
+        "chr1": 2
+      }
+    ],
+    [
+      "SAMPLE_060",
+      {
+        "chr1": 2
+      }
+    ],
+    [
+      "SAMPLE_061",
+      {
+        "chr1": 2
+      }
+    ],
+    [
+      "SAMPLE_062",
+      {
+        "chr1": 2
+      }
+    ],
+    [
+      "SAMPLE_063",
+      {
+        "chr1": 2
+      }
+    ],
+    [
+      "SAMPLE_064",
+      {
+        "chr1": 2
+      }
+    ],
+    [
+      "SAMPLE_065",
+      {
+        "chr1": 2
+      }
+    ],
+    [
+      "SAMPLE_066",
+      {
+        "chr1": 2
+      }
+    ],
+    [
+      "SAMPLE_067",
+      {
+        "chr1": 2
+      }
+    ],
+    [
+      "SAMPLE_068",
+      {
+        "chr1": 2
+      }
+    ],
+    [
+      "SAMPLE_069",
+      {
+        "chr1": 2
+      }
+    ],
+    [
+      "SAMPLE_070",
+      {
+        "chr1": 2
+      }
+    ],
+    [
+      "SAMPLE_071",
+      {
+        "chr1": 2
+      }
+    ],
+    [
+      "SAMPLE_072",
+      {
+        "chr1": 2
+      }
+    ],
+    [
+      "SAMPLE_073",
+      {
+        "chr1": 2
+      }
+    ],
+    [
+      "SAMPLE_074",
+      {
+        "chr1": 2
+      }
+    ],
+    [
+      "SAMPLE_075",
+      {
+        "chr1": 2
+      }
+    ],
+    [
+      "SAMPLE_076",
+      {
+        "chr1": 2
+      }
+    ],
+    [
+      "SAMPLE_077",
+      {
+        "chr1": 2
+      }
+    ],
+    [
+      "SAMPLE_078",
+      {
+        "chr1": 2
+      }
+    ],
+    [
+      "SAMPLE_079",
+      {
+        "chr1": 2
+      }
+    ],
+    [
+      "SAMPLE_080",
+      {
+        "chr1": 2
+      }
+    ],
+    [
+      "SAMPLE_081",
+      {
+        "chr1": 2
+      }
+    ],
+    [
+      "SAMPLE_082",
+      {
+        "chr1": 2
+      }
+    ],
+    [
+      "SAMPLE_083",
+      {
+        "chr1": 2
+      }
+    ],
+    [
+      "SAMPLE_084",
+      {
+        "chr1": 2
+      }
+    ],
+    [
+      "SAMPLE_085",
+      {
+        "chr1": 2
+      }
+    ],
+    [
+      "SAMPLE_086",
+      {
+        "chr1": 2
+      }
+    ],
+    [
+      "SAMPLE_087",
+      {
+        "chr1": 2
+      }
+    ],
+    [
+      "SAMPLE_088",
+      {
+        "chr1": 2
+      }
+    ],
+    [
+      "SAMPLE_089",
+      {
+        "chr1": 2
+      }
+    ],
+    [
+      "SAMPLE_090",
+      {
+        "chr1": 2
+      }
+    ],
+    [
+      "SAMPLE_091",
+      {
+        "chr1": 2
+      }
+    ],
+    [
+      "SAMPLE_092",
+      {
+        "chr1": 2
+      }
+    ],
+    [
+      "SAMPLE_093",
+      {
+        "chr1": 2
+      }
+    ],
+    [
+      "SAMPLE_094",
+      {
+        "chr1": 2
+      }
+    ],
+    [
+      "SAMPLE_095",
+      {
+        "chr1": 2
+      }
+    ],
+    [
+      "SAMPLE_096",
+      {
+        "chr1": 2
+      }
+    ],
+    [
+      "SAMPLE_097",
+      {
+        "chr1": 2
+      }
+    ],
+    [
+      "SAMPLE_098",
+      {
+        "chr1": 2
+      }
+    ],
+    [
+      "SAMPLE_099",
+      {
+        "chr1": 2
+      }
+    ]
+  ],
+  "expected": {
+    "written_count": 3
+  }
+}

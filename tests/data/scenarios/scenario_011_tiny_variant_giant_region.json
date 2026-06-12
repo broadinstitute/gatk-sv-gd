@@ -1,0 +1,66 @@
+{
+  "name": "tiny_variant_giant_region",
+  "description": "A tiny 10-bp VCF variant overlaps a 1-Mbp NAHR region. Reciprocal overlap is tiny. With default threshold (0.5), no match. VCF record passthrough + novel record for the GD.",
+  "vcf_header": {
+    "contigs": {
+      "chr1": null
+    },
+    "samples": [
+      "S1"
+    ]
+  },
+  "vcf_records": [
+    {
+      "chrom": "chr1",
+      "pos": 1001,
+      "stop": 1011,
+      "id": "tiny",
+      "alts": [
+        "<DEL>"
+      ],
+      "info": {
+        "SVTYPE": "DEL"
+      },
+      "samples": {
+        "S1": {
+          "GT": [
+            0,
+            1
+          ],
+          "RD_CN": 1
+        }
+      }
+    }
+  ],
+  "gd_table_rows": [
+    {
+      "chr": "chr1",
+      "start": 0,
+      "end": 1000000,
+      "gd_id": "GD_GIANT",
+      "svtype": "DEL",
+      "nahr": "yes",
+      "cluster": "clusterA",
+      "bp1": "1",
+      "bp2": "2"
+    }
+  ],
+  "gd_calls": [
+    {
+      "chrom": "chr1",
+      "pos": 0,
+      "end": 1000000,
+      "region_id": "GD_GIANT",
+      "svtype": "DEL",
+      "samples": [
+        "S1"
+      ]
+    }
+  ],
+  "expected": {
+    "written_count": 2,
+    "svtypes": [
+      "DEL"
+    ]
+  }
+}

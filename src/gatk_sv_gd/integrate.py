@@ -376,6 +376,19 @@ def get_expected_cn(
 # ── Carrier extraction ───────────────────────────────────────────────
 
 
+def _is_homref(gt) -> bool:
+    """Check if a genotype represents a hom-ref state.
+
+    Handles both tuple ``(0, 0)`` (pysam / real VCF) and list ``[0, 0]``
+    (JSON-encoded scenario data, test stubs).  Also handles ``None``
+    (no-call) which is treated as non-hom-ref.
+    """
+    if gt is None:
+        return False
+    gt_tuple = tuple(gt) if not isinstance(gt, tuple) else gt
+    return gt_tuple == (0, 0)
+
+
 def _extract_vcf_carriers(record: "pysam.VariantRecord") -> Set[str]:
     """Return carrier samples from a VCF record.
 
@@ -384,7 +397,7 @@ def _extract_vcf_carriers(record: "pysam.VariantRecord") -> Set[str]:
     carriers: Set[str] = set()
     for sample_name, gt_dict in record.samples.items():
         gt = gt_dict.get("GT", (0, 0))
-        if gt != (0, 0):
+        if not _is_homref(gt):
             carriers.add(sample_name)
     return carriers
 
@@ -745,7 +758,7 @@ def main(argv: Optional[List[Text]] = None) -> None:
                                 # hom-ref after genotype reconciliation — they
                                 # carry no useful signal beyond the input VCF.
                                 all_homref = all(
-                                    gt.get("GT") == (0, 0)
+                                    _is_homref(gt.get("GT", (0, 0)))
                                     for gt in record.samples.values()
                                 )
                                 if all_homref:
@@ -808,7 +821,7 @@ def main(argv: Optional[List[Text]] = None) -> None:
                     # Skip novel records where all samples are hom-ref —
                     # they carry no useful signal beyond the input VCF.
                     all_homref = all(
-                        gt.get("GT") == (0, 0)
+                        _is_homref(gt.get("GT", (0, 0)))
                         for gt in new_rec.samples.values()
                     )
                     if all_homref:

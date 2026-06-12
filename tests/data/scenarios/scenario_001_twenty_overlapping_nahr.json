@@ -1,0 +1,672 @@
+{
+  "name": "twenty_overlapping_nahr",
+  "description": "One VCF record overlaps 20 NAHR regions all at identical coords. Only the one whose carrier set perfectly matches the VCF should win. The other 19 must be emitted as novel records (or suppressed).",
+  "vcf_header": {
+    "contigs": {
+      "chr1": null
+    },
+    "samples": [
+      "S1",
+      "S2",
+      "S3",
+      "S4",
+      "S5",
+      "S6",
+      "S7",
+      "S8",
+      "S9",
+      "S10",
+      "S11",
+      "S12",
+      "S13",
+      "S14",
+      "S15",
+      "S16",
+      "S17",
+      "S18",
+      "S19",
+      "S20"
+    ]
+  },
+  "vcf_records": [
+    {
+      "chrom": "chr1",
+      "pos": 1001,
+      "stop": 5001,
+      "id": "var1",
+      "alts": [
+        "<DEL>"
+      ],
+      "info": {
+        "SVTYPE": "DEL"
+      },
+      "samples": {
+        "S1": {
+          "GT": [
+            0,
+            1
+          ],
+          "RD_CN": 1
+        },
+        "S2": {
+          "GT": [
+            0,
+            1
+          ],
+          "RD_CN": 1
+        },
+        "S3": {
+          "GT": [
+            0,
+            1
+          ],
+          "RD_CN": 1
+        },
+        "S4": {
+          "GT": [
+            0,
+            1
+          ],
+          "RD_CN": 1
+        },
+        "S5": {
+          "GT": [
+            0,
+            1
+          ],
+          "RD_CN": 1
+        },
+        "S6": {
+          "GT": [
+            0,
+            1
+          ],
+          "RD_CN": 1
+        },
+        "S7": {
+          "GT": [
+            0,
+            1
+          ],
+          "RD_CN": 1
+        },
+        "S8": {
+          "GT": [
+            0,
+            1
+          ],
+          "RD_CN": 1
+        },
+        "S9": {
+          "GT": [
+            0,
+            1
+          ],
+          "RD_CN": 1
+        },
+        "S10": {
+          "GT": [
+            0,
+            1
+          ],
+          "RD_CN": 1
+        },
+        "S11": {
+          "GT": [
+            0,
+            1
+          ],
+          "RD_CN": 1
+        },
+        "S12": {
+          "GT": [
+            0,
+            1
+          ],
+          "RD_CN": 1
+        },
+        "S13": {
+          "GT": [
+            0,
+            1
+          ],
+          "RD_CN": 1
+        },
+        "S14": {
+          "GT": [
+            0,
+            1
+          ],
+          "RD_CN": 1
+        },
+        "S15": {
+          "GT": [
+            0,
+            1
+          ],
+          "RD_CN": 1
+        },
+        "S16": {
+          "GT": [
+            0,
+            1
+          ],
+          "RD_CN": 1
+        },
+        "S17": {
+          "GT": [
+            0,
+            1
+          ],
+          "RD_CN": 1
+        },
+        "S18": {
+          "GT": [
+            0,
+            1
+          ],
+          "RD_CN": 1
+        },
+        "S19": {
+          "GT": [
+            0,
+            1
+          ],
+          "RD_CN": 1
+        },
+        "S20": {
+          "GT": [
+            0,
+            1
+          ],
+          "RD_CN": 1
+        }
+      }
+    }
+  ],
+  "gd_table_rows": [
+    {
+      "chr": "chr1",
+      "start": 1000,
+      "end": 5000,
+      "gd_id": "GD1",
+      "svtype": "DEL",
+      "nahr": "yes",
+      "cluster": "megaCluster",
+      "bp1": "1",
+      "bp2": "2"
+    },
+    {
+      "chr": "chr1",
+      "start": 1000,
+      "end": 5000,
+      "gd_id": "GD2",
+      "svtype": "DEL",
+      "nahr": "yes",
+      "cluster": "megaCluster",
+      "bp1": "1",
+      "bp2": "2"
+    },
+    {
+      "chr": "chr1",
+      "start": 1000,
+      "end": 5000,
+      "gd_id": "GD3",
+      "svtype": "DEL",
+      "nahr": "yes",
+      "cluster": "megaCluster",
+      "bp1": "1",
+      "bp2": "2"
+    },
+    {
+      "chr": "chr1",
+      "start": 1000,
+      "end": 5000,
+      "gd_id": "GD4",
+      "svtype": "DEL",
+      "nahr": "yes",
+      "cluster": "megaCluster",
+      "bp1": "1",
+      "bp2": "2"
+    },
+    {
+      "chr": "chr1",
+      "start": 1000,
+      "end": 5000,
+      "gd_id": "GD5",
+      "svtype": "DEL",
+      "nahr": "yes",
+      "cluster": "megaCluster",
+      "bp1": "1",
+      "bp2": "2"
+    },
+    {
+      "chr": "chr1",
+      "start": 1000,
+      "end": 5000,
+      "gd_id": "GD6",
+      "svtype": "DEL",
+      "nahr": "yes",
+      "cluster": "megaCluster",
+      "bp1": "1",
+      "bp2": "2"
+    },
+    {
+      "chr": "chr1",
+      "start": 1000,
+      "end": 5000,
+      "gd_id": "GD7",
+      "svtype": "DEL",
+      "nahr": "yes",
+      "cluster": "megaCluster",
+      "bp1": "1",
+      "bp2": "2"
+    },
+    {
+      "chr": "chr1",
+      "start": 1000,
+      "end": 5000,
+      "gd_id": "GD8",
+      "svtype": "DEL",
+      "nahr": "yes",
+      "cluster": "megaCluster",
+      "bp1": "1",
+      "bp2": "2"
+    },
+    {
+      "chr": "chr1",
+      "start": 1000,
+      "end": 5000,
+      "gd_id": "GD9",
+      "svtype": "DEL",
+      "nahr": "yes",
+      "cluster": "megaCluster",
+      "bp1": "1",
+      "bp2": "2"
+    },
+    {
+      "chr": "chr1",
+      "start": 1000,
+      "end": 5000,
+      "gd_id": "GD10",
+      "svtype": "DEL",
+      "nahr": "yes",
+      "cluster": "megaCluster",
+      "bp1": "1",
+      "bp2": "2"
+    },
+    {
+      "chr": "chr1",
+      "start": 1000,
+      "end": 5000,
+      "gd_id": "GD11",
+      "svtype": "DEL",
+      "nahr": "yes",
+      "cluster": "megaCluster",
+      "bp1": "1",
+      "bp2": "2"
+    },
+    {
+      "chr": "chr1",
+      "start": 1000,
+      "end": 5000,
+      "gd_id": "GD12",
+      "svtype": "DEL",
+      "nahr": "yes",
+      "cluster": "megaCluster",
+      "bp1": "1",
+      "bp2": "2"
+    },
+    {
+      "chr": "chr1",
+      "start": 1000,
+      "end": 5000,
+      "gd_id": "GD13",
+      "svtype": "DEL",
+      "nahr": "yes",
+      "cluster": "megaCluster",
+      "bp1": "1",
+      "bp2": "2"
+    },
+    {
+      "chr": "chr1",
+      "start": 1000,
+      "end": 5000,
+      "gd_id": "GD14",
+      "svtype": "DEL",
+      "nahr": "yes",
+      "cluster": "megaCluster",
+      "bp1": "1",
+      "bp2": "2"
+    },
+    {
+      "chr": "chr1",
+      "start": 1000,
+      "end": 5000,
+      "gd_id": "GD15",
+      "svtype": "DEL",
+      "nahr": "yes",
+      "cluster": "megaCluster",
+      "bp1": "1",
+      "bp2": "2"
+    },
+    {
+      "chr": "chr1",
+      "start": 1000,
+      "end": 5000,
+      "gd_id": "GD16",
+      "svtype": "DEL",
+      "nahr": "yes",
+      "cluster": "megaCluster",
+      "bp1": "1",
+      "bp2": "2"
+    },
+    {
+      "chr": "chr1",
+      "start": 1000,
+      "end": 5000,
+      "gd_id": "GD17",
+      "svtype": "DEL",
+      "nahr": "yes",
+      "cluster": "megaCluster",
+      "bp1": "1",
+      "bp2": "2"
+    },
+    {
+      "chr": "chr1",
+      "start": 1000,
+      "end": 5000,
+      "gd_id": "GD18",
+      "svtype": "DEL",
+      "nahr": "yes",
+      "cluster": "megaCluster",
+      "bp1": "1",
+      "bp2": "2"
+    },
+    {
+      "chr": "chr1",
+      "start": 1000,
+      "end": 5000,
+      "gd_id": "GD19",
+      "svtype": "DEL",
+      "nahr": "yes",
+      "cluster": "megaCluster",
+      "bp1": "1",
+      "bp2": "2"
+    },
+    {
+      "chr": "chr1",
+      "start": 1000,
+      "end": 5000,
+      "gd_id": "GD20",
+      "svtype": "DEL",
+      "nahr": "yes",
+      "cluster": "megaCluster",
+      "bp1": "1",
+      "bp2": "2"
+    }
+  ],
+  "gd_calls": [
+    {
+      "chrom": "chr1",
+      "pos": 1000,
+      "end": 5000,
+      "region_id": "GD1",
+      "svtype": "DEL",
+      "samples": [
+        "S1",
+        "S2",
+        "S3",
+        "S4",
+        "S5",
+        "S6",
+        "S7",
+        "S8",
+        "S9",
+        "S10",
+        "S11",
+        "S12",
+        "S13",
+        "S14",
+        "S15",
+        "S16",
+        "S17",
+        "S18",
+        "S19",
+        "S20"
+      ]
+    },
+    {
+      "chrom": "chr1",
+      "pos": 1000,
+      "end": 5000,
+      "region_id": "GD2",
+      "svtype": "DEL",
+      "samples": [
+        "S1"
+      ]
+    },
+    {
+      "chrom": "chr1",
+      "pos": 1000,
+      "end": 5000,
+      "region_id": "GD3",
+      "svtype": "DEL",
+      "samples": [
+        "S2",
+        "S3"
+      ]
+    },
+    {
+      "chrom": "chr1",
+      "pos": 1000,
+      "end": 5000,
+      "region_id": "GD4",
+      "svtype": "DEL",
+      "samples": [
+        "S10",
+        "S15",
+        "S20"
+      ]
+    },
+    {
+      "chrom": "chr1",
+      "pos": 1000,
+      "end": 5000,
+      "region_id": "GD5",
+      "svtype": "DEL",
+      "samples": [
+        "S1"
+      ]
+    },
+    {
+      "chrom": "chr1",
+      "pos": 1000,
+      "end": 5000,
+      "region_id": "GD6",
+      "svtype": "DEL",
+      "samples": [
+        "S1",
+        "S2",
+        "S3",
+        "S4"
+      ]
+    },
+    {
+      "chrom": "chr1",
+      "pos": 1000,
+      "end": 5000,
+      "region_id": "GD7",
+      "svtype": "DEL",
+      "samples": [
+        "S5",
+        "S6",
+        "S7",
+        "S8",
+        "S9",
+        "S10"
+      ]
+    },
+    {
+      "chrom": "chr1",
+      "pos": 1000,
+      "end": 5000,
+      "region_id": "GD8",
+      "svtype": "DEL",
+      "samples": [
+        "S11",
+        "S12",
+        "S13",
+        "S14",
+        "S15"
+      ]
+    },
+    {
+      "chrom": "chr1",
+      "pos": 1000,
+      "end": 5000,
+      "region_id": "GD9",
+      "svtype": "DEL",
+      "samples": [
+        "S16",
+        "S17",
+        "S18",
+        "S19",
+        "S20"
+      ]
+    },
+    {
+      "chrom": "chr1",
+      "pos": 1000,
+      "end": 5000,
+      "region_id": "GD10",
+      "svtype": "DEL",
+      "samples": [
+        "S1",
+        "S3",
+        "S5",
+        "S7",
+        "S9"
+      ]
+    },
+    {
+      "chrom": "chr1",
+      "pos": 1000,
+      "end": 5000,
+      "region_id": "GD11",
+      "svtype": "DEL",
+      "samples": [
+        "S2",
+        "S4",
+        "S6",
+        "S8",
+        "S10"
+      ]
+    },
+    {
+      "chrom": "chr1",
+      "pos": 1000,
+      "end": 5000,
+      "region_id": "GD12",
+      "svtype": "DEL",
+      "samples": [
+        "S11",
+        "S12",
+        "S13",
+        "S14"
+      ]
+    },
+    {
+      "chrom": "chr1",
+      "pos": 1000,
+      "end": 5000,
+      "region_id": "GD13",
+      "svtype": "DEL",
+      "samples": [
+        "S15",
+        "S16",
+        "S17",
+        "S18"
+      ]
+    },
+    {
+      "chrom": "chr1",
+      "pos": 1000,
+      "end": 5000,
+      "region_id": "GD14",
+      "svtype": "DEL",
+      "samples": [
+        "S19",
+        "S20"
+      ]
+    },
+    {
+      "chrom": "chr1",
+      "pos": 1000,
+      "end": 5000,
+      "region_id": "GD15",
+      "svtype": "DEL",
+      "samples": [
+        "S1",
+        "S20"
+      ]
+    },
+    {
+      "chrom": "chr1",
+      "pos": 1000,
+      "end": 5000,
+      "region_id": "GD16",
+      "svtype": "DEL",
+      "samples": [
+        "S2"
+      ]
+    },
+    {
+      "chrom": "chr1",
+      "pos": 1000,
+      "end": 5000,
+      "region_id": "GD17",
+      "svtype": "DEL",
+      "samples": [
+        "S3"
+      ]
+    },
+    {
+      "chrom": "chr1",
+      "pos": 1000,
+      "end": 5000,
+      "region_id": "GD18",
+      "svtype": "DEL",
+      "samples": [
+        "S1",
+        "S2"
+      ]
+    },
+    {
+      "chrom": "chr1",
+      "pos": 1000,
+      "end": 5000,
+      "region_id": "GD19",
+      "svtype": "DEL",
+      "samples": [
+        "S3",
+        "S4"
+      ]
+    },
+    {
+      "chrom": "chr1",
+      "pos": 1000,
+      "end": 5000,
+      "region_id": "GD20",
+      "svtype": "DEL",
+      "samples": [
+        "S5",
+        "S6"
+      ]
+    }
+  ],
+  "expected": {
+    "min_written": 20,
+    "matched_id": "GD1"
+  }
+}

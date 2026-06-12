@@ -38,6 +38,10 @@ where = ["src"]
 
 [tool.pytest.ini_options]
 addopts = "--cov=gatk_sv_gd --cov-report=term-missing --cov-fail-under=90"
+markers = [
+    "integration: marks tests as integration tests (deselect with -m 'not integration')",
+    "slow: marks tests as taking a long time to run (deselect with -m 'not slow')",
+]
 filterwarnings = [
     "ignore:'oneOf' deprecated - use 'one_of':DeprecationWarning:matplotlib\\._fontconfig_pattern",
     "ignore:'parseString' deprecated - use 'parse_string':DeprecationWarning:matplotlib\\._fontconfig_pattern",

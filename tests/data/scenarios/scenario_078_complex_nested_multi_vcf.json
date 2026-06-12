@@ -1,0 +1,429 @@
+{
+  "name": "complex_nested_multi_vcf",
+  "description": "5 VCF records, 15 GD entries. Some records overlap multiple GD regions, some overlap none. Tests full pipeline with varied outcomes.",
+  "vcf_header": {
+    "contigs": {
+      "chr1": null
+    },
+    "samples": [
+      "S1",
+      "S2",
+      "S3"
+    ]
+  },
+  "vcf_records": [
+    {
+      "chrom": "chr1",
+      "pos": 1001,
+      "stop": 2001,
+      "id": "v1",
+      "alts": [
+        "<DEL>"
+      ],
+      "info": {
+        "SVTYPE": "DEL"
+      },
+      "samples": {
+        "S1": {
+          "GT": [
+            0,
+            0
+          ]
+        }
+      }
+    },
+    {
+      "chrom": "chr1",
+      "pos": 3001,
+      "stop": 4001,
+      "id": "v2",
+      "alts": [
+        "<DEL>"
+      ],
+      "info": {
+        "SVTYPE": "DEL"
+      },
+      "samples": {
+        "S1": {
+          "GT": [
+            0,
+            0
+          ]
+        }
+      }
+    },
+    {
+      "chrom": "chr1",
+      "pos": 5001,
+      "stop": 6001,
+      "id": "v3",
+      "alts": [
+        "<DEL>"
+      ],
+      "info": {
+        "SVTYPE": "DEL"
+      },
+      "samples": {
+        "S1": {
+          "GT": [
+            0,
+            1
+          ],
+          "RD_CN": 1
+        }
+      }
+    },
+    {
+      "chrom": "chr1",
+      "pos": 7001,
+      "stop": 8001,
+      "id": "v4",
+      "alts": [
+        "<DEL>"
+      ],
+      "info": {
+        "SVTYPE": "DEL"
+      },
+      "samples": {
+        "S1": {
+          "GT": [
+            0,
+            0
+          ]
+        }
+      }
+    },
+    {
+      "chrom": "chr1",
+      "pos": 9001,
+      "stop": 10001,
+      "id": "v5",
+      "alts": [
+        "<DEL>"
+      ],
+      "info": {
+        "SVTYPE": "DEL"
+      },
+      "samples": {
+        "S1": {
+          "GT": [
+            0,
+            0
+          ]
+        }
+      }
+    }
+  ],
+  "gd_table_rows": [
+    {
+      "chr": "chr1",
+      "start": 300,
+      "end": 1200,
+      "gd_id": "GD_A1",
+      "svtype": "DEL",
+      "nahr": "yes",
+      "cluster": "clusterA",
+      "bp1": "1",
+      "bp2": "2"
+    },
+    {
+      "chr": "chr1",
+      "start": 300,
+      "end": 1200,
+      "gd_id": "GD_A2",
+      "svtype": "DEL",
+      "nahr": "yes",
+      "cluster": "clusterA",
+      "bp1": "1",
+      "bp2": "2"
+    },
+    {
+      "chr": "chr1",
+      "start": 300,
+      "end": 1200,
+      "gd_id": "GD_A3",
+      "svtype": "DEL",
+      "nahr": "yes",
+      "cluster": "clusterA",
+      "bp1": "1",
+      "bp2": "2"
+    },
+    {
+      "chr": "chr1",
+      "start": 2500,
+      "end": 4500,
+      "gd_id": "GD_B1",
+      "svtype": "DEL",
+      "nahr": "yes",
+      "cluster": "clusterB",
+      "bp1": "1",
+      "bp2": "2"
+    },
+    {
+      "chr": "chr1",
+      "start": 2500,
+      "end": 4500,
+      "gd_id": "GD_B2",
+      "svtype": "DEL",
+      "nahr": "yes",
+      "cluster": "clusterB",
+      "bp1": "1",
+      "bp2": "2"
+    },
+    {
+      "chr": "chr1",
+      "start": 2500,
+      "end": 4500,
+      "gd_id": "GD_B3",
+      "svtype": "DEL",
+      "nahr": "yes",
+      "cluster": "clusterB",
+      "bp1": "1",
+      "bp2": "2"
+    },
+    {
+      "chr": "chr1",
+      "start": 4500,
+      "end": 6500,
+      "gd_id": "GD_C1",
+      "svtype": "DEL",
+      "nahr": "yes",
+      "cluster": "clusterC",
+      "bp1": "1",
+      "bp2": "2"
+    },
+    {
+      "chr": "chr1",
+      "start": 4500,
+      "end": 6500,
+      "gd_id": "GD_C2",
+      "svtype": "DEL",
+      "nahr": "yes",
+      "cluster": "clusterC",
+      "bp1": "1",
+      "bp2": "2"
+    },
+    {
+      "chr": "chr1",
+      "start": 4500,
+      "end": 6500,
+      "gd_id": "GD_C3",
+      "svtype": "DEL",
+      "nahr": "yes",
+      "cluster": "clusterC",
+      "bp1": "1",
+      "bp2": "2"
+    },
+    {
+      "chr": "chr1",
+      "start": 6500,
+      "end": 8500,
+      "gd_id": "GD_D1",
+      "svtype": "DEL",
+      "nahr": "yes",
+      "cluster": "clusterD",
+      "bp1": "1",
+      "bp2": "2"
+    },
+    {
+      "chr": "chr1",
+      "start": 6500,
+      "end": 8500,
+      "gd_id": "GD_D2",
+      "svtype": "DEL",
+      "nahr": "yes",
+      "cluster": "clusterD",
+      "bp1": "1",
+      "bp2": "2"
+    },
+    {
+      "chr": "chr1",
+      "start": 6500,
+      "end": 8500,
+      "gd_id": "GD_D3",
+      "svtype": "DEL",
+      "nahr": "yes",
+      "cluster": "clusterD",
+      "bp1": "1",
+      "bp2": "2"
+    },
+    {
+      "chr": "chr1",
+      "start": 11000,
+      "end": 12000,
+      "gd_id": "GD_E1",
+      "svtype": "DEL",
+      "nahr": "yes",
+      "cluster": "clusterE",
+      "bp1": "1",
+      "bp2": "2"
+    },
+    {
+      "chr": "chr1",
+      "start": 11000,
+      "end": 12000,
+      "gd_id": "GD_E2",
+      "svtype": "DEL",
+      "nahr": "yes",
+      "cluster": "clusterE",
+      "bp1": "1",
+      "bp2": "2"
+    },
+    {
+      "chr": "chr1",
+      "start": 11000,
+      "end": 12000,
+      "gd_id": "GD_E3",
+      "svtype": "DEL",
+      "nahr": "yes",
+      "cluster": "clusterE",
+      "bp1": "1",
+      "bp2": "2"
+    }
+  ],
+  "gd_calls": [
+    {
+      "chrom": "chr1",
+      "pos": 300,
+      "end": 1200,
+      "region_id": "GD_A1",
+      "svtype": "DEL",
+      "samples": [
+        "S1"
+      ]
+    },
+    {
+      "chrom": "chr1",
+      "pos": 300,
+      "end": 1200,
+      "region_id": "GD_A2",
+      "svtype": "DEL",
+      "samples": [
+        "S2"
+      ]
+    },
+    {
+      "chrom": "chr1",
+      "pos": 300,
+      "end": 1200,
+      "region_id": "GD_A3",
+      "svtype": "DEL",
+      "samples": []
+    },
+    {
+      "chrom": "chr1",
+      "pos": 2500,
+      "end": 4500,
+      "region_id": "GD_B1",
+      "svtype": "DEL",
+      "samples": [
+        "S1"
+      ]
+    },
+    {
+      "chrom": "chr1",
+      "pos": 2500,
+      "end": 4500,
+      "region_id": "GD_B2",
+      "svtype": "DEL",
+      "samples": [
+        "S2"
+      ]
+    },
+    {
+      "chrom": "chr1",
+      "pos": 2500,
+      "end": 4500,
+      "region_id": "GD_B3",
+      "svtype": "DEL",
+      "samples": []
+    },
+    {
+      "chrom": "chr1",
+      "pos": 4500,
+      "end": 6500,
+      "region_id": "GD_C1",
+      "svtype": "DEL",
+      "samples": [
+        "S1"
+      ]
+    },
+    {
+      "chrom": "chr1",
+      "pos": 4500,
+      "end": 6500,
+      "region_id": "GD_C2",
+      "svtype": "DEL",
+      "samples": [
+        "S2"
+      ]
+    },
+    {
+      "chrom": "chr1",
+      "pos": 4500,
+      "end": 6500,
+      "region_id": "GD_C3",
+      "svtype": "DEL",
+      "samples": []
+    },
+    {
+      "chrom": "chr1",
+      "pos": 6500,
+      "end": 8500,
+      "region_id": "GD_D1",
+      "svtype": "DEL",
+      "samples": [
+        "S1"
+      ]
+    },
+    {
+      "chrom": "chr1",
+      "pos": 6500,
+      "end": 8500,
+      "region_id": "GD_D2",
+      "svtype": "DEL",
+      "samples": [
+        "S2"
+      ]
+    },
+    {
+      "chrom": "chr1",
+      "pos": 6500,
+      "end": 8500,
+      "region_id": "GD_D3",
+      "svtype": "DEL",
+      "samples": []
+    },
+    {
+      "chrom": "chr1",
+      "pos": 11000,
+      "end": 12000,
+      "region_id": "GD_E1",
+      "svtype": "DEL",
+      "samples": [
+        "S1"
+      ]
+    },
+    {
+      "chrom": "chr1",
+      "pos": 11000,
+      "end": 12000,
+      "region_id": "GD_E2",
+      "svtype": "DEL",
+      "samples": [
+        "S2"
+      ]
+    },
+    {
+      "chrom": "chr1",
+      "pos": 11000,
+      "end": 12000,
+      "region_id": "GD_E3",
+      "svtype": "DEL",
+      "samples": []
+    }
+  ],
+  "expected": {
+    "min_written": 10
+  }
+}

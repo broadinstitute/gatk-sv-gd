@@ -1,0 +1,78 @@
+{
+  "name": "vcf_no_carriers_gd_has_carriers",
+  "description": "VCF record: all hom-ref. GD entry: has carriers. After reconciliation: carriers in gd_calls become het, non-carriers stay hom-ref. At least one carrier remains → written.",
+  "vcf_header": {
+    "contigs": {
+      "chr1": null
+    },
+    "samples": [
+      "S1",
+      "S2",
+      "S3"
+    ]
+  },
+  "vcf_records": [
+    {
+      "chrom": "chr1",
+      "pos": 1001,
+      "stop": 5001,
+      "id": "var1",
+      "alts": [
+        "<DEL>"
+      ],
+      "info": {
+        "SVTYPE": "DEL"
+      },
+      "samples": {
+        "S1": {
+          "GT": [
+            0,
+            0
+          ]
+        },
+        "S2": {
+          "GT": [
+            0,
+            0
+          ]
+        },
+        "S3": {
+          "GT": [
+            0,
+            0
+          ]
+        }
+      }
+    }
+  ],
+  "gd_table_rows": [
+    {
+      "chr": "chr1",
+      "start": 1000,
+      "end": 5000,
+      "gd_id": "GD1",
+      "svtype": "DEL",
+      "nahr": "yes",
+      "cluster": "clusterA",
+      "bp1": "1",
+      "bp2": "2"
+    }
+  ],
+  "gd_calls": [
+    {
+      "chrom": "chr1",
+      "pos": 1000,
+      "end": 5000,
+      "region_id": "GD1",
+      "svtype": "DEL",
+      "samples": [
+        "S1",
+        "S2"
+      ]
+    }
+  ],
+  "expected": {
+    "written_count": 1,
+    "matched_id": "GD1"
+  }
+}

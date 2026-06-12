@@ -1,0 +1,85 @@
+{
+  "name": "phase1_same_gd_as_phase2",
+  "description": "A non-NAHR entry and a NAHR entry both overlap the same VCF record. Phase 2 should win and overwrite Phase 1's annotation.",
+  "vcf_header": {
+    "contigs": {
+      "chr1": null
+    },
+    "samples": [
+      "S1"
+    ]
+  },
+  "vcf_records": [
+    {
+      "chrom": "chr1",
+      "pos": 1501,
+      "stop": 3501,
+      "id": "var1",
+      "alts": [
+        "<DEL>"
+      ],
+      "info": {
+        "SVTYPE": "DEL"
+      },
+      "samples": {
+        "S1": {
+          "GT": [
+            0,
+            0
+          ]
+        }
+      }
+    }
+  ],
+  "gd_table_rows": [
+    {
+      "chr": "chr1",
+      "start": 1000,
+      "end": 2000,
+      "gd_id": "GD_NNAHR",
+      "svtype": "DEL",
+      "nahr": "no",
+      "cluster": "clusterX",
+      "bp1": "1",
+      "bp2": "2"
+    },
+    {
+      "chr": "chr1",
+      "start": 1000,
+      "end": 3000,
+      "gd_id": "GD_NAHR",
+      "svtype": "DEL",
+      "nahr": "yes",
+      "cluster": "clusterY",
+      "bp1": "1",
+      "bp2": "2"
+    }
+  ],
+  "gd_calls": [
+    {
+      "chrom": "chr1",
+      "pos": 1000,
+      "end": 2000,
+      "region_id": "GD_NNAHR",
+      "svtype": "DEL",
+      "samples": [
+        "S1"
+      ]
+    },
+    {
+      "chrom": "chr1",
+      "pos": 1000,
+      "end": 3000,
+      "region_id": "GD_NAHR",
+      "svtype": "DEL",
+      "samples": [
+        "S1"
+      ]
+    }
+  ],
+  "expected": {
+    "written_count": 2,
+    "matched_id": "GD_NAHR",
+    "matched_cluster": "clusterY"
+  }
+}

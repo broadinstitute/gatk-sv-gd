@@ -1,0 +1,63 @@
+{
+  "name": "par_bed_empty",
+  "description": "PAR BED file is empty. Tests that PAR detection handles this.",
+  "vcf_header": {
+    "contigs": {
+      "chrX": null
+    },
+    "samples": [
+      "S1"
+    ]
+  },
+  "vcf_records": [
+    {
+      "chrom": "chrX",
+      "pos": 1001,
+      "stop": 5001,
+      "id": "var1",
+      "alts": [
+        "<DEL>"
+      ],
+      "info": {
+        "SVTYPE": "DEL"
+      },
+      "samples": {
+        "S1": {
+          "GT": [
+            0,
+            0
+          ]
+        }
+      }
+    }
+  ],
+  "gd_table_rows": [
+    {
+      "chr": "chrX",
+      "start": 1000,
+      "end": 5000,
+      "gd_id": "GD_X1",
+      "svtype": "DEL",
+      "nahr": "yes",
+      "cluster": "clusterX",
+      "bp1": "1",
+      "bp2": "2"
+    }
+  ],
+  "gd_calls": [
+    {
+      "chrom": "chrX",
+      "pos": 1000,
+      "end": 5000,
+      "region_id": "GD_X1",
+      "svtype": "DEL",
+      "samples": [
+        "S1"
+      ]
+    }
+  ],
+  "par_intervals": [],
+  "expected": {
+    "written_count": 1
+  }
+}

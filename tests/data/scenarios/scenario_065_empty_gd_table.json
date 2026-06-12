@@ -1,0 +1,41 @@
+{
+  "name": "empty_gd_table",
+  "description": "GD table with no rows (only headers). All VCF records should pass through unchanged.",
+  "vcf_header": {
+    "contigs": {
+      "chr1": null
+    },
+    "samples": [
+      "S1"
+    ]
+  },
+  "vcf_records": [
+    {
+      "chrom": "chr1",
+      "pos": 1001,
+      "stop": 5001,
+      "id": "var1",
+      "alts": [
+        "<DEL>"
+      ],
+      "info": {
+        "SVTYPE": "DEL"
+      },
+      "samples": {
+        "S1": {
+          "GT": [
+            0,
+            1
+          ],
+          "RD_CN": 1
+        }
+      }
+    }
+  ],
+  "gd_table_rows": [],
+  "gd_calls": [],
+  "expected": {
+    "written_count": 1,
+    "matched_gd": null
+  }
+}

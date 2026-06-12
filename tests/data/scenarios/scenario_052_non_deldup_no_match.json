@@ -1,0 +1,62 @@
+{
+  "name": "non_deldup_no_match",
+  "description": "VCF record with svtype='BND'. No matching GD entry. Should pass through unchanged.",
+  "vcf_header": {
+    "contigs": {
+      "chr1": null
+    },
+    "samples": [
+      "S1"
+    ]
+  },
+  "vcf_records": [
+    {
+      "chrom": "chr1",
+      "pos": 1001,
+      "stop": 5001,
+      "id": "bnd1",
+      "alts": [
+        "<BND>"
+      ],
+      "info": {
+        "SVTYPE": "BND"
+      },
+      "samples": {
+        "S1": {
+          "GT": [
+            0,
+            1
+          ]
+        }
+      }
+    }
+  ],
+  "gd_table_rows": [
+    {
+      "chr": "chr1",
+      "start": 1000,
+      "end": 5000,
+      "gd_id": "GD_DEL1",
+      "svtype": "DEL",
+      "nahr": "yes",
+      "cluster": "clusterA",
+      "bp1": "1",
+      "bp2": "2"
+    }
+  ],
+  "gd_calls": [
+    {
+      "chrom": "chr1",
+      "pos": 1000,
+      "end": 5000,
+      "region_id": "GD_DEL1",
+      "svtype": "DEL",
+      "samples": [
+        "S1"
+      ]
+    }
+  ],
+  "expected": {
+    "written_count": 2
+  }
+}

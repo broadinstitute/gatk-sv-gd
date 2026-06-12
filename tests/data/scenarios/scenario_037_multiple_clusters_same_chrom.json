@@ -1,0 +1,146 @@
+{
+  "name": "multiple_clusters_same_chrom",
+  "description": "Five GD regions across three different clusters on chr1. Tests that cluster-level grouping doesn't interfere with matching.",
+  "vcf_header": {
+    "contigs": {
+      "chr1": null
+    },
+    "samples": [
+      "S1"
+    ]
+  },
+  "vcf_records": [
+    {
+      "chrom": "chr1",
+      "pos": 1001,
+      "stop": 5001,
+      "id": "var1",
+      "alts": [
+        "<DEL>"
+      ],
+      "info": {
+        "SVTYPE": "DEL"
+      },
+      "samples": {
+        "S1": {
+          "GT": [
+            0,
+            0
+          ]
+        }
+      }
+    }
+  ],
+  "gd_table_rows": [
+    {
+      "chr": "chr1",
+      "start": 1000,
+      "end": 2000,
+      "gd_id": "GD_A1",
+      "svtype": "DEL",
+      "nahr": "yes",
+      "cluster": "clusterA",
+      "bp1": "1",
+      "bp2": "2"
+    },
+    {
+      "chr": "chr1",
+      "start": 1500,
+      "end": 3000,
+      "gd_id": "GD_A2",
+      "svtype": "DEL",
+      "nahr": "yes",
+      "cluster": "clusterA",
+      "bp1": "1",
+      "bp2": "2"
+    },
+    {
+      "chr": "chr1",
+      "start": 2500,
+      "end": 4000,
+      "gd_id": "GD_B1",
+      "svtype": "DEL",
+      "nahr": "yes",
+      "cluster": "clusterB",
+      "bp1": "1",
+      "bp2": "2"
+    },
+    {
+      "chr": "chr1",
+      "start": 3500,
+      "end": 5000,
+      "gd_id": "GD_B2",
+      "svtype": "DEL",
+      "nahr": "yes",
+      "cluster": "clusterB",
+      "bp1": "1",
+      "bp2": "2"
+    },
+    {
+      "chr": "chr1",
+      "start": 4500,
+      "end": 5500,
+      "gd_id": "GD_C1",
+      "svtype": "DEL",
+      "nahr": "yes",
+      "cluster": "clusterC",
+      "bp1": "1",
+      "bp2": "2"
+    }
+  ],
+  "gd_calls": [
+    {
+      "chrom": "chr1",
+      "pos": 1000,
+      "end": 2000,
+      "region_id": "GD_A1",
+      "svtype": "DEL",
+      "samples": [
+        "S1"
+      ]
+    },
+    {
+      "chrom": "chr1",
+      "pos": 1500,
+      "end": 3000,
+      "region_id": "GD_A2",
+      "svtype": "DEL",
+      "samples": [
+        "S1"
+      ]
+    },
+    {
+      "chrom": "chr1",
+      "pos": 2500,
+      "end": 4000,
+      "region_id": "GD_B1",
+      "svtype": "DEL",
+      "samples": [
+        "S1"
+      ]
+    },
+    {
+      "chrom": "chr1",
+      "pos": 3500,
+      "end": 5000,
+      "region_id": "GD_B2",
+      "svtype": "DEL",
+      "samples": [
+        "S1"
+      ]
+    },
+    {
+      "chrom": "chr1",
+      "pos": 4500,
+      "end": 5500,
+      "region_id": "GD_C1",
+      "svtype": "DEL",
+      "samples": [
+        "S1"
+      ]
+    }
+  ],
+  "expected": {
+    "min_written": 1
+  }
+}
