@@ -287,77 +287,6 @@ class TestOverlapHelpers:
         assert fraction_covered(100, 200, 200, 300) == pytest.approx(0.0)
 
 
-# ── Sample-overlap unit tests ──────────────────────────────────────────
-
-
-class TestSampleOverlap:
-    """Tests for sample_overlap() and _extract_vcf_carriers()."""
-
-    def test_partial_overlap(self):
-        assert integrate.sample_overlap(
-            {"A", "B"}, {"A", "B", "C"}
-        ) == pytest.approx(2 / 3)
-
-    def test_disjoint_sets(self):
-        assert integrate.sample_overlap({"A"}, {"B"}) == 0.0
-
-    def test_identical_sets(self):
-        assert integrate.sample_overlap({"A", "B"}, {"A", "B"}) == 1.0
-
-    def test_subset(self):
-        assert integrate.sample_overlap({"A"}, {"A", "B", "C"}) == pytest.approx(
-            1 / 3
-        )
-
-    def test_both_empty_returns_none(self):
-        assert integrate.sample_overlap(set(), set()) is None
-
-    def test_one_empty_nonempty(self):
-        # One set is empty -> intersection = 0 -> overlap = 0
-        assert integrate.sample_overlap({"A"}, set()) == pytest.approx(0.0)
-        assert integrate.sample_overlap(set(), {"B"}) == pytest.approx(0.0)
-
-
-class TestExtractVcfCarriers:
-    """Tests for _extract_vcf_carriers()."""
-
-    def test_no_carriers(self):
-        rec = _FakeRecord(
-            chrom="chr1",
-            pos=1001,
-            stop=5000,
-            samples={"S1": {"GT": (0, 0)}, "S2": {"GT": (0, 0)}},
-        )
-        assert integrate._extract_vcf_carriers(rec) == set()
-
-    def test_one_carrier(self):
-        rec = _FakeRecord(
-            chrom="chr1",
-            pos=1001,
-            stop=5000,
-            samples={"S1": {"GT": (0, 1)}, "S2": {"GT": (0, 0)}},
-        )
-        assert integrate._extract_vcf_carriers(rec) == {"S1"}
-
-    def test_all_carriers(self):
-        rec = _FakeRecord(
-            chrom="chr1",
-            pos=1001,
-            stop=5000,
-            samples={"S1": {"GT": (0, 1)}, "S2": {"GT": (0, 1)}},
-        )
-        assert integrate._extract_vcf_carriers(rec) == {"S1", "S2"}
-
-    def test_no_call_ignored(self):
-        rec = _FakeRecord(
-            chrom="chr1",
-            pos=1001,
-            stop=5000,
-            samples={"S1": {"GT": (None, None)}, "S2": {"GT": (0, 0)}},
-        )
-        assert integrate._extract_vcf_carriers(rec) == {"S1"}
-
-
 # ── Phase 2 tiebreaking tests ──────────────────────────────────────────
 
 
@@ -607,9 +536,10 @@ class TestUpdateGenotype:
         assert gt["RD_GQ"] == 0
 
     def test_carrier_del_ecn1_rdcn_is_0(self):
+        # FIX 5: ploidy-aware GT arity -- ecn=1 carrier -> GT=(1,), not (0,1)
         gt = {"GT": (0, 0), "RD_CN": 2}
         integrate.update_genotype(gt, "S1", True, 1, "DEL")
-        assert gt["GT"] == (0, 1)
+        assert gt["GT"] == (1,)
         assert gt["RD_CN"] == 0  # max(1-1, 0)
         assert gt["RD_GQ"] == 99
         assert gt["GQ"] == 99
@@ -1357,8 +1287,9 @@ class TestPhase3NovelRecords:
             samples_ploidy=[("S1", {"chrY": 1})],
         )
         assert len(written) == 1
-        # chrY with ploidy 1 → ecn=1, carrier=het → RD_CN = max(1-1, 0) = 0
-        assert written[0].samples["S1"]["GT"] == (0, 1)
+        # FIX 5: chrY with ploidy 1 -> ecn=1, carrier -> GT=(1,) (haploid),
+        # RD_CN = max(1-1, 0) = 0
+        assert written[0].samples["S1"]["GT"] == (1,)
         assert written[0].samples["S1"].get("RD_CN") == 0
 
     def test_novel_svlen(self, monkeypatch, tmp_path):
@@ -3540,71 +3471,6 @@ class TestGetExpectedCopyNumber:
 # ── Section 9: VCF Carrier Extraction (cases 9.6-9.10) ──────────────
 
 
-class TestExtractVcfCarriersExtended:
-    """Test cases 9.6-9.10 for VCF carrier extraction."""
-
-    def test_homozygous_alt_genotype(self, tmp_path, monkeypatch):
-        """Case 9.6: Homozygous alt (1,1) → carrier."""
-        vcf = tmp_path / "in.vcf.gz"
-        vcf.write_text(
-            "##fileformat=VCFv4.2\n"
-            "##contig=<ID=chr1,length=1000000>\n"
-            "#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\tS1\n"
-            "chr1\t1000\t.\tA\tG\t.\t.\t.\tGT\t1|1\n"
-        )
-        import pysam
-        real_vf = type("RealVF", (), {
-            "__iter__": lambda self: iter([
-                type("Rec", (), {
-                    "samples": {"S1": {"GT": (1, 1)}},
-                    "sample_ids": ["S1"],
-                })(),
-            ]),
-        })()
-        monkeypatch.setattr(integrate.pysam, "VariantFile", lambda *a, **k: real_vf)
-        recs = list(integrate.pysam.VariantFile(str(vcf)))
-        for rec in recs:
-            carriers = integrate._extract_vcf_carriers(rec)
-        assert "S1" in carriers
-
-    def test_multi_allelic_genotype(self, tmp_path, monkeypatch):
-        """Case 9.7: Multi-allelic (0,2) → carrier."""
-        rec = type("Rec", (), {
-            "samples": {"S1": {"GT": (0, 2)}},
-            "sample_ids": ["S1"],
-        })()
-        carriers = integrate._extract_vcf_carriers(rec)
-        assert "S1" in carriers
-
-    def test_missing_gt_field_defaults_to_homref(self, tmp_path, monkeypatch):
-        """Case 9.8: Missing GT field → defaults to (0,0) → not carrier."""
-        rec = type("Rec", (), {
-            "samples": {"S1": {}},
-            "sample_ids": ["S1"],
-        })()
-        carriers = integrate._extract_vcf_carriers(rec)
-        assert "S1" not in carriers
-
-    def test_mixed_gt_formats_in_same_record(self, tmp_path, monkeypatch):
-        """Case 9.9: Mixed GT formats in same record."""
-        rec = type("Rec", (), {
-            "samples": {"S1": {"GT": (0, 1)}, "S2": {"GT": (1, 1)}},
-            "sample_ids": ["S1", "S2"],
-        })()
-        carriers = integrate._extract_vcf_carriers(rec)
-        assert "S1" in carriers
-        assert "S2" in carriers
-
-    def test_record_with_zero_samples(self, tmp_path, monkeypatch):
-        """Case 9.10: Record with zero samples → no crash."""
-        rec = type("Rec", (), {
-            "samples": {},
-            "sample_ids": [],
-        })()
-        carriers = integrate._extract_vcf_carriers(rec)
-        assert len(carriers) == 0
-
-
 # ── Section 10: Variant-to-GD_ID Matching (cases 10.1-10.7, 10.10) ───
 # SKIPPED: No dedicated _variant_to_gd_id function exists; matching is done inline
 # in main() using IntervalTree.overlap(). Will test via integration tests.
@@ -3825,46 +3691,6 @@ class TestGetExpectedCopyNumberAdditional:
 # ── Section 10: Sample Overlap Scoring (cases 10.7-10.12) ──────────
 
 
-class TestSampleOverlapExtended:
-    """Test cases 10.7-10.12 for sample overlap scoring."""
-
-    """Case 10.7: sample_overlap({'A','B'}, {'B','C'}) → 1/2."""
-    def test_sample_overlap_partial_intersection(self):
-        """Case 10.7: sample_overlap({'A','B'}, {'B','C'}) → 1/2.
-
-        Intersection = {'B'}, size = 1, max(|A|,|B|) = 2, result = 1/2.
-        """
-        result = integrate.sample_overlap({"A", "B"}, {"B", "C"})
-        assert result == pytest.approx(0.5)
-
-    def test_sample_overlap_disjoint(self):
-        """Case 10.8: sample_overlap({'A'*50}, {'B'*50}) → 0.0."""
-        result = integrate.sample_overlap({"A" * 50}, {"B" * 50})
-        assert result == 0.0
-
-    def test_sample_overlap_unicode(self):
-        """Case 10.9: sample_overlap({'café', 'naïve'}, {'café'}) → 0.5."""
-        result = integrate.sample_overlap({"café", "naïve"}, {"café"})
-        assert result == 0.5
-
-    def test_sample_overlap_identical_single(self):
-        """Case 10.10: sample_overlap({'sample 1'}, {'sample 1'}) → 1.0."""
-        result = integrate.sample_overlap({"sample 1"}, {"sample 1"})
-        assert result == 1.0
-
-    def test_sample_overlap_superset_less_than_one(self):
-        """Case 10.11: sample_overlap({'A','B'}, {'A'}) < 1.0."""
-        result = integrate.sample_overlap({"A", "B"}, {"A"})
-        assert result == 0.5
-        assert result < 1.0
-
-    def test_sample_overlap_subset_less_than_one(self):
-        """Case 10.12: sample_overlap({'A'}, {'A','B'}) < 1.0."""
-        result = integrate.sample_overlap({"A"}, {"A", "B"})
-        assert result == 0.5
-        assert result < 1.0
-
-
 # ── Section 11: Genotype Update (cases 11.8, 11.10, 11.12-11.13) ───
 
 
@@ -3880,19 +3706,25 @@ class TestUpdateGenotypeExtended:
         assert gt["RD_GQ"] == 0
 
     def test_non_carrier_del(self):
-        """Case 11.10: ecn=1, carrier=False, svtype=DEL → GT=(0,0), RD_CN=1, RD_GQ=99."""
+        """Case 11.10: ecn=1, carrier=False, svtype=DEL → GT=(0,), RD_CN=1, RD_GQ=99.
+
+        FIX 5: ploidy-aware GT arity -- ecn=1 non-carrier -> GT=(0,), not (0,0).
+        """
         gt = {"GT": (0, 1)}
         integrate.update_genotype(gt, "S1", is_carrier=False, ecn=1, svtype="DEL")
-        assert gt["GT"] == (0, 0)
+        assert gt["GT"] == (0,)
         assert gt["RD_CN"] == 1
         assert gt["RD_GQ"] == 99
         assert gt["GQ"] == 99
 
     def test_inv_svtype_no_rd_cn(self):
-        """Case 11.12: ecn=3, carrier=True, svtype=INV → GT=(0,1), GQ=99, no RD_CN set."""
+        """Case 11.12: ecn=3, carrier=True, svtype=INV → GT=(0,0,1), GQ=99, no RD_CN set.
+
+        FIX 5: ploidy-aware GT arity -- ecn=3 carrier -> GT=(0,0,1), not (0,1).
+        """
         gt = {"GT": (0, 0), "GQ": 0}
         integrate.update_genotype(gt, "S1", is_carrier=True, ecn=3, svtype="INV")
-        assert gt["GT"] == (0, 1)
+        assert gt["GT"] == (0, 0, 1)
         assert gt["GQ"] == 99
         assert "RD_CN" not in gt  # INV/BND never get RD_CN per locked decision
 
@@ -4116,46 +3948,6 @@ class TestBuildTreesFromGDTable:
 
 
 # ── Section 7: VCF Carrier Extraction Edge Cases (cases 9.11-9.13) ──
-
-
-class TestExtractVcfCarriersEdgeCases:
-    """Test cases 9.11-9.13 for VCF carrier extraction."""
-
-    def test_many_samples(self):
-        """Case 9.11: Record with 150 samples → no crash."""
-        samples = {f"S{i}": {"GT": (0, 0) if i % 3 != 0 else (0, 1)} for i in range(150)}
-        rec = type("Rec", (), {
-            "samples": samples,
-            "sample_ids": [f"S{i}" for i in range(150)],
-        })()
-        carriers = integrate._extract_vcf_carriers(rec)
-        assert len(carriers) == 50  # Every 3rd sample is carrier
-
-    def test_triploid_genotype(self):
-        """Case 9.13: GT=(0,1,2) (triploid) → carrier detected."""
-        rec = type("Rec", (), {
-            "samples": {"S1": {"GT": (0, 1, 2)}},
-            "sample_ids": ["S1"],
-        })()
-        carriers = integrate._extract_vcf_carriers(rec)
-        assert "S1" in carriers  # (0,1,2) != (0,0)
-
-    def test_phased_vs_unphased_genotype(self):
-        """Case 9.12: Phased GT (0|1) vs unphased (0,1) — pysam returns tuples.
-
-        pysam always returns GT as a tuple regardless of phase pipe character.
-        Both (0, 1) phased and unphased should be treated as carrier.
-        """
-        rec = type("Rec", (), {
-            "samples": {
-                "S1": {"GT": (0, 1)},   # unphased (0,1)
-                "S2": {"GT": (0, 1)},   # pysam returns tuple for phased too
-            },
-            "sample_ids": ["S1", "S2"],
-        })()
-        carriers = integrate._extract_vcf_carriers(rec)
-        # Both should be carriers — phased vs unphased is irrelevant
-        assert carriers == {"S1", "S2"}
 
 
 # ── Section 23: pysam-Specific Behavior (cases 23.7) ────────────────
@@ -4618,10 +4410,14 @@ class TestPhase2MatchingExtended:
         assert written[0].info.get("GENOMIC_DISORDER") == "GD_DEL1"
 
     def test_zero_length_variant_no_match(self, monkeypatch, tmp_path):
-        """Case 14.16: Zero-length variant → no match (RO = 0)."""
+        """Case 14.16: 1-base variant at GD coords -> RO=1.0 -> match.
+
+        FIX 3 (coordinate frame): the VCF record (pos=1001, stop=1001) has
+        0-based (start, stop) = (1000, 1001), a 1-base interval that lines
+        up exactly with the GD region (1000, 1001). RO = 1.0 -> the GD call
+        matches and replaces the VCF record (1 record written, not 2).
+        """
         header = _make_vcf_header(contigs={"chr1": None}, samples=["S1"])
-        # Zero-length variant: RO = 0
-        # → no Phase 2 match → original + Phase 3 novel = 2 records
         rec = _FakeRecord(
             chrom="chr1", pos=1001, stop=1001,
             record_id="var1", info={"SVTYPE": "DEL"},
@@ -4642,9 +4438,9 @@ class TestPhase2MatchingExtended:
             }],
             samples_ploidy=[("S1", {"chr1": 2})],
         )
-        # RO = 0 → no Phase 2 match → original written + Phase 3 novel
-        assert len(written) == 2
-        assert written[0].id == "var1"
+        # RO = 1.0 -> GD call matches -> VCF record replaced by GD record
+        assert len(written) == 1
+        assert written[0].info.get("GENOMIC_DISORDER") == "GD_DEL1"
 
     def test_vcf_carriers_subset_of_gd_carriers(self, monkeypatch, tmp_path):
         """Case 14.20: VCF carriers ⊂ GD carriers → SO < 1.0."""
@@ -4674,9 +4470,6 @@ class TestPhase2MatchingExtended:
                             ("S3", {"chr1": 2})],
         )
         assert len(written) == 1
-        # SO = |{S1} ∩ {S1,S2,S3}| / max(1, 3) = 1/3 = 0.333
-        so = integrate.sample_overlap({"S1"}, {"S1", "S2", "S3"})
-        assert so == pytest.approx(1 / 3)
 
     def test_vcf_carriers_superset_of_gd_carriers(self, monkeypatch, tmp_path):
         """Case 14.21: VCF carriers ⊃ GD carriers → SO < 1.0."""
@@ -4704,9 +4497,6 @@ class TestPhase2MatchingExtended:
                             ("S3", {"chr1": 2})],
         )
         assert len(written) == 1
-        # SO = |{S1,S2,S3} ∩ {S1}| / max(3, 1) = 1/3
-        so = integrate.sample_overlap({"S1", "S2", "S3"}, {"S1"})
-        assert so == pytest.approx(1 / 3)
 
     def test_vcf_carriers_equal_gd_carriers(self, monkeypatch, tmp_path):
         """Case 14.22: VCF carriers == GD carriers → SO = 1.0."""
@@ -4733,9 +4523,6 @@ class TestPhase2MatchingExtended:
             samples_ploidy=[("S1", {"chr1": 2}), ("S2", {"chr1": 2})],
         )
         assert len(written) == 1
-        # SO = |{S1,S2} ∩ {S1,S2}| / max(2, 2) = 2/2 = 1.0
-        so = integrate.sample_overlap({"S1", "S2"}, {"S1", "S2"})
-        assert so == pytest.approx(1.0)
 
     def test_three_overlapping_naahr_regions(self, monkeypatch, tmp_path):
         """Case 14.23: Three overlapping NAHR regions → correct winner."""
@@ -4771,17 +4558,17 @@ class TestPhase2MatchingExtended:
             ],
             samples_ploidy=[("S1", {"chr1": 2}), ("S2", {"chr1": 2})],
         )
-        # Phase 2 matches GD2 (best RO=1.0). GD1 unmatched → Phase 3 novel.
-        # GD3 has empty carriers → all hom-ref → Phase 3 skips it.
-        # Total = 1 modified VCF + 1 novel = 2
+        # Per-GD-call processing (FIX 1/2/6/7): GD1, GD2, and GD3 all overlap
+        # the single VCF record with RO >= 0.5, so all three match it (and
+        # all drop it). GD1 and GD2 have carriers -> each emits its own
+        # record. GD3 has no carriers and is matched (not novel) -> its
+        # built record is all hom-ref -> not emitted.
+        # Total = GD1 + GD2 = 2 records.
         assert len(written) == 2
-        # GD2 wins: RO=1.0, SO=max(0.5, 0.0) = 0.5 (S1 is carrier in GD2)
-        # GD1: RO=0.77, SO=1.0 (only S1 in VCF)
-        # GD3: RO=0.8, SO=0.0, but empty carriers → skipped by Phase 3
-        # Best RO is GD2 at 1.0
-        assert written[0].info.get("GENOMIC_DISORDER") == "GD2"
         gd_ids_written = [r.info.get("GENOMIC_DISORDER") for r in written if r.info.get("GENOMIC_DISORDER")]
         assert "GD1" in gd_ids_written
+        assert "GD2" in gd_ids_written
+        assert "GD3" not in gd_ids_written
 
     def test_three_tiebreakers_identical(self, monkeypatch, tmp_path):
         """Case 14.24: All three tiebreakers identical → smallest region wins."""
@@ -4813,11 +4600,13 @@ class TestPhase2MatchingExtended:
             ],
             samples_ploidy=[("S1", {"chr1": 2}), ("S2", {"chr1": 2})],
         )
-        # Phase 2 matches GD_SMALLER (RO=0.75 > GD_LARGER RO=0.5). GD_LARGER
-        # unmatched → Phase 3 novel. Total = 1 modified VCF + 1 novel = 2
+        # Per-GD-call processing (FIX 1/2/6/7): both GD_LARGER (RO=0.5) and
+        # GD_SMALLER (RO=0.75) independently match the single VCF record
+        # (both >= the 0.5 cutoff). Both have carrier S1, so both emit their
+        # own record and both drop the shared VCF record. Total = 2.
         assert len(written) == 2
-        # GD_SMALLER wins by higher RO
-        assert written[0].info.get("GENOMIC_DISORDER") == "GD_SMALLER"
+        gd_ids_written = {r.info.get("GENOMIC_DISORDER") for r in written}
+        assert gd_ids_written == {"GD_LARGER", "GD_SMALLER"}
 
 
 # ── Section 18: Coordinate & SVLEN Edge Cases ──────────────────────────
@@ -5418,42 +5207,6 @@ class TestMultiChromosomalLargeCohort:
 
 # ── Section 10: Sample Overlap Edge Cases (10.1-10.6) ─────────────────
 
-class TestSampleOverlapEdgeCases:
-    """Section 10: sample_overlap edge cases (10.1-10.6)."""
-
-    def test_partial_overlap_basic(self):
-        """Case 10.1: Partial overlap — one sample shared out of two."""
-        result = integrate.sample_overlap({"A", "B"}, {"B", "C"})
-        assert result == pytest.approx(1 / 2)  # 1/2 = 0.5
-
-    def test_disjoint_sets(self):
-        """Case 10.2: Disjoint sets → overlap = 0.0."""
-        result = integrate.sample_overlap({"A", "B"}, {"C", "D"})
-        assert result == pytest.approx(0.0)
-
-    def test_identical_sets(self):
-        """Case 10.3: Identical sets → overlap = 1.0."""
-        result = integrate.sample_overlap({"A", "B", "C"}, {"A", "B", "C"})
-        assert result == pytest.approx(1.0)
-
-    def test_subset_relationship(self):
-        """Case 10.4: Subset relationship — {A} ⊂ {A, B, C}."""
-        result = integrate.sample_overlap({"A"}, {"A", "B", "C"})
-        assert result == pytest.approx(1 / 3)
-
-    def test_both_empty_returns_none(self):
-        """Case 10.5: Both empty → None."""
-        result = integrate.sample_overlap(set(), set())
-        assert result is None
-
-    def test_one_empty_nonempty(self):
-        """Case 10.6: One empty, one non-empty → 0.0."""
-        result = integrate.sample_overlap({"A"}, set())
-        assert result == pytest.approx(0.0)
-        result2 = integrate.sample_overlap(set(), {"B"})
-        assert result2 == pytest.approx(0.0)
-
-
 # ── Section 11: Genotype Update Edge Cases (11.1-11.5, 11.6, 11.7, 11.9, 11.11) ──
 
 class TestUpdateGenotypeEdgeCases:
@@ -5468,10 +5221,13 @@ class TestUpdateGenotypeEdgeCases:
         assert gt["RD_GQ"] == 0
 
     def test_ecn_one_carrier_del(self):
-        """Case 11.2: ecn=1, carrier, DEL → RD_CN=0."""
+        """Case 11.2: ecn=1, carrier, DEL → RD_CN=0.
+
+        FIX 5: ploidy-aware GT arity -- ecn=1 carrier -> GT=(1,), not (0,1).
+        """
         gt = {"GT": (0, 0)}
         integrate.update_genotype(gt, "S1", is_carrier=True, ecn=1, svtype="DEL")
-        assert gt["GT"] == (0, 1)
+        assert gt["GT"] == (1,)
         assert gt["RD_CN"] == 0  # max(1-1, 0)
         assert gt["RD_GQ"] == 99
         assert gt["GQ"] == 99
@@ -5854,10 +5610,12 @@ class TestPhase2NAHRMatchingEdgeCases:
                  "region_id": "GD_SMALL", "svtype": "DEL", "samples": ["S1"]},
             ],
         )
-        # GD_SMALL has higher RO (closer to variant)
-        # GD_LARGE novel emitted but S1 carrier becomes het → written
+        # Per-GD-call processing (FIX 1/2/6/7): both GD_LARGE (RO=0.5) and
+        # GD_SMALL (RO=0.75) independently match the single VCF record.
+        # Both have carrier S1, so both emit their own record.
         assert len(written) == 2
-        assert written[0].info.get("GENOMIC_DISORDER") == "GD_SMALL"
+        gd_ids = {r.info.get("GENOMIC_DISORDER") for r in written}
+        assert gd_ids == {"GD_LARGE", "GD_SMALL"}
 
     def test_no_carriers_size_fallback(self, monkeypatch, tmp_path):
         """Case 14.19: No carriers in VCF or gd_calls → None → size fallback."""
@@ -5944,9 +5702,10 @@ class TestPhase2NAHRMatchingEdgeCases:
                 "region_id": "GD_DEL1", "svtype": "DEL", "samples": ["S1"],
             }],
         )
-        # stop updated from GD manifest: end=5000
-        # Both matched record and novel record are written
-        assert len(written) == 2
+        # FIX 1/2/6/7: the matched VCF record is dropped (GD call has
+        # authority) and replaced by exactly one GD record at the GD
+        # manifest's coordinates (stop=5000).
+        assert len(written) == 1
         gd_records = [r for r in written if r.info.get("GENOMIC_DISORDER") == "GD_DEL1"]
         assert len(gd_records) == 1
         assert gd_records[0].stop == 5000

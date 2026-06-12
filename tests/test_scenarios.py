@@ -1526,7 +1526,9 @@ class TestNovelEmission:
     @pytest.mark.integration
     def test_scenario_040_gd_calls_orphan(self, monkeypatch, tmp_path):
         """Scenario 40: gd_calls_orphan."""
-        # A GD_ID appears in gd_calls but NOT in gd_table. Should still emit as novel (no GD table metadata needed for novel).
+        # GD_ORPHAN appears in gd_calls but NOT in gd_table. A record cannot be
+        # built without cluster/BP metadata, so it is warned about and skipped.
+        # GD_REAL (present in gd_table, no overlapping VCF record) emits as novel.
 
         vcf_records = [
         ]
@@ -1545,18 +1547,21 @@ class TestNovelEmission:
         par_intervals = None
         extra_argv = None
 
-        with pytest.raises(RuntimeError, match=".*") as exc_info:
-            _run_integrate_main(
-                monkeypatch, tmp_path,
-                vcf_records=vcf_records,
-                vcf_header=vcf_header,
-                gd_table_rows=gd_table_rows,
-                gd_calls_entries=gd_calls_entries,
-                samples_ploidy=samples_ploidy,
-                par_intervals=par_intervals,
-                extra_argv=extra_argv,
-            )
-        assert "GD-calls entry 'GD_ORPHAN'/DEL has no metadata" in str(exc_info.value)
+        written = _run_integrate_main(
+            monkeypatch, tmp_path,
+            vcf_records=vcf_records,
+            vcf_header=vcf_header,
+            gd_table_rows=gd_table_rows,
+            gd_calls_entries=gd_calls_entries,
+            samples_ploidy=samples_ploidy,
+            par_intervals=par_intervals,
+            extra_argv=extra_argv,
+        )
+
+        # GD_ORPHAN skipped (no metadata); GD_REAL emitted as novel.
+        assert len(written) == 1
+        gd_ids = {r.info.get("GENOMIC_DISORDER") for r in written}
+        assert gd_ids == {"GD_REAL"}
     @pytest.mark.integration
     def test_scenario_052_non_deldup_no_match(self, monkeypatch, tmp_path):
         """Scenario 52: non_deldup_no_match."""
@@ -2329,7 +2334,10 @@ class TestOtherEdgeCases:
     @pytest.mark.integration
     def test_scenario_035_inversion_svtype(self, monkeypatch, tmp_path):
         """Scenario 35: inversion_svtype."""
-        # GD entry with svtype='INV' (neither DEL nor DUP). RD_CN should NOT be set for carriers.
+        # GD entry with svtype='INV' (neither DEL nor DUP). The INV GD call
+        # matches the INV VCF record (svtype-aware), so the VCF record is
+        # dropped and one authoritative GD record is emitted. RD_CN is NOT set
+        # for carriers because the svtype is neither DEL nor DUP.
 
         vcf_records = [
             _FakeRecord(
@@ -2369,7 +2377,9 @@ class TestOtherEdgeCases:
             extra_argv=extra_argv,
         )
 
-        assert len(written) == 2
+        assert len(written) == 1
+        gt = written[0].samples["S1"]
+        assert "RD_CN" not in gt  # not set for non-DEL/DUP svtype
     @pytest.mark.integration
     def test_scenario_038_variant_contains_all_regions(self, monkeypatch, tmp_path):
         """Scenario 38: variant_contains_all_regions."""
@@ -2842,7 +2852,11 @@ class TestOtherEdgeCases:
             extra_argv=extra_argv,
         )
 
-        assert len(written) == 2
+        # FIX 1/2/6/7: GD1 is a single GD call, so it emits exactly ONE
+        # authoritative record (no duplicate IDs), and both matching VCF
+        # records (both RO=1.0) are dropped.
+        assert len(written) == 1
+        assert written[0].info.get("GENOMIC_DISORDER") == "GD1"
     @pytest.mark.integration
     def test_scenario_054_gd_region_contains_variant(self, monkeypatch, tmp_path):
         """Scenario 54: gd_region_contains_variant."""
