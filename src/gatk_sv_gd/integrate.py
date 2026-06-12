@@ -123,6 +123,9 @@ def _build_trees_from_gd_table(
     non_nahr_trees: Dict[str, IntervalTree] = defaultdict(IntervalTree)
     gd_metadata: Dict[str, dict] = {}
 
+    # Local logger for this function (called before main() sets up logging)
+    _log = get_logger("integrate")
+
     for _cluster, locus in gd_table.get_all_loci().items():
         chrom = locus.chrom
         for entry in locus.gd_entries:
@@ -131,6 +134,18 @@ def _build_trees_from_gd_table(
             start = entry["start_GRCh38"]
             end = entry["end_GRCh38"]
             is_nahr = entry["NAHR"] == "yes"
+
+            # Reject inverted intervals — IntervalTree does not allow start >= end.
+            if start >= end:
+                _log.error(
+                    "Skipping GD entry %r on %s: inverted or zero-length "
+                    "interval (start=%d, end=%d)",
+                    gd_id,
+                    chrom,
+                    start,
+                    end,
+                )
+                continue
 
             gd_metadata[gd_id] = {
                 "cluster": locus.cluster,
@@ -743,12 +758,10 @@ def main(argv: Optional[List[Text]] = None) -> None:
                     if (region_id, svtype) in matched_gd_variants:
                         continue
                     if region_id not in gd_metadata:
-                        logger.warning(
-                            "GD-calls entry %r/%s has no metadata; skipping",
-                            region_id,
-                            svtype,
+                        raise RuntimeError(
+                            f"GD-calls entry {region_id!r}/{svtype} has no "
+                            f"metadata in the GD table; cannot emit novel record."
                         )
-                        continue
                     meta = gd_metadata[region_id]
                     chrom = gd_info["chrom"]
                     pos = gd_info["pos"]   # 0-based start
