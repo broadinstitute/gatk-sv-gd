@@ -1,21 +1,39 @@
 """
 Integrate GD calls into a GATK-SV final VCF.
 
-Annotates existing DEL/DUP records that match a known GD region, overwrites
-and reconciles their genotypes from a GD-call carrier manifest, and emits
-novel records for GD calls that have no matching variant in the input VCF.
+Single-pass streaming design — O(GD entries) memory, never O(records):
 
-Three processing phases:
-1. Non-NAHR partial overlap annotation — any DEL/DUP overlapping a non-NAHR
-   region by >= --non-nahr-overlap gets GENOMIC_DISORDER / GD_CLUSTER INFO.
-2. GD-call-centric processing — for each (GD_ID, svtype) GD call, find all
-   overlapping VCF records (RO >= --reciprocal-overlap). Matched VCF records
-   are dropped (GD calls have authority and clear false positives by
-   deletion). Exactly one authoritative record is emitted per GD call at its
-   own coordinates, unless every sample is hom-ref. A GD call is "novel" only
-   when it has zero RO matches.
-3. Write surviving VCF records — records not dropped by Phase 2 are written
-   as-is, followed by the GD records emitted in Phase 2.
+1. Build a ``gd_call_index`` (chrom → IntervalTree of NAHR gd_calls with
+   svtype, start, stop) from the GD-calls TSV.  Identify NAHR / non-NAHR by
+   the GD table (``nahr_trees`` / ``non_nahr_trees``), not by gd_calls
+   membership.
+
+2. Stream the input VCF once.  For each record:
+
+   a. **NAHR drop** — DEL/DUP matching a NAHR ``gd_call_index`` entry by
+      SVTYPE + reciprocal overlap >= ``--reciprocal-overlap``:
+      *do not write*; mark the gd_call as matched.
+   b. **Non-NAHR annotate** — else, if the record overlaps a non-NAHR region
+      by ``fraction_covered >= --non-nahr-overlap``:
+      set ``GENOMIC_DISORDER`` / ``GD_CLUSTER`` INFO in place and *write*.
+      Every overlapping record is annotated; none are dropped.  The existing
+      per-sample genotypes ARE the non-NAHR calls.
+   c. Otherwise — *write* unchanged.
+
+   Records are written to a coordinate-sorted passthrough temp file (order
+   preserved from sorted input).
+
+3. After the stream: for each NAHR gd_call emit one ``_build_gd_record``
+   (``is_novel`` = gd_call not matched) with carriers from the TSV into a
+   small separate GD-records file.
+
+4. Sort only the small GD file (``bcftools sort``); merge with the
+   already-sorted passthrough via ``bcftools concat -a`` (allow-overlaps
+   positional merge) → final output, bgzipped + tabix-indexed.
+
+Non-NAHR gd_calls rows are not expected in the calls TSV (``infer``/``call``
+emit nothing for non-NAHR sites); they are handled exclusively via
+``non_nahr_trees`` derived from the GD table.
 
 Usage (via CLI)::
 
@@ -28,7 +46,8 @@ Usage (via CLI)::
         --out-vcf integrated.vcf.gz
 
 Requirements:
-    ``bcftools`` must be available on PATH (used for final VCF sorting).
+    ``bcftools`` must be available on PATH (used for final VCF sorting and
+    merging).
 """
 
 import argparse
@@ -464,7 +483,7 @@ def _ensure_headers(header: "pysam.VariantHeader") -> None:
             existing_fmt.add(fmt_id)
 
 
-# ── VCF sorting ──────────────────────────────────────────────────────
+# ── VCF sorting and merging ──────────────────────────────────────────
 
 
 def _sort_vcf(vcf_path: str, out_path: str, temp_dir: str) -> None:
@@ -476,6 +495,27 @@ def _sort_vcf(vcf_path: str, out_path: str, temp_dir: str) -> None:
     if proc.returncode != 0:
         raise RuntimeError(
             f"bcftools sort returned non-zero exit code: {proc.returncode}"
+        )
+
+
+def _concat_vcf(passthrough_path: str, gd_sorted_path: str, out_path: str) -> None:
+    """Merge a coordinate-sorted passthrough VCF with sorted GD records.
+
+    Uses ``bcftools concat --allow-overlaps`` (positional merge) so that
+    NAHR GD records are interleaved with passthrough records by coordinate
+    without re-sorting the (potentially large) passthrough file.
+    """
+    proc = subprocess.Popen(
+        [
+            "bcftools", "concat", "--allow-overlaps",
+            passthrough_path, gd_sorted_path,
+            "-O", "z", "-o", out_path,
+        ]
+    )
+    proc.communicate()
+    if proc.returncode != 0:
+        raise RuntimeError(
+            f"bcftools concat returned non-zero exit code: {proc.returncode}"
         )
 
 
@@ -542,48 +582,39 @@ def _parse_args(argv: Optional[List[Text]] = None) -> argparse.Namespace:
     return parser.parse_args()
 
 
-# ── New helpers: GD-call-centric Phase 2 ─────────────────────────────
+# ── GD-call index builder ─────────────────────────────────────────────
 
 
-def _find_overlapping_vcf_records(
-    vcf_records: List[Tuple["pysam.VariantRecord", dict]],
-    chrom: str,
-    start: int,       # 0-based
-    stop: int,        # 0-based exclusive
-    svtype: str,
-    ro_cutoff: float,
-) -> List[Tuple[int, float]]:
-    """Return (index, reciprocal_overlap) for VCF records matching svtype
-    with RO >= threshold against the given interval.
+def _build_gd_call_index(
+    gd_calls: Dict[Tuple[str, str], dict],
+    gd_metadata: Dict[str, dict],
+) -> Dict[str, "IntervalTree"]:
+    """Build a per-chrom IntervalTree index of NAHR gd_calls for fast lookup.
 
-    Iterates the buffered VCF list and filters on:
-    - Matching SVTYPE (svtype-aware: DEL only matches DEL, etc.)
-    - Reciprocal overlap >= threshold
-    - Chromosome match
+    Only NAHR gd_calls entries are indexed (non-NAHR is handled exclusively
+    via ``non_nahr_trees`` from the GD table).  Each interval stores
+    ``(gd_id, svtype, start, stop)`` so the drop test can check SVTYPE and
+    reciprocal overlap without re-reading the gd_calls dict.
 
-    Returns
-    -------
-    list of (index, ro) tuples where index refers to the position in
-    vcf_records and ro is the reciprocal overlap value.
+    Non-NAHR entries (``gd_metadata[gd_id]["nahr"] is False``) are silently
+    skipped — they are annotate-only and never drop VCF records.
     """
-    matches: List[Tuple[int, float]] = []
-    for idx, (record, meta) in enumerate(vcf_records):
-        record_svtype = record.info.get("SVTYPE", "")
-        if isinstance(record_svtype, (tuple, list)):
-            record_svtype = record_svtype[0] if record_svtype else ""
-        record_svtype = str(record_svtype) if record_svtype else ""
-
-        if record_svtype != svtype:
+    index: Dict[str, IntervalTree] = defaultdict(IntervalTree)
+    for (gd_id, svtype), gd_info in gd_calls.items():
+        # Fallback: treat as NAHR when not in metadata (caller is NAHR by default)
+        is_nahr = gd_metadata.get(gd_id, {}).get("nahr", True)
+        if not is_nahr:
+            # Non-NAHR entries: annotate-only path, not drop+replace.
             continue
+        chrom = gd_info["chrom"]
+        start = gd_info["pos"]
+        stop = gd_info["end"]
+        if start < stop:
+            index[chrom].addi(start, stop, (gd_id, svtype, start, stop))
+    return index
 
-        if record.chrom != chrom:
-            continue
 
-        ro = reciprocal_overlap(record.start, record.stop, start, stop)
-        if ro >= ro_cutoff:
-            matches.append((idx, ro))
-
-    return matches
+# ── Record builder ───────────────────────────────────────────────────
 
 
 def _build_gd_record(
@@ -636,8 +667,11 @@ def _build_gd_record(
         new_rec.info["ALGORITHMS"] = ("depth",)
     new_rec.info[GENOMIC_DISORDER_KEY] = gd_id
     new_rec.info["GD_CLUSTER"] = meta["cluster"]
-    new_rec.info["GD_BP1"] = meta["bp1"]
-    new_rec.info["GD_BP2"] = meta["bp2"]
+    # Only set BP fields when non-empty (fallback metadata may use "").
+    if meta.get("bp1"):
+        new_rec.info["GD_BP1"] = meta["bp1"]
+    if meta.get("bp2"):
+        new_rec.info["GD_BP2"] = meta["bp2"]
 
     for sample, gt in new_rec.samples.items():
         ecn = get_expected_cn(
@@ -653,7 +687,13 @@ def _build_gd_record(
 
 
 def main(argv: Optional[List[Text]] = None) -> None:
-    """Entry point for the *integrate* subcommand."""
+    """Entry point for the *integrate* subcommand.
+
+    Single-pass streaming over the input VCF — memory is O(GD entries),
+    never O(records).  NAHR gd_calls drop+replace overlapping records; non-NAHR
+    regions annotate overlapping records in place (no drop, no synthesized
+    record).  See module docstring for the full algorithm.
+    """
     args = _parse_args(argv)
 
     logger = get_logger("integrate")
@@ -688,116 +728,161 @@ def main(argv: Optional[List[Text]] = None) -> None:
 
     os.makedirs(args.temp_dir, exist_ok=True)
 
-    with tempfile.NamedTemporaryFile(
-        dir=args.temp_dir, suffix=".vcf.gz", delete=False
-    ) as tmp_file:
-        tmp_vcf_path = tmp_file.name
+    # Build the per-chrom index of NAHR gd_calls for O(log N) drop decisions.
+    gd_call_index = _build_gd_call_index(gd_calls, gd_metadata)
 
-    try:
-        with pysam.VariantFile(args.vcf) as vcf_in:
-            header = vcf_in.header
-            _ensure_headers(header)
+    with pysam.VariantFile(args.vcf) as vcf_in:
+        header = vcf_in.header
+        _ensure_headers(header)
 
-            vcf_samples = set(header.samples)
+        vcf_samples = set(header.samples)
 
-            # Warn about carriers absent from VCF header
-            for (region_id, svtype), gd_info in gd_calls.items():
-                for sample in gd_info["samples"]:
-                    if sample not in vcf_samples:
-                        logger.warning(
-                            "Carrier sample %r (region %s/%s) not in VCF header",
-                            sample,
-                            region_id,
-                            svtype,
-                        )
+        # Warn about carriers absent from VCF header
+        for (region_id, svtype), gd_info in gd_calls.items():
+            for sample in gd_info["samples"]:
+                if sample not in vcf_samples:
+                    logger.warning(
+                        "Carrier sample %r (region %s/%s) not in VCF header",
+                        sample,
+                        region_id,
+                        svtype,
+                    )
 
-            # Phase 1: Buffer VCF records (instead of writing immediately)
-            vcf_records: List[Tuple["pysam.VariantRecord", dict]] = []
+        # matched_calls: set of (gd_id, svtype) whose VCF records were dropped.
+        # is_novel = (gd_id, svtype) not in matched_calls after the stream.
+        matched_calls: Set[Tuple[str, str]] = set()
 
-            for record in vcf_in:
-                svtype = record.info.get("SVTYPE", "")
-                if isinstance(svtype, (tuple, list)):
-                    svtype = svtype[0] if svtype else ""
-                svtype = str(svtype) if svtype else ""
+        with tempfile.NamedTemporaryFile(
+            dir=args.temp_dir, suffix=".passthrough.vcf.gz", delete=False
+        ) as _pt:
+            passthrough_path = _pt.name
+        with tempfile.NamedTemporaryFile(
+            dir=args.temp_dir, suffix=".gd_records.vcf.gz", delete=False
+        ) as _gd:
+            gd_records_path = _gd.name
+        with tempfile.NamedTemporaryFile(
+            dir=args.temp_dir, suffix=".gd_sorted.vcf.gz", delete=False
+        ) as _gs:
+            gd_sorted_path = _gs.name
 
-                if svtype not in ("DEL", "DUP"):
-                    vcf_records.append((record, {"gd_handled": False, "write": True}))
+        try:
+            # ── Single-pass streaming ────────────────────────────────
+            with pysam.VariantFile(
+                passthrough_path, mode="w", header=header
+            ) as vcf_pass:
+                for record in vcf_in:
+                    svtype = record.info.get("SVTYPE", "")
+                    if isinstance(svtype, (tuple, list)):
+                        svtype = svtype[0] if svtype else ""
+                    svtype = str(svtype) if svtype else ""
+
+                    chrom = record.chrom
+                    start = record.start  # 0-based start
+                    stop = record.stop    # 0-based end (half-open)
+                    record_len = stop - start
+
+                    # ── NAHR drop check (constraint 4 / 5) ──────────
+                    # Check if this record is matched by any NAHR gd_call
+                    # (any svtype).  If matched → drop the record (write
+                    # nothing) and mark the gd_call as matched.
+                    # NAHR drop takes precedence over non-NAHR annotation
+                    # (constraint 5).
+                    dropped = False
+                    if chrom in gd_call_index and record_len > 0:
+                        for iv in gd_call_index[chrom].overlap(start, stop):
+                            iv_gd_id, iv_svtype, iv_start, iv_stop = iv.data
+                            if iv_svtype != svtype:
+                                continue
+                            ro = reciprocal_overlap(start, stop, iv_start, iv_stop)
+                            if ro >= args.reciprocal_overlap:
+                                matched_calls.add((iv_gd_id, iv_svtype))
+                                dropped = True
+                                # Continue checking other overlapping gd_calls
+                                # so all matching entries are marked.
+
+                    if dropped:
+                        continue  # Record dropped — NAHR wins.
+
+                    # Non-DEL/DUP records pass through (after NAHR drop check).
+                    # Non-NAHR annotation is DEL/DUP-specific.
+                    if svtype not in ("DEL", "DUP"):
+                        vcf_pass.write(record)
+                        continue
+
+                    # ── Non-NAHR annotation (constraint 3) ──────────
+                    # Any DEL/DUP record overlapping a non-NAHR region
+                    # by fraction_covered >= threshold gets GENOMIC_DISORDER /
+                    # GD_CLUSTER in place.  All such records are kept.
+                    if record_len > 0 and chrom in non_nahr_trees:
+                        for non_nahr_ov in non_nahr_trees[chrom].overlap(start, stop):
+                            region_id_sv = non_nahr_ov.data  # (gd_id, svtype)
+                            ov_region_id, ov_svtype = region_id_sv
+                            if ov_svtype != svtype:
+                                continue
+                            ov_frac = fraction_covered(
+                                non_nahr_ov.begin, non_nahr_ov.end, start, stop
+                            )
+                            if ov_frac >= args.non_nahr_overlap:
+                                record.info[GENOMIC_DISORDER_KEY] = ov_region_id
+                                record.info["GD_CLUSTER"] = (
+                                    gd_metadata[ov_region_id]["cluster"]
+                                )
+                                # Annotate with the first matching non-NAHR
+                                # region (deterministic: first overlap wins).
+                                break
+
+                    vcf_pass.write(record)
+
+            # ── Emit one GD record per NAHR gd_call ─────────────────
+            # Writes GD records to a small separate file (not the large
+            # passthrough). Only NAHR gd_calls go through _build_gd_record.
+            gd_records: List["pysam.VariantRecord"] = []
+
+            for (gd_id, svtype), gd_info in gd_calls.items():
+                # Only process NAHR entries through the drop+replace path.
+                is_nahr = gd_metadata.get(gd_id, {}).get("nahr", True)
+                if not is_nahr:
+                    # Non-NAHR: annotate-only; no synthesized record.
                     continue
 
-                chrom = record.chrom
-                start = record.start  # 0-based start
-                stop = record.stop    # 0-based end (half-open)
-                record_len = stop - start
-
-                # Phase 1: Non-NAHR partial overlap annotation
-                if record_len > 0 and chrom in non_nahr_trees:
-                    for non_nahr_ov in non_nahr_trees[chrom].overlap(start, stop):
-                        region_id_sv = non_nahr_ov.data  # (gd_id, svtype)
-                        ov_region_id, ov_svtype = region_id_sv
-                        if ov_svtype != svtype:
-                            continue
-                        ov_frac = fraction_covered(
-                            non_nahr_ov.begin, non_nahr_ov.end, start, stop
-                        )
-                        if ov_frac >= args.non_nahr_overlap:
-                            record.info[GENOMIC_DISORDER_KEY] = ov_region_id
-                            record.info["GD_CLUSTER"] = (
-                                gd_metadata[ov_region_id]["cluster"]
-                            )
-                            break
-
-                vcf_records.append((record, {"gd_handled": False, "write": True}))
-
-            # Phase 2: GD-call-centric processing
-            #
-            # Each GD call is processed independently and emits at most one
-            # record.  For every (gd_id, svtype) GD call:
-            #   1. Find all overlapping VCF records (RO >= threshold).
-            #   2. If there is at least one match, the GD call is NOT novel;
-            #      if there are zero matches, it is novel.
-            #   3. Matched VCF records are dropped (added to replaced_vcf)
-            #      regardless of whether the GD call has carriers -- the GD
-            #      call has authority and clears false positives by deletion.
-            #   4. Build a new authoritative record at the GD call's
-            #      coordinates and emit it unless all samples are hom-ref.
-            #
-            # NAHR vs non-NAHR ordering is retained purely for stable,
-            # deterministic output ordering -- it no longer implies any
-            # matching priority between GD calls.
-            gd_records: List[pysam.VariantRecord] = []
-            replaced_vcf: Set[int] = set()
-
-            nahr_gd: List[Tuple[str, str, dict]] = []
-            non_nahr_gd: List[Tuple[str, str, dict]] = []
-            for (gd_id, svtype), gd_info in gd_calls.items():
-                is_nahr = gd_metadata.get(gd_id, {}).get("nahr", False)
-                if is_nahr:
-                    nahr_gd.append((gd_id, svtype, gd_info))
-                else:
-                    non_nahr_gd.append((gd_id, svtype, gd_info))
-
-            for gd_id, svtype, gd_info in nahr_gd + non_nahr_gd:
                 carriers = gd_info["samples"]
                 chrom = gd_info["chrom"]
                 start = gd_info["pos"]    # 0-based
                 stop = gd_info["end"]     # 0-based exclusive
 
-                if gd_id not in gd_metadata:
+                # Skip inverted or zero-length intervals (coordinates from
+                # gd_calls may not have been validated by the GD table loader).
+                if start >= stop:
                     logger.warning(
-                        "GD ID %r has no metadata in the GD table; skipping.",
-                        gd_id,
+                        "GD call %r/%s has inverted/zero interval "
+                        "(start=%d >= stop=%d); skipping.",
+                        gd_id, svtype, start, stop,
                     )
                     continue
 
-                matches = _find_overlapping_vcf_records(
-                    vcf_records, chrom, start, stop, svtype,
-                    args.reciprocal_overlap,
-                )
-                matched_idxs = {idx for idx, _ro in matches}
-                is_novel = not matched_idxs
+                # T2: GD-ID fallback — use the gd_calls coordinates and a
+                # synthetic meta when gd_id is absent from the GD table.
+                # This handles calls produced against an older GD-table version.
+                if gd_id not in gd_metadata:
+                    logger.warning(
+                        "GD ID %r has no metadata in the GD table; "
+                        "using fallback metadata.",
+                        gd_id,
+                    )
+                    meta = {
+                        "cluster": gd_id,
+                        "bp1": "",
+                        "bp2": "",
+                        "nahr": True,
+                        "svtype": svtype,
+                    }
+                else:
+                    meta = gd_metadata[gd_id]
+
+                is_novel = (gd_id, svtype) not in matched_calls
 
                 # Novel call with no carriers: nothing to assert and nothing
-                # to clear -> skip entirely.
+                # to clear → skip entirely.
                 if is_novel and not carriers:
                     continue
 
@@ -813,7 +898,6 @@ def main(argv: Optional[List[Text]] = None) -> None:
                     )
                     continue
 
-                meta = gd_metadata[gd_id]
                 new_rec = _build_gd_record(
                     header, chrom, start, stop,
                     gd_id, svtype, meta,
@@ -822,35 +906,40 @@ def main(argv: Optional[List[Text]] = None) -> None:
                     is_novel,
                 )
 
-                # Matched VCF records are dropped whenever the GD call is
-                # processed -- even with zero carriers, this clears false
-                # positives by deletion (preserves old behaviour).
-                replaced_vcf |= matched_idxs
-
                 if not all_homref_record(new_rec.samples.values()):
                     gd_records.append(new_rec)
 
-            # Phase 3: Write surviving VCF records and GD records
-            with pysam.VariantFile(tmp_vcf_path, mode="w", header=header) as vcf_out:
-                for idx, (record, _meta) in enumerate(vcf_records):
-                    if idx not in replaced_vcf:
-                        vcf_out.write(record)
+            # Write GD records to the small separate file.
+            with pysam.VariantFile(
+                gd_records_path, mode="w", header=header
+            ) as vcf_gd:
                 for gd_rec in gd_records:
-                    vcf_out.write(gd_rec)
+                    vcf_gd.write(gd_rec)
 
-        logger.info("Sorting and indexing final VCF")
-        with tempfile.TemporaryDirectory(dir=args.temp_dir) as temp_sort_dir:
-            _sort_vcf(
-                vcf_path=tmp_vcf_path,
-                out_path=args.out_vcf,
-                temp_dir=temp_sort_dir,
-            )
-        pysam.tabix_index(args.out_vcf, preset="vcf", force=True)
-        logger.info("Integration complete: %s", args.out_vcf)
+            # ── Index passthrough before concat ──────────────────────
+            # pysam.tabix_index bgzips the file in place (if not already
+            # bgzipped) and writes the .tbi index.  bcftools concat
+            # --allow-overlaps requires every input to be bgzipped + indexed.
+            pysam.tabix_index(passthrough_path, preset="vcf", force=True)
 
-    finally:
-        if os.path.exists(tmp_vcf_path):
-            os.unlink(tmp_vcf_path)
+            # ── Sort GD file + merge with passthrough ────────────────
+            logger.info("Sorting GD records and merging with passthrough VCF")
+            with tempfile.TemporaryDirectory(dir=args.temp_dir) as temp_sort_dir:
+                _sort_vcf(
+                    vcf_path=gd_records_path,
+                    out_path=gd_sorted_path,
+                    temp_dir=temp_sort_dir,
+                )
+            # Index the sorted GD file — also required by --allow-overlaps.
+            pysam.tabix_index(gd_sorted_path, preset="vcf", force=True)
+            _concat_vcf(passthrough_path, gd_sorted_path, args.out_vcf)
+            pysam.tabix_index(args.out_vcf, preset="vcf", force=True)
+            logger.info("Integration complete: %s", args.out_vcf)
+
+        finally:
+            for path in (passthrough_path, gd_records_path, gd_sorted_path):
+                if os.path.exists(path):
+                    os.unlink(path)
 
 
 def all_homref_record(sample_dicts) -> bool:

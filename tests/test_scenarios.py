@@ -694,9 +694,14 @@ class TestNAHRMatching:
             extra_argv=extra_argv,
         )
 
-        assert len(written) == 3
+        # Under single-pass streaming:
+        # - GD_NNAHR gd_call: non-NAHR → annotate-only, no synthesized record.
+        # - rec dropped by GD_NAHR1 (NAHR, RO>=0.5).
+        # - GD_NAHR1 emitted (matched); GD_NAHR2 novel (emitted).
+        # Total: 2 records.
+        assert len(written) == 2
         gd_ids = {r.info.get("GENOMIC_DISORDER") for r in written}
-        assert gd_ids == { "GD_NAHR1", "GD_NAHR2", "GD_NNAHR" }
+        assert gd_ids == {"GD_NAHR1", "GD_NAHR2"}
     @pytest.mark.integration
     def test_scenario_029_non_nahr_no_gd_calls(self, monkeypatch, tmp_path):
         """Scenario 29: non_nahr_no_gd_calls."""
@@ -837,11 +842,11 @@ class TestNAHRMatching:
             extra_argv=extra_argv,
         )
 
-        assert len(written) == 2
-        gd_ids = {r.info.get("GENOMIC_DISORDER") for r in written}
-        assert "GD_NAHR" in gd_ids
-        gd_ids = {r.info.get("GENOMIC_DISORDER") for r in written}
-        assert "GD_NNAHR" in gd_ids
+        # Under single-pass streaming: rec dropped by GD_NAHR (NAHR, RO>=0.5).
+        # GD_NNAHR gd_call: non-NAHR → annotate-only, no synthesized record.
+        # GD_NAHR emitted (matched). Total: 1 record.
+        assert len(written) == 1
+        assert written[0].info.get("GENOMIC_DISORDER") == "GD_NAHR"
     @pytest.mark.integration
     def test_scenario_045_carrier_overlap_matrix(self, monkeypatch, tmp_path):
         """Scenario 45: carrier_overlap_matrix."""
@@ -1558,10 +1563,15 @@ class TestNovelEmission:
             extra_argv=extra_argv,
         )
 
-        # GD_ORPHAN skipped (no metadata); GD_REAL emitted as novel.
-        assert len(written) == 1
+        # T2 fallback: GD_ORPHAN uses fallback metadata (cluster=GD_ORPHAN),
+        # carriers present → record emitted. GD_REAL also emitted as novel.
+        assert len(written) == 2
         gd_ids = {r.info.get("GENOMIC_DISORDER") for r in written}
-        assert gd_ids == {"GD_REAL"}
+        assert "GD_REAL" in gd_ids
+        assert "GD_ORPHAN" in gd_ids
+        # Fallback cluster == GD_ORPHAN (used as cluster when not in gd_table)
+        orphan_rec = next(r for r in written if r.info.get("GENOMIC_DISORDER") == "GD_ORPHAN")
+        assert orphan_rec.info.get("GD_CLUSTER") == "GD_ORPHAN"
     @pytest.mark.integration
     def test_scenario_052_non_deldup_no_match(self, monkeypatch, tmp_path):
         """Scenario 52: non_deldup_no_match."""
@@ -2281,9 +2291,14 @@ class TestOtherEdgeCases:
             extra_argv=extra_argv,
         )
 
-        assert len(written) == 3
+        # Under single-pass streaming:
+        # - rec dropped by GD_NAHR_MATCH (NAHR, RO>=0.5); never reaches non-NAHR annotation.
+        # - GD_NONNAHR gd_call: non-NAHR → annotate-only, no synthesized record.
+        # - GD_NAHR_MATCH emitted (matched); GD_NAHR_NOVEL novel (emitted).
+        # Total: 2 records.
+        assert len(written) == 2
         gd_ids = {r.info.get("GENOMIC_DISORDER") for r in written}
-        assert gd_ids == { "GD_NAHR_MATCH", "GD_NAHR_NOVEL", "GD_NONNAHR" }
+        assert gd_ids == {"GD_NAHR_MATCH", "GD_NAHR_NOVEL"}
     @pytest.mark.integration
     def test_scenario_031_multiple_alt_alleles(self, monkeypatch, tmp_path):
         """Scenario 31: multiple_alt_alleles."""
@@ -4515,11 +4530,12 @@ class TestPhaseCollision:
             extra_argv=extra_argv,
         )
 
-        assert len(written) == 2
-        gd_ids = {r.info.get("GENOMIC_DISORDER") for r in written}
-        assert "GD_NAHR" in gd_ids
-        gd_clusters = {r.info.get("GD_CLUSTER") for r in written}
-        assert "clusterY" in gd_clusters
+        # Under single-pass streaming: rec dropped by GD_NAHR (NAHR, RO>=0.5).
+        # GD_NONNAHR gd_call is non-NAHR → annotate-only, no synthesized record.
+        # GD_NAHR emitted (matched). Total: 1 record.
+        assert len(written) == 1
+        assert written[0].info.get("GENOMIC_DISORDER") == "GD_NAHR"
+        assert written[0].info.get("GD_CLUSTER") == "clusterY"
     @pytest.mark.integration
     def test_scenario_030_phase2_match_no_gd_calls(self, monkeypatch, tmp_path):
         """Scenario 30: phase2_match_no_gd_calls."""
@@ -4610,11 +4626,12 @@ class TestPhaseCollision:
             extra_argv=extra_argv,
         )
 
-        assert len(written) == 2
-        gd_ids = {r.info.get("GENOMIC_DISORDER") for r in written}
-        assert "GD_NAHR" in gd_ids
-        gd_clusters = {r.info.get("GD_CLUSTER") for r in written}
-        assert "clusterY" in gd_clusters
+        # Under single-pass streaming: rec dropped by GD_NAHR (NAHR, RO>=0.5).
+        # GD_NNAHR gd_call is non-NAHR → annotate-only, no synthesized record.
+        # GD_NAHR emitted (matched, not novel). Total: 1 record.
+        assert len(written) == 1
+        assert written[0].info.get("GENOMIC_DISORDER") == "GD_NAHR"
+        assert written[0].info.get("GD_CLUSTER") == "clusterY"
 
 class TestScalability:
     """Tests for Scalability scenarios."""

@@ -169,6 +169,23 @@ def _install_test_stub_modules():
 _install_test_stub_modules()
 
 
+# ── Global test stubs for integrate module ───────────────────────────
+
+
+@pytest.fixture(autouse=True)
+def _patch_integrate_concat_vcf(monkeypatch):
+    """No-op _concat_vcf globally — bcftools concat is unavailable in tests.
+
+    Applied to every test session-wide so that any test file that exercises
+    integrate.main() does not need to stub _concat_vcf individually.
+    """
+    try:
+        from gatk_sv_gd import integrate
+        monkeypatch.setattr(integrate, "_concat_vcf", lambda *a, **k: None)
+    except Exception:
+        pass  # If integrate is not importable (rare), skip silently.
+
+
 # ── Scenario data loader ─────────────────────────────────────────────
 
 

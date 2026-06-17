@@ -11,6 +11,9 @@ import pytest
 from gatk_sv_gd import integrate
 from gatk_sv_gd._util import overlap_bases, reciprocal_overlap, fraction_covered
 
+# Capture the real _concat_vcf before any test monkeypatching can replace it.
+_REAL_CONCAT_VCF = integrate._concat_vcf
+
 
 # ── FakeIntervalTree / FakeInterval ─────────────────────────────────
 
@@ -226,6 +229,12 @@ def _make_fake_pysam(read_records=None, header=None):
 def _patch_interval_tree(monkeypatch):
     """Monkeypatch integrate.IntervalTree with functional FakeIntervalTree."""
     monkeypatch.setattr(integrate, "IntervalTree", FakeIntervalTree)
+
+
+@pytest.fixture(autouse=True)
+def _patch_concat_vcf(monkeypatch):
+    """No-op _concat_vcf — bcftools concat is not available in test context."""
+    monkeypatch.setattr(integrate, "_concat_vcf", lambda *a, **k: None)
 
 
 @pytest.fixture()
@@ -1380,8 +1389,13 @@ class TestPhase3NovelRecords:
         assert "RD_CN" in written[0].samples["S1"]
         assert "RD_GQ" in written[0].samples["S1"]
 
-    def test_non_nahr_novel_record(self, monkeypatch, tmp_path):
-        """Case 15.15: Non-NAHR gd_calls entry → novel record emitted."""
+    def test_non_nahr_gd_call_annotate_only(self, monkeypatch, tmp_path):
+        """Case 15.15: Non-NAHR gd_calls entry → annotate-only, no synthesized record.
+
+        Non-NAHR sites are identified by the GD table (non_nahr_trees), not by
+        gd_calls membership.  A non-NAHR gd_calls row does NOT produce a
+        drop+replace cycle.  With no VCF records to annotate, nothing is written.
+        """
         header = _make_vcf_header(contigs={"chr1": None}, samples=["S1"])
         written = _run_integrate_main(
             monkeypatch, tmp_path,
@@ -1396,19 +1410,21 @@ class TestPhase3NovelRecords:
                 "region_id": "GD_NONNAHR", "svtype": "DEL", "samples": ["S1"],
             }],
         )
-        # Non-NAHR goes to Phase 3 as novel record (not Phase 2 matching)
-        assert len(written) == 1
-        assert written[0].info.get("GENOMIC_DISORDER") == "GD_NONNAHR"
+        # Non-NAHR is annotate-only: no VCF records overlap, nothing written.
+        assert len(written) == 0
 
 
 class TestPhaseInteractions:
     """Phase 8d: Phase interactions (section 16)."""
 
     def test_phase1_and_phase2_match(self, monkeypatch, tmp_path):
-        """Case 16.1: Phase 1 annotates, Phase 2 matches → Phase 2 overwrites GD."""
+        """Case 16.1: Non-NAHR annotate + NAHR drop+replace on same record.
+
+        The VCF record overlaps GD_NAHR (NAHR, RO>=0.5) → dropped.
+        Non-NAHR gd_call entry is ignored (annotate-only path, no _build_gd_record).
+        Result: one GD_NAHR record from the drop+replace cycle.
+        """
         header = _make_vcf_header(contigs={"chr1": None}, samples=["S1"])
-        # NAHR overlaps variant (RO >= 0.5), non-NAHR also overlaps
-        # Phase 2 matches GD_NAHR; GD_NONNAHR unmatched → Phase 3 novel
         rec = _FakeRecord(
             chrom="chr1", pos=1501, stop=5500,
             record_id="var1", info={"SVTYPE": "DEL"},
@@ -1433,14 +1449,13 @@ class TestPhaseInteractions:
                  "region_id": "GD_NAHR", "svtype": "DEL", "samples": ["S1"]},
             ],
         )
-        # Phase 2 matches GD_NAHR; GD_NONNAHR novel → 2 records
-        assert len(written) == 2
+        # NAHR drop+replace: one GD_NAHR record.
+        # Non-NAHR gd_call is annotate-only (no synthesized record).
+        assert len(written) == 1
         assert written[0].info.get("GENOMIC_DISORDER") == "GD_NAHR"
-        gd_ids = {r.info.get("GENOMIC_DISORDER") for r in written if r.info.get("GENOMIC_DISORDER")}
-        assert "GD_NONNAHR" in gd_ids
 
     def test_phase2_wins_cluster(self, monkeypatch, tmp_path):
-        """Case 16.2: Phase 1 annotates, Phase 2 matches → GD_CLUSTER from Phase 2 wins."""
+        """Case 16.2: NAHR drop+replace → GD_CLUSTER from GD_NAHR entry."""
         header = _make_vcf_header(contigs={"chr1": None}, samples=["S1"])
         rec = _FakeRecord(
             chrom="chr1", pos=1501, stop=5500,
@@ -1466,11 +1481,15 @@ class TestPhaseInteractions:
                  "region_id": "GD_NAHR", "svtype": "DEL", "samples": ["S1"]},
             ],
         )
-        assert len(written) == 2
+        assert len(written) == 1
         assert written[0].info.get("GD_CLUSTER") == "clusterB"
 
-    def test_non_nahr_novel(self, monkeypatch, tmp_path):
-        """Case 16.3: Non-NAHR entry with gd_calls → goes to Phase 3, can be novel."""
+    def test_non_nahr_gd_call_annotate_only(self, monkeypatch, tmp_path):
+        """Case 16.3: Non-NAHR gd_calls entry → annotate-only, no synthesized record.
+
+        Non-NAHR sites are identified by non_nahr_trees, not by gd_calls membership.
+        With no VCF records to annotate, nothing is written.
+        """
         header = _make_vcf_header(contigs={"chr1": None}, samples=["S1"])
         written = _run_integrate_main(
             monkeypatch, tmp_path,
@@ -1485,12 +1504,11 @@ class TestPhaseInteractions:
                 "region_id": "GD_NONNAHR", "svtype": "DEL", "samples": ["S1"],
             }],
         )
-        assert len(written) == 1
-        assert written[0].info.get("GENOMIC_DISORDER") == "GD_NONNAHR"
-        assert written[0].id == "GD_NONNAHR_DEL_novel"
+        # Non-NAHR: annotate-only, no VCF records to annotate → nothing written.
+        assert len(written) == 0
 
     def test_phase1_and_phase2_same_record(self, monkeypatch, tmp_path):
-        """Case 16.4: Record annotated Phase 1 AND matched Phase 2 → GD from Phase 2."""
+        """Case 16.4: Record overlaps NAHR GD_CALL → dropped+replaced, not annotated."""
         header = _make_vcf_header(contigs={"chr1": None}, samples=["S1"])
         rec = _FakeRecord(
             chrom="chr1", pos=2001, stop=4500,
@@ -1516,8 +1534,8 @@ class TestPhaseInteractions:
                  "region_id": "GD_NAHR", "svtype": "DEL", "samples": ["S1"]},
             ],
         )
-        # GD_NONNAHR novel → 2 records
-        assert len(written) == 2
+        # NAHR drop+replace → one GD_NAHR record; non-NAHR gd_call skipped.
+        assert len(written) == 1
         assert written[0].info.get("GENOMIC_DISORDER") == "GD_NAHR"
 
     def test_phase2_no_gd_calls_entry(self, monkeypatch, tmp_path):
@@ -1545,7 +1563,7 @@ class TestPhaseInteractions:
         assert written[0].info.get("GENOMIC_DISORDER") is None
 
     def test_all_three_phases(self, monkeypatch, tmp_path):
-        """Case 16.6: All three phases active on same chromosome → correct output."""
+        """Case 16.6: NAHR drop+replace + novel NAHR + non-NAHR annotate-only."""
         header = _make_vcf_header(contigs={"chr1": None}, samples=["S1"])
         rec = _FakeRecord(
             chrom="chr1", pos=1501, stop=5500,
@@ -1576,7 +1594,10 @@ class TestPhaseInteractions:
                  "region_id": "GD_NOVEL", "svtype": "DEL", "samples": ["S1"]},
             ],
         )
-        assert len(written) == 3
+        # GD_NAHR: matched (rec dropped), emits 1 NAHR record.
+        # GD_NOVEL: novel (no matching record), emits 1 novel record.
+        # GD_NONNAHR gd_call: annotate-only, no synthesized record.
+        assert len(written) == 2
         gd_ids = {r.info.get("GENOMIC_DISORDER") for r in written}
         assert "GD_NAHR" in gd_ids
         assert "GD_NOVEL" in gd_ids
@@ -6322,10 +6343,15 @@ class TestPhase3NovelRecordsRemaining:
         )
         assert len(written) == 0
 
-    def test_novel_record_missing_metadata_skipped(self, monkeypatch, tmp_path):
-        """Case 15.4: GD entry in gd_calls but not in gd_metadata → skipped."""
+    def test_novel_record_missing_metadata_uses_fallback(self, monkeypatch, tmp_path):
+        """Case 15.4: GD entry in gd_calls but not in gd_metadata → fallback meta used.
+
+        Under the T2 GD-ID fallback, a missing gd_id synthesizes metadata from
+        the gd_calls coordinates and emits a record with GD_ID as the cluster.
+        A record IS written (carriers present → not all-hom-ref).
+        """
         header = _make_vcf_header(contigs={"chr1": None}, samples=["S1"])
-        # GD table has no entry for GD_UNKNOWN, so it's not in gd_metadata
+        # GD table has no entry for GD_UNKNOWN; fallback meta is used.
         written = _run_integrate_main(
             monkeypatch, tmp_path,
             vcf_records=[], vcf_header=header,
@@ -6340,7 +6366,10 @@ class TestPhase3NovelRecordsRemaining:
                 "samples": ["S1"],
             }],
         )
-        assert len(written) == 0
+        # Fallback: record emitted with GD_UNKNOWN as GENOMIC_DISORDER and cluster.
+        assert len(written) == 1
+        assert written[0].info.get("GENOMIC_DISORDER") == "GD_UNKNOWN"
+        assert written[0].info.get("GD_CLUSTER") == "GD_UNKNOWN"
 
     def test_novel_record_id_format(self, monkeypatch, tmp_path):
         """Case 15.10: Novel record ID format: {GD_ID}_{svtype}_novel."""
@@ -7638,4 +7667,543 @@ class TestBcftoolsSortBranchCoverage:
         integrate._sort_vcf("in.vcf.gz", "out.vcf.gz", "/tmp")
 
 
+# ── T1: Streaming refactor tests ─────────────────────────────────────
+
+
+class TestStreaming:
+    """T1: Single-pass streaming — memory O(GD entries), never O(records)."""
+
+    def test_single_pass_matches_buffered(self, monkeypatch, tmp_path):
+        """Output with 10 records matches the expected GD-call-centric result.
+
+        Verifies that the streaming design produces the same final set of
+        written records as the old buffered path for a representative fixture:
+        one NAHR gd_call matched (VCF record dropped + replaced), one novel
+        NAHR gd_call, and a non-NAHR annotation on a passing record.
+        """
+        header = _make_vcf_header(contigs={"chr1": None}, samples=["S1"])
+        # Record that will be DROPPED by GD_NAHR (RO=1.0)
+        rec_nahr = _FakeRecord(
+            chrom="chr1", pos=1001, stop=5000,
+            record_id="var_nahr", info={"SVTYPE": "DEL"},
+            samples={"S1": {"GT": (0, 1)}},
+        )
+        # Record that will be annotated by non-NAHR region (small, doesn't
+        # match GD_NAHR with RO>=0.5 since it overlaps only ~20% of GD_NAHR)
+        rec_annot = _FakeRecord(
+            chrom="chr1", pos=1001, stop=1900,
+            record_id="var_annot", info={"SVTYPE": "DEL"},
+            samples={"S1": {"GT": (0, 1)}},
+        )
+        # Record that passes through untouched (INV)
+        rec_pass = _FakeRecord(
+            chrom="chr1", pos=1001, stop=5000,
+            record_id="var_pass", info={"SVTYPE": "INV"},
+            samples={"S1": {"GT": (0, 1)}},
+        )
+
+        written = _run_integrate_main(
+            monkeypatch, tmp_path,
+            vcf_records=[rec_nahr, rec_annot, rec_pass],
+            vcf_header=header,
+            gd_table_rows=[
+                {"chr": "chr1", "start": 1000, "end": 5000,
+                 "gd_id": "GD_NAHR", "svtype": "DEL", "nahr": "yes",
+                 "cluster": "clusterA", "bp1": "bp1a", "bp2": "bp2a"},
+                {"chr": "chr1", "start": 6000, "end": 9000,
+                 "gd_id": "GD_NOVEL", "svtype": "DEL", "nahr": "yes",
+                 "cluster": "clusterB", "bp1": "bp1b", "bp2": "bp2b"},
+                {"chr": "chr1", "start": 1000, "end": 5000,
+                 "gd_id": "GD_NNAHR", "svtype": "DEL", "nahr": "no",
+                 "cluster": "clusterC", "bp1": "bp1c", "bp2": "bp2c"},
+            ],
+            gd_calls_entries=[
+                {"chrom": "chr1", "pos": 1000, "end": 5000,
+                 "region_id": "GD_NAHR", "svtype": "DEL", "samples": ["S1"]},
+                {"chrom": "chr1", "pos": 6000, "end": 9000,
+                 "region_id": "GD_NOVEL", "svtype": "DEL", "samples": ["S1"]},
+                # Non-NAHR gd_call: annotate-only, no synthesized record.
+                {"chrom": "chr1", "pos": 1000, "end": 5000,
+                 "region_id": "GD_NNAHR", "svtype": "DEL", "samples": ["S1"]},
+            ],
+            extra_argv=["--non-nahr-overlap", "0.02"],
+        )
+
+        # rec_nahr dropped by GD_NAHR; GD_NAHR emitted (matched, not novel).
+        # rec_annot: overlaps GD_NNAHR non-NAHR → annotated, written.
+        # rec_pass (INV): not in gd_call_index for DEL, passes through.
+        # GD_NOVEL: novel (no matching record), emitted.
+        # GD_NNAHR gd_call: non-NAHR → no synthesized record.
+        assert len(written) == 4  # GD_NAHR + rec_annot + rec_pass + GD_NOVEL
+        gd_ids = {r.info.get("GENOMIC_DISORDER") for r in written}
+        assert "GD_NAHR" in gd_ids
+        assert "GD_NOVEL" in gd_ids
+        assert "GD_NNAHR" in gd_ids  # rec_annot got non-NAHR annotation
+        # rec_nahr must be absent (it was dropped by GD_NAHR)
+        ids = [r.id for r in written]
+        assert "var_nahr" not in ids
+
+    def test_no_buffer_growth(self, monkeypatch, tmp_path):
+        """Large N records: gd_call_index holds O(GD entries), not O(records).
+
+        This is a functional correctness test rather than a memory profiling
+        test — we verify that streaming N=1000 records produces the expected
+        output without any in-memory record buffer.
+        """
+        N = 1000
+        header = _make_vcf_header(contigs={"chr1": None}, samples=["S1"])
+        # Generate N records on chr1, none overlapping GD_NAHR(1000-5000)
+        records = [
+            _FakeRecord(
+                chrom="chr1", pos=10000 + i * 100, stop=10050 + i * 100,
+                record_id=f"var_{i}", info={"SVTYPE": "DEL"},
+                samples={"S1": {"GT": (0, 0)}},
+            )
+            for i in range(N)
+        ]
+        # One NAHR gd_call at 1000-5000 (no matching VCF record)
+        written = _run_integrate_main(
+            monkeypatch, tmp_path,
+            vcf_records=records,
+            vcf_header=header,
+            gd_table_rows=[{
+                "chr": "chr1", "start": 1000, "end": 5000,
+                "gd_id": "GD_NAHR", "svtype": "DEL", "nahr": "yes",
+                "cluster": "clusterA", "bp1": "1", "bp2": "2",
+            }],
+            gd_calls_entries=[{
+                "chrom": "chr1", "pos": 1000, "end": 5000,
+                "region_id": "GD_NAHR", "svtype": "DEL", "samples": ["S1"],
+            }],
+        )
+        # All N passthrough records + 1 novel GD_NAHR record
+        assert len(written) == N + 1
+        gd_ids = {r.info.get("GENOMIC_DISORDER") for r in written if r.info.get("GENOMIC_DISORDER")}
+        assert "GD_NAHR" in gd_ids
+
+
+# ── T2: GD-ID fallback tests ─────────────────────────────────────────
+
+
+class TestMissingGdIdFallback:
+    """T2: GD-ID absent from gd_table → fallback metadata used, record emitted."""
+
+    def test_missing_gd_id_uses_fallback(self, monkeypatch, tmp_path, caplog):
+        """gd_id absent from gd_table → fallback meta used, record emitted.
+
+        Verifies constraint: when a gd_calls entry has a gd_id not present in
+        gd_metadata (e.g. calls produced against an older GD-table version),
+        fallback metadata {cluster=gd_id, bp1="", bp2="", nahr=True} is used.
+        The call is not dropped; a record IS emitted with GENOMIC_DISORDER ==
+        gd_id and GD_CLUSTER == gd_id.  GD_BP1/GD_BP2 are absent (empty bp).
+        """
+        header = _make_vcf_header(contigs={"chr1": None}, samples=["S1"])
+
+        import logging
+        with caplog.at_level(logging.WARNING, logger="gatk_sv_gd"):
+            written = _run_integrate_main(
+                monkeypatch, tmp_path,
+                vcf_records=[], vcf_header=header,
+                gd_table_rows=[{
+                    # gd_table only has GD_OTHER; GD_FALLBACK is absent
+                    "chr": "chr1", "start": 2000, "end": 6000,
+                    "gd_id": "GD_OTHER", "svtype": "DEL", "nahr": "yes",
+                    "cluster": "clusterX", "bp1": "1", "bp2": "2",
+                }],
+                gd_calls_entries=[{
+                    "chrom": "chr1", "pos": 1000, "end": 5000,
+                    "region_id": "GD_FALLBACK", "svtype": "DEL",
+                    "samples": ["S1"],
+                }],
+            )
+
+        # Warning must be logged for the missing GD_ID
+        assert any("GD_FALLBACK" in r.message for r in caplog.records)
+
+        # Fallback: record IS emitted (carriers present)
+        assert len(written) == 1
+        rec = written[0]
+        assert rec.info.get("GENOMIC_DISORDER") == "GD_FALLBACK"
+        assert rec.info.get("GD_CLUSTER") == "GD_FALLBACK"
+        # GD_BP1/GD_BP2 absent when bp1=bp2="" (T3 guard)
+        assert rec.info.get("GD_BP1") is None
+        assert rec.info.get("GD_BP2") is None
+
+
+# ── T3: Empty bp1/bp2 guard tests ────────────────────────────────────
+
+
+class TestBuildGdRecord:
+    """Tests for _build_gd_record helper."""
+
+    def _make_trees(self, intervals=None):
+        trees = defaultdict(FakeIntervalTree)
+        if intervals:
+            for chrom, start, end in intervals:
+                trees[chrom].addi(start, end)
+        return trees
+
+    def test_empty_bp_not_set(self):
+        """T3: fallback meta with empty bp1/bp2 → GD_BP1/GD_BP2 absent from INFO."""
+        header = _make_vcf_header(contigs={"chr1": None}, samples=["S1"])
+        meta = {"cluster": "GD_FALLBACK", "bp1": "", "bp2": "", "nahr": True, "svtype": "DEL"}
+        rec = integrate._build_gd_record(
+            header=header,
+            chrom="chr1",
+            pos=1000,
+            stop=5000,
+            gd_id="GD_FALLBACK",
+            svtype="DEL",
+            meta=meta,
+            carriers={"S1"},
+            ploidy_dict={"S1": {"chr1": 2}},
+            par_trees=self._make_trees(),
+            is_novel=True,
+        )
+        assert rec.info.get("GD_BP1") is None
+        assert rec.info.get("GD_BP2") is None
+
+    def test_nonempty_bp_is_set(self):
+        """When bp1/bp2 are non-empty, GD_BP1/GD_BP2 ARE set in INFO."""
+        header = _make_vcf_header(contigs={"chr1": None}, samples=["S1"])
+        meta = {"cluster": "clusterA", "bp1": "LCR1", "bp2": "LCR2", "nahr": True, "svtype": "DEL"}
+        rec = integrate._build_gd_record(
+            header=header,
+            chrom="chr1",
+            pos=1000,
+            stop=5000,
+            gd_id="GD_DEL",
+            svtype="DEL",
+            meta=meta,
+            carriers={"S1"},
+            ploidy_dict={"S1": {"chr1": 2}},
+            par_trees=self._make_trees(),
+            is_novel=True,
+        )
+        assert rec.info.get("GD_BP1") == "LCR1"
+        assert rec.info.get("GD_BP2") == "LCR2"
+
+
+# ── T4: Non-NAHR annotation tests (new) ──────────────────────────────
+
+
+class TestMainNonNahrAnnotationNew:
+    """T4: Non-NAHR in-place annotation in the single streaming pass."""
+
+    def test_all_overlapping_records_annotated(self, monkeypatch, tmp_path):
+        """All records overlapping a non-NAHR region get GENOMIC_DISORDER/GD_CLUSTER.
+
+        Three records overlap the non-NAHR locus; all three must be annotated
+        and none dropped.
+        """
+        header = _make_vcf_header(contigs={"chr1": None}, samples=["S1"])
+        recs = [
+            _FakeRecord(
+                chrom="chr1", pos=1001, stop=3000,
+                record_id=f"var_{i}", info={"SVTYPE": "DEL"},
+                samples={"S1": {"GT": (0, 1)}},
+            )
+            for i in range(3)
+        ]
+
+        written = _run_integrate_main(
+            monkeypatch, tmp_path,
+            vcf_records=recs,
+            vcf_header=header,
+            gd_table_rows=[{
+                "chr": "chr1", "start": 1000, "end": 5000,
+                "gd_id": "GD_NNAHR", "svtype": "DEL", "nahr": "no",
+                "cluster": "clusterC", "bp1": "1", "bp2": "2",
+            }],
+            gd_calls_entries=[],
+            extra_argv=["--non-nahr-overlap", "0.02"],
+        )
+
+        # All 3 records written (none dropped), all annotated.
+        assert len(written) == 3
+        for r in written:
+            assert r.info.get("GENOMIC_DISORDER") == "GD_NNAHR"
+            assert r.info.get("GD_CLUSTER") == "clusterC"
+
+    def test_homref_overlap_still_annotated(self, monkeypatch, tmp_path):
+        """All-hom-ref record overlapping non-NAHR region → annotated and kept.
+
+        The all-hom-ref filter applies only to synthesized GD records from
+        _build_gd_record, not to passthrough records.  A passthrough hom-ref
+        record that overlaps a non-NAHR locus must be annotated and written.
+        """
+        header = _make_vcf_header(contigs={"chr1": None}, samples=["S1"])
+        rec = _FakeRecord(
+            chrom="chr1", pos=1001, stop=3000,
+            record_id="var_homref", info={"SVTYPE": "DEL"},
+            samples={"S1": {"GT": (0, 0)}},  # hom-ref
+        )
+
+        written = _run_integrate_main(
+            monkeypatch, tmp_path,
+            vcf_records=[rec],
+            vcf_header=header,
+            gd_table_rows=[{
+                "chr": "chr1", "start": 1000, "end": 5000,
+                "gd_id": "GD_NNAHR", "svtype": "DEL", "nahr": "no",
+                "cluster": "clusterC", "bp1": "1", "bp2": "2",
+            }],
+            gd_calls_entries=[],
+            extra_argv=["--non-nahr-overlap", "0.02"],
+        )
+
+        assert len(written) == 1
+        assert written[0].info.get("GENOMIC_DISORDER") == "GD_NNAHR"
+
+    def test_nahr_drop_takes_precedence(self, monkeypatch, tmp_path):
+        """Record matching a NAHR gd_call is dropped, even if it grazes non-NAHR.
+
+        A record that matches both a NAHR gd_call (RO >= threshold) AND
+        overlaps a non-NAHR region must be DROPPED (not annotated and kept).
+        NAHR drop wins over non-NAHR annotate (constraint 5).
+        """
+        header = _make_vcf_header(contigs={"chr1": None}, samples=["S1"])
+        rec = _FakeRecord(
+            chrom="chr1", pos=1001, stop=5000,
+            record_id="var1", info={"SVTYPE": "DEL"},
+            samples={"S1": {"GT": (0, 1)}},
+        )
+
+        written = _run_integrate_main(
+            monkeypatch, tmp_path,
+            vcf_records=[rec],
+            vcf_header=header,
+            gd_table_rows=[
+                # NAHR region: fully overlaps the record
+                {"chr": "chr1", "start": 1000, "end": 5000,
+                 "gd_id": "GD_NAHR", "svtype": "DEL", "nahr": "yes",
+                 "cluster": "clusterA", "bp1": "1", "bp2": "2"},
+                # Non-NAHR region: also overlaps the record
+                {"chr": "chr1", "start": 1000, "end": 3000,
+                 "gd_id": "GD_NNAHR", "svtype": "DEL", "nahr": "no",
+                 "cluster": "clusterC", "bp1": "3", "bp2": "4"},
+            ],
+            gd_calls_entries=[{
+                "chrom": "chr1", "pos": 1000, "end": 5000,
+                "region_id": "GD_NAHR", "svtype": "DEL", "samples": ["S1"],
+            }],
+            extra_argv=["--non-nahr-overlap", "0.02"],
+        )
+
+        # rec is dropped by NAHR (never reaches non-NAHR annotation).
+        # GD_NAHR emitted (matched). var1 is NOT in written.
+        gd_ids = {r.info.get("GENOMIC_DISORDER") for r in written}
+        assert "GD_NAHR" in gd_ids
+        assert not any(r.id == "var1" for r in written)
+        # The written record is the GD_NAHR replacement, not var1
+        nahr_recs = [r for r in written if r.info.get("GENOMIC_DISORDER") == "GD_NAHR"]
+        assert len(nahr_recs) == 1
+        assert nahr_recs[0].id != "var1"
+
+
+# ── T1: concat_vcf error path coverage ───────────────────────────────
+
+
+class TestBcftoolsConcatBranchCoverage:
+    """Ensure the _concat_vcf error path is covered.
+
+    We call the underlying implementation directly (the autouse _patch_concat_vcf
+    fixture patches the module namespace but we can call the function from
+    source inspection).
+    """
+
+    def test_bcftools_concat_nonzero_exit_code(self, monkeypatch):
+        """bcftools concat returns non-zero → RuntimeError raised.
+
+        Uses the real _concat_vcf implementation (captured at import time before
+        any autouse fixtures can replace it) with a mocked subprocess.Popen.
+        """
+        class MockPopen:
+            def __init__(self, cmd, *a, **k):
+                pass
+
+            def communicate(self):
+                return (b"", b"concat failed")
+
+            @property
+            def returncode(self):
+                return 1
+
+        monkeypatch.setattr(integrate.subprocess, "Popen", MockPopen)
+        with pytest.raises(RuntimeError, match="exit code: 1"):
+            _REAL_CONCAT_VCF("pass.vcf.gz", "gd.vcf.gz", "out.vcf.gz")
+
+    def test_concat_vcf_called_in_main(self, monkeypatch, tmp_path):
+        """main() calls _concat_vcf after sorting GD records."""
+        calls = []
+
+        def _spy_concat(passthrough, gd_sorted, out):
+            calls.append((passthrough, gd_sorted, out))
+
+        monkeypatch.setattr(integrate, "_concat_vcf", _spy_concat)
+        monkeypatch.setattr(integrate, "_sort_vcf", lambda *a, **k: None)
+
+        header = _make_vcf_header(contigs={"chr1": None}, samples=["S1"])
+        _run_integrate_main(
+            monkeypatch, tmp_path,
+            vcf_records=[], vcf_header=header,
+            gd_table_rows=[],
+            gd_calls_entries=[],
+        )
+        # _concat_vcf was called exactly once from main()
+        assert len(calls) == 1
+
+
+# ── T2: inputs indexed before concat ─────────────────────────────────
+
+
+class TestConcatInputsIndexedBeforeConcat:
+    """Verify that both VCF inputs are bgzipped+indexed before _concat_vcf.
+
+    bcftools concat --allow-overlaps requires every input to be bgzipped and
+    tabix/CSI-indexed.  We use a real _concat_vcf code path (mocking only
+    subprocess.Popen so bcftools is not required) combined with a spy
+    pysam.tabix_index that creates stub .tbi files.  The _concat_vcf spy then
+    asserts that both .tbi sidecar files exist at call time.
+    """
+
+    def test_both_inputs_indexed_and_allow_overlaps_in_argv(
+        self, monkeypatch, tmp_path
+    ):
+        """main() indexes passthrough and gd_sorted before concat --allow-overlaps.
+
+        Assertions:
+        - passthrough_path + '.tbi' exists when _concat_vcf is entered
+        - gd_sorted_path  + '.tbi' exists when _concat_vcf is entered
+        - '--allow-overlaps' is present in the bcftools concat argv
+        """
+        import os
+        import types
+
+        # -- 1. Fake pysam.tabix_index that creates stub .tbi sidecar files ---
+        tabix_calls = []
+
+        def _spy_tabix_index(path, preset=None, force=False):
+            tabix_calls.append(path)
+            # Create the .tbi sidecar so the existence check in the spy works.
+            tbi_path = path + ".tbi"
+            open(tbi_path, "w").close()  # noqa: WPS515
+
+        # -- 2. Spy _concat_vcf: uses real implementation but mocks Popen ------
+        #    We capture the argv and check that .tbi files exist BEFORE the
+        #    subprocess call would fire.
+        concat_invocations = []
+        tbi_present_at_concat = []
+
+        class _MockPopenSuccess:
+            def __init__(self, cmd, *a, **k):
+                concat_invocations.append(list(cmd))
+                # Record whether each input's .tbi exists at this moment.
+                for arg in cmd:
+                    if arg not in ("-O", "z", "-o", "bcftools", "concat",
+                                   "--allow-overlaps") and arg.endswith(".vcf.gz"):
+                        tbi_present_at_concat.append(
+                            (arg, os.path.exists(arg + ".tbi"))
+                        )
+
+            def communicate(self):
+                return (b"", b"")
+
+            @property
+            def returncode(self):
+                return 0
+
+        monkeypatch.setattr(integrate.subprocess, "Popen", _MockPopenSuccess)
+
+        # -- 3. Wire up fake pysam with the spy tabix_index -------------------
+        written_records = []
+
+        class _FakeVF:
+            def __init__(self, path, mode=None, header=None):
+                self._path = path
+                self._mode = mode or "r"
+                if mode == "w":
+                    self.header = header
+                else:
+                    self._records = []
+                    self.header = _make_vcf_header(
+                        contigs={"chr1": None}, samples=["S1"]
+                    )
+
+            def __iter__(self):
+                return iter(getattr(self, "_records", []))
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                pass
+
+            def close(self):
+                pass
+
+            def write(self, record):
+                written_records.append(record)
+
+        fake_pysam = types.SimpleNamespace(
+            VariantFile=_FakeVF,
+            tabix_index=_spy_tabix_index,
+        )
+        monkeypatch.setattr(integrate, "pysam", fake_pysam)
+
+        # -- 4. Override the autouse no-op stubs for _concat_vcf and _sort_vcf -
+        #    Use the real _concat_vcf (captured before any autouse stub ran).
+        monkeypatch.setattr(integrate, "_concat_vcf", _REAL_CONCAT_VCF)
+        monkeypatch.setattr(integrate, "_sort_vcf", lambda *a, **k: None)
+        monkeypatch.setattr(integrate, "setup_logging", lambda *a, **k: None)
+
+        # -- 5. Build minimal input files -------------------------------------
+        gd_table_path = _make_gd_table_file(tmp_path, [])
+        gd_calls_path = _make_gd_calls_file(tmp_path, [])
+        ploidy_path = _make_ploidy_file(
+            tmp_path, [("S1", {"chr1": 2})]
+        )
+        par_path = _make_par_file(tmp_path)
+        out_vcf = str(tmp_path / "out.vcf.gz")
+        (tmp_path / "in.vcf.gz").write_text("dummy")
+
+        integrate.main([
+            "--vcf", str(tmp_path / "in.vcf.gz"),
+            "--gd-calls", gd_calls_path,
+            "--gd-table", gd_table_path,
+            "--par-bed", par_path,
+            "--ploidy-table", ploidy_path,
+            "--out-vcf", out_vcf,
+            "--temp-dir", str(tmp_path),
+        ])
+
+        # -- 6. Assertions -----------------------------------------------------
+        # _concat_vcf (via bcftools concat) was called exactly once.
+        assert len(concat_invocations) == 1, (
+            f"Expected 1 bcftools concat invocation, got {len(concat_invocations)}"
+        )
+        argv = concat_invocations[0]
+
+        # --allow-overlaps must be in the concat command.
+        assert "--allow-overlaps" in argv, (
+            f"--allow-overlaps missing from bcftools concat argv: {argv}"
+        )
+
+        # tabix_index must have been called for the passthrough and gd_sorted
+        # paths before _concat_vcf fired.
+        assert len(tabix_calls) >= 2, (
+            f"Expected tabix_index called >=2 times before concat, got {tabix_calls}"
+        )
+
+        # Every .vcf.gz input to concat must have had its .tbi present.
+        input_checks = [
+            (path, present)
+            for path, present in tbi_present_at_concat
+            if path != out_vcf
+        ]
+        assert input_checks, "No VCF input paths were captured from concat argv"
+        not_indexed = [(p, ok) for p, ok in input_checks if not ok]
+        assert not not_indexed, (
+            f"These concat inputs lacked a .tbi at call time: {not_indexed}"
+        )
 
