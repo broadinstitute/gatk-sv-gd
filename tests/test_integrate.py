@@ -1717,6 +1717,88 @@ class TestMainNonNahrAnnotation:
         assert len(written) == 1
 
 
+class TestNonNahrMaxSizeRatio:
+    """Non-NAHR max-size-ratio filter."""
+
+    def _region_row(self):
+        return {
+            "chr": "chr1", "start": 1000, "end": 2000,  # 1000 bp region
+            "gd_id": "GD_SZ1", "svtype": "DEL",
+            "nahr": "no", "cluster": "clusterSZ", "bp1": "1", "bp2": "2",
+        }
+
+    def test_variant_within_ratio_annotated(self, monkeypatch, tmp_path):
+        header = _make_vcf_header(contigs={"chr1": None}, samples=["S1"])
+        # variant 1900 bp, region 1000 bp → ratio 1.9 < 2.0 → annotated
+        rec = _FakeRecord(
+            chrom="chr1", pos=1000, stop=2900,
+            record_id="v1", info={"SVTYPE": "DEL"},
+            samples={"S1": {"GT": (0, 1)}},
+        )
+        written = _run_integrate_main(
+            monkeypatch, tmp_path,
+            vcf_records=[rec], vcf_header=header,
+            gd_table_rows=[self._region_row()],
+            gd_calls_entries=[],
+            extra_argv=["--non-nahr-overlap", "0.01"],
+        )
+        assert len(written) == 1
+        assert written[0].info.get("GENOMIC_DISORDER") == "GD_SZ1"
+
+    def test_variant_exceeds_ratio_not_annotated(self, monkeypatch, tmp_path):
+        header = _make_vcf_header(contigs={"chr1": None}, samples=["S1"])
+        # variant 2100 bp, region 1000 bp → ratio 2.1 > 2.0 → not annotated
+        rec = _FakeRecord(
+            chrom="chr1", pos=1000, stop=3100,
+            record_id="v2", info={"SVTYPE": "DEL"},
+            samples={"S1": {"GT": (0, 1)}},
+        )
+        written = _run_integrate_main(
+            monkeypatch, tmp_path,
+            vcf_records=[rec], vcf_header=header,
+            gd_table_rows=[self._region_row()],
+            gd_calls_entries=[],
+            extra_argv=["--non-nahr-overlap", "0.01"],
+        )
+        assert len(written) == 1
+        assert written[0].info.get("GENOMIC_DISORDER") is None
+
+    def test_custom_ratio_configurable(self, monkeypatch, tmp_path):
+        header = _make_vcf_header(contigs={"chr1": None}, samples=["S1"])
+        # variant exactly = region size (1000 bp, 0-based 1000-2000); pos=1001 (1-based)
+        rec = _FakeRecord(
+            chrom="chr1", pos=1001, stop=2000,
+            record_id="v3", info={"SVTYPE": "DEL"},
+            samples={"S1": {"GT": (0, 1)}},
+        )
+        # ratio 1.0: variant len (1000) == region len (1000) → 1000 > 1.0*1000 is False → annotated
+        written = _run_integrate_main(
+            monkeypatch, tmp_path,
+            vcf_records=[rec], vcf_header=header,
+            gd_table_rows=[self._region_row()],
+            gd_calls_entries=[],
+            extra_argv=["--non-nahr-overlap", "0.01", "--non-nahr-max-size-ratio", "1.0"],
+        )
+        assert len(written) == 1
+        assert written[0].info.get("GENOMIC_DISORDER") == "GD_SZ1"
+
+        # ratio 0.5: variant len (1000) > 0.5 * region (500) → not annotated
+        rec2 = _FakeRecord(
+            chrom="chr1", pos=1001, stop=2000,
+            record_id="v3b", info={"SVTYPE": "DEL"},
+            samples={"S1": {"GT": (0, 1)}},
+        )
+        written2 = _run_integrate_main(
+            monkeypatch, tmp_path,
+            vcf_records=[rec2], vcf_header=header,
+            gd_table_rows=[self._region_row()],
+            gd_calls_entries=[],
+            extra_argv=["--non-nahr-overlap", "0.01", "--non-nahr-max-size-ratio", "0.5"],
+        )
+        assert len(written2) == 1
+        assert written2[0].info.get("GENOMIC_DISORDER") is None
+
+
 class TestMainCarrierAbsentWarning:
     """Carrier sample absent from VCF header -> warning logged."""
 
@@ -5888,15 +5970,19 @@ class TestPhase1NonNahrMatching:
         assert gd_id in ("GD_NON_A", "GD_NON_B")
 
     def test_non_nahr_completely_contained_in_variant(self, monkeypatch, tmp_path):
-        """Case 13.6: Non-NAHR completely contained in variant."""
+        """Case 13.6: Non-NAHR completely contained in variant.
+
+        Variant (9501 bp) is 9.5x the region (1000 bp), exceeding the default
+        max-size-ratio of 2.0, so annotation is suppressed.
+        """
         header = _make_vcf_header(contigs={"chr1": None}, samples=["S1"])
-        # Variant: 501-10001, Non-NAHR: 2000-3000
+        # Variant: 501-10001 (start=500, record_len=9501), Non-NAHR: 2000-3000 (1000 bp)
         rec = _FakeRecord(
             chrom="chr1", pos=501, stop=10001,
             record_id="var1", info={"SVTYPE": "DEL"},
             samples={"S1": {"GT": (0, 1)}},
         )
-        # overlap = 1000, fraction = 1000/1000 = 1.0 >= 0.5
+        # overlap fraction = 1.0 >= 0.5, but 9501 > 2.0 * 1000 → size cap blocks annotation
         written = _run_integrate_main(
             monkeypatch, tmp_path,
             vcf_records=[rec],
@@ -5910,7 +5996,7 @@ class TestPhase1NonNahrMatching:
             extra_argv=["--non-nahr-overlap", "0.5"],
         )
         assert len(written) == 1
-        assert written[0].info.get("GENOMIC_DISORDER") == "GD_NON1"
+        assert written[0].info.get("GENOMIC_DISORDER") is None
 
     def test_non_nahr_variant_contained_in_non_nahr(self, monkeypatch, tmp_path):
         """Case 13.7: Variant completely contained in non-NAHR."""

@@ -574,6 +574,14 @@ def _parse_args(argv: Optional[List[Text]] = None) -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--non-nahr-max-size-ratio", type=float, default=2.0,
+        help=(
+            "Maximum allowed ratio of variant length to matched non-NAHR region "
+            "length. Variants larger than RATIO * region_length are not annotated "
+            "(default: 2.0)."
+        ),
+    )
+    parser.add_argument(
         "--temp-dir", default="./",
         help="Temporary directory for intermediate files.",
     )
@@ -818,6 +826,9 @@ def main(argv: Optional[List[Text]] = None) -> None:
                             region_id_sv = non_nahr_ov.data  # (gd_id, svtype)
                             ov_region_id, ov_svtype = region_id_sv
                             if ov_svtype != svtype:
+                                continue
+                            region_len = non_nahr_ov.end - non_nahr_ov.begin
+                            if region_len > 0 and record_len > args.non_nahr_max_size_ratio * region_len:
                                 continue
                             ov_frac = fraction_covered(
                                 non_nahr_ov.begin, non_nahr_ov.end, start, stop
