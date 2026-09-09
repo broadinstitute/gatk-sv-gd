@@ -102,13 +102,18 @@ class _FakeRecord:
         )
 
 
+class _FakeContigs(dict):
+    def add(self, chrom):
+        self[chrom] = None
+
+
 class _FakeHeader:
     """Minimal pysam VariantHeader stub."""
 
     def __init__(self, contigs=None, samples=None):
         self.info = {}
         self.formats = {}
-        self.contigs = dict(contigs) if contigs else {}
+        self.contigs = _FakeContigs(contigs or {})
         self.samples = list(samples) if samples else []
         self._lines = []
 
@@ -541,17 +546,17 @@ class TestUpdateGenotype:
         gt = {"GT": (0, 0), "RD_CN": 2, "RD_GQ": 99}
         integrate.update_genotype(gt, "S1", True, 0, "DEL")
         assert gt["GT"] == (None, None)
-        assert gt["RD_CN"] == 0
-        assert gt["RD_GQ"] == 0
+        assert gt["RD_CN"] is None
+        assert gt["RD_GQ"] is None
 
     def test_carrier_del_ecn1_rdcn_is_0(self):
-        # FIX 5: ploidy-aware GT arity -- ecn=1 carrier -> GT=(1,), not (0,1)
+        # GATK-SV keeps diploid-encoded GT for single-copy contigs.
         gt = {"GT": (0, 0), "RD_CN": 2}
         integrate.update_genotype(gt, "S1", True, 1, "DEL")
-        assert gt["GT"] == (1,)
+        assert gt["GT"] == (0, 1)
         assert gt["RD_CN"] == 0  # max(1-1, 0)
-        assert gt["RD_GQ"] == 99
-        assert gt["GQ"] == 99
+        assert gt["RD_GQ"] is None
+        assert gt["GQ"] is None
 
     def test_carrier_del_ecn2(self):
         gt = {"GT": (0, 0)}
@@ -570,15 +575,15 @@ class TestUpdateGenotype:
         integrate.update_genotype(gt, "S1", False, 2, "DEL")
         assert gt["GT"] == (0, 0)
         assert gt["RD_CN"] == 2
-        assert gt["RD_GQ"] == 99
+        assert gt["RD_GQ"] is None
 
     def test_pesr_reset_when_present(self):
         gt = {"GT": (0, 0), "SR_GT": (1,), "SR_GQ": 50, "PE_GT": (1,), "PE_GQ": 50}
         integrate.update_genotype(gt, "S1", True, 2, "DEL")
-        assert gt["SR_GT"] == (0,)
-        assert gt["SR_GQ"] == 99
-        assert gt["PE_GT"] == (0,)
-        assert gt["PE_GQ"] == 99
+        assert gt["SR_GT"] is None
+        assert gt["SR_GQ"] is None
+        assert gt["PE_GT"] is None
+        assert gt["PE_GQ"] is None
 
     def test_pesr_skipped_when_absent(self):
         gt = {"GT": (0, 0)}
@@ -866,6 +871,7 @@ def _run_integrate_main(
     samples_ploidy=None,
     par_intervals=None,
     extra_argv=None,
+    complete_cohort=True,
 ):
     """Helper to run integrate.main() with functional stubs.
 
@@ -873,6 +879,27 @@ def _run_integrate_main(
     """
     gd_table_path = _make_gd_table_file(tmp_path, gd_table_rows)
     gd_calls_path = _make_gd_calls_file(tmp_path, gd_calls_entries)
+    # These fixtures specify carrier sets; explicitly evaluate all other VCF
+    # samples as non-carriers, as the real call command does in its wide TSV.
+    if complete_cohort and not str(gd_calls_path).endswith(".gz"):
+        from pathlib import Path
+        lines = Path(gd_calls_path).read_text().splitlines()
+        columns = lines[0].split("\t")
+        sample_idx = columns.index("sample")
+        carrier_idx = columns.index("is_carrier")
+        gd_idx, sv_idx = columns.index("GD_ID"), columns.index("svtype")
+        groups = {}
+        for line in lines[1:]:
+            fields = line.split("\t")
+            groups.setdefault((fields[gd_idx], fields[sv_idx]), []).append(fields)
+        for rows in groups.values():
+            evaluated = {row[sample_idx] for row in rows}
+            for sample in set(vcf_header.samples) - evaluated:
+                row = list(rows[0])
+                row[sample_idx] = sample
+                row[carrier_idx] = "False"
+                lines.append("\t".join(row))
+        Path(gd_calls_path).write_text("\n".join(lines) + "\n")
     ploidy_path = _make_ploidy_file(
         tmp_path, samples_ploidy or [("S1", {"chr1": 2}), ("S2", {"chr1": 2})]
     )
@@ -1033,7 +1060,7 @@ class TestMainMatchedWithoutCall:
 class TestMainSvtypeBugRegression:
     """Regression: DEL variant must NOT match DUP GD entry at identical coords."""
 
-    def test_del_matches_del_not_dup(self, monkeypatch, tmp_path):
+    def test_conflicting_del_and_dup_rejected(self, monkeypatch, tmp_path):
         header = _make_vcf_header(contigs={"chr1": None}, samples=["S1"])
         del_rec = _FakeRecord(
             chrom="chr1",
@@ -1044,43 +1071,36 @@ class TestMainSvtypeBugRegression:
             samples={"S1": {"GT": (0, 1), "RD_CN": 1}},
         )
 
-        written = _run_integrate_main(
-            monkeypatch, tmp_path,
-            vcf_records=[del_rec],
-            vcf_header=header,
-            gd_table_rows=[
-                {
-                    "chr": "chr1", "start": 1000, "end": 5000,
-                    "gd_id": "GD_DEL1", "svtype": "DEL",
-                    "nahr": "yes", "cluster": "clusterA", "bp1": "1", "bp2": "2",
-                },
-                {
-                    "chr": "chr1", "start": 1000, "end": 5000,
-                    "gd_id": "GD_DUP1", "svtype": "DUP",
-                    "nahr": "yes", "cluster": "clusterA", "bp1": "1", "bp2": "2",
-                },
-            ],
-            gd_calls_entries=[
-                {
-                    "chrom": "chr1", "pos": 1000, "end": 5000,
-                    "region_id": "GD_DEL1", "svtype": "DEL",
-                    "samples": ["S1"],
-                },
-                {
-                    "chrom": "chr1", "pos": 1000, "end": 5000,
-                    "region_id": "GD_DUP1", "svtype": "DUP",
-                    "samples": ["S1"],
-                },
-            ],
-        )
-
-        # The DEL record should be matched to GD_DEL1, NOT GD_DUP1
-        assert len(written) >= 1
-        del_out = written[0]
-        assert del_out.info.get("GENOMIC_DISORDER") == "GD_DEL1"
-        # GD_DUP1 had no matching DEL/DUP VCF record, so it becomes a novel record
-        novel = [r for r in written if r.id and "novel" in r.id]
-        assert any("GD_DUP1" in r.id for r in novel)
+        with pytest.raises(ValueError, match="Conflicting GD copy states"):
+            _run_integrate_main(
+                monkeypatch, tmp_path,
+                vcf_records=[del_rec],
+                vcf_header=header,
+                gd_table_rows=[
+                    {
+                        "chr": "chr1", "start": 1000, "end": 5000,
+                        "gd_id": "GD_DEL1", "svtype": "DEL",
+                        "nahr": "yes", "cluster": "clusterA", "bp1": "1", "bp2": "2",
+                    },
+                    {
+                        "chr": "chr1", "start": 1000, "end": 5000,
+                        "gd_id": "GD_DUP1", "svtype": "DUP",
+                        "nahr": "yes", "cluster": "clusterA", "bp1": "1", "bp2": "2",
+                    },
+                ],
+                gd_calls_entries=[
+                    {
+                        "chrom": "chr1", "pos": 1000, "end": 5000,
+                        "region_id": "GD_DEL1", "svtype": "DEL",
+                        "samples": ["S1"],
+                    },
+                    {
+                        "chrom": "chr1", "pos": 1000, "end": 5000,
+                        "region_id": "GD_DUP1", "svtype": "DUP",
+                        "samples": ["S1"],
+                    },
+                ],
+            )
 
 
 class TestMainNovelRecord:
@@ -1296,9 +1316,9 @@ class TestPhase3NovelRecords:
             samples_ploidy=[("S1", {"chrY": 1})],
         )
         assert len(written) == 1
-        # FIX 5: chrY with ploidy 1 -> ecn=1, carrier -> GT=(1,) (haploid),
+        # GATK-SV chrY with ploidy 1 uses a diploid-encoded carrier GT,
         # RD_CN = max(1-1, 0) = 0
-        assert written[0].samples["S1"]["GT"] == (1,)
+        assert written[0].samples["S1"]["GT"] == (0, 1)
         assert written[0].samples["S1"].get("RD_CN") == 0
 
     def test_novel_svlen(self, monkeypatch, tmp_path):
@@ -3801,34 +3821,30 @@ class TestUpdateGenotypeExtended:
     """Test cases 11.8, 11.10, 11.12-11.13 for genotype update."""
 
     def test_ecn_zero_carrier_dup(self):
-        """Case 11.8: ecn=0, carrier=True, svtype=DUP → GT=(None,None), RD_CN=0."""
+        """Case 11.8: ecn=0 has missing genotype and depth fields."""
         gt = {"GT": (0, 1)}
         integrate.update_genotype(gt, "S1", is_carrier=True, ecn=0, svtype="DUP")
         assert gt["GT"] == (None, None)
-        assert gt["RD_CN"] == 0
-        assert gt["RD_GQ"] == 0
+        assert gt["RD_CN"] is None
+        assert gt["RD_GQ"] is None
 
     def test_non_carrier_del(self):
-        """Case 11.10: ecn=1, carrier=False, svtype=DEL → GT=(0,), RD_CN=1, RD_GQ=99.
-
-        FIX 5: ploidy-aware GT arity -- ecn=1 non-carrier -> GT=(0,), not (0,0).
+        """Case 11.10: ecn=1 non-carriers have GT=(0,0), RD_CN=1 and missing quality.
         """
         gt = {"GT": (0, 1)}
         integrate.update_genotype(gt, "S1", is_carrier=False, ecn=1, svtype="DEL")
-        assert gt["GT"] == (0,)
+        assert gt["GT"] == (0, 0)
         assert gt["RD_CN"] == 1
-        assert gt["RD_GQ"] == 99
-        assert gt["GQ"] == 99
+        assert gt["RD_GQ"] is None
+        assert gt["GQ"] is None
 
     def test_inv_svtype_no_rd_cn(self):
-        """Case 11.12: ecn=3, carrier=True, svtype=INV → GT=(0,0,1), GQ=99, no RD_CN set.
-
-        FIX 5: ploidy-aware GT arity -- ecn=3 carrier -> GT=(0,0,1), not (0,1).
+        """Case 11.12: legacy INV carrier encoding has missing quality and no RD_CN.
         """
         gt = {"GT": (0, 0), "GQ": 0}
         integrate.update_genotype(gt, "S1", is_carrier=True, ecn=3, svtype="INV")
-        assert gt["GT"] == (0, 0, 1)
-        assert gt["GQ"] == 99
+        assert gt["GT"] == (0, 1)
+        assert gt["GQ"] is None
         assert "RD_CN" not in gt  # INV/BND never get RD_CN per locked decision
 
     def test_reset_existing_genotype(self):
@@ -3837,8 +3853,8 @@ class TestUpdateGenotypeExtended:
         integrate.update_genotype(gt, "S1", is_carrier=False, ecn=2, svtype="DUP")
         assert gt["GT"] == (0, 0)
         assert gt["RD_CN"] == 2
-        assert gt["RD_GQ"] == 99
-        assert gt["GQ"] == 99
+        assert gt["RD_GQ"] is None
+        assert gt["GQ"] is None
 
 
 # ── Section 20: Reader Error Paths (cases 20.1-20.8) ────────────────
@@ -4288,7 +4304,7 @@ class TestPhase2MatchingExtended:
         assert len(written) == 1
         assert written[0].samples["S1"]["GT"] == (0, 1)
         assert written[0].samples["S1"]["RD_CN"] == 1  # DEL: ecn-1
-        assert written[0].samples["S1"]["RD_GQ"] == 99
+        assert written[0].samples["S1"]["RD_GQ"] is None
 
     def test_single_sample_non_carrier_skipped(self, monkeypatch, tmp_path):
         """Case 14.8: Single sample, non-carrier → homref, record skipped."""
@@ -4673,8 +4689,8 @@ class TestPhase2MatchingExtended:
         assert "GD2" in gd_ids_written
         assert "GD3" not in gd_ids_written
 
-    def test_three_tiebreakers_identical(self, monkeypatch, tmp_path):
-        """Case 14.24: All three tiebreakers identical → smallest region wins."""
+    def test_nested_same_state_calls_merge(self, monkeypatch, tmp_path):
+        """Overlapping calls with the same CN collapse to one supported extent."""
         header = _make_vcf_header(contigs={"chr1": None}, samples=["S1", "S2"])
         # Two NAHR regions with same RO, same SO, different sizes
         # The one with smaller size diff wins
@@ -4703,13 +4719,10 @@ class TestPhase2MatchingExtended:
             ],
             samples_ploidy=[("S1", {"chr1": 2}), ("S2", {"chr1": 2})],
         )
-        # Per-GD-call processing (FIX 1/2/6/7): both GD_LARGER (RO=0.5) and
-        # GD_SMALLER (RO=0.75) independently match the single VCF record
-        # (both >= the 0.5 cutoff). Both have carrier S1, so both emit their
-        # own record and both drop the shared VCF record. Total = 2.
-        assert len(written) == 2
-        gd_ids_written = {r.info.get("GENOMIC_DISORDER") for r in written}
-        assert gd_ids_written == {"GD_LARGER", "GD_SMALLER"}
+        # Nested same-state GD detections represent one event with both labels.
+        assert len(written) == 1
+        assert (written[0].start, written[0].stop) == (1000, 5000)
+        assert written[0].info["GD_CALL_IDS"] == ("GD_LARGER", "GD_SMALLER")
 
 
 # ── Section 18: Coordinate & SVLEN Edge Cases ──────────────────────────
@@ -4852,24 +4865,23 @@ class TestCoordinateSvlenEdgeCases:
         assert written[0].pos == 2001
         assert written[0].stop == 8000
 
-    def test_svlen_negative_not_written(self, monkeypatch, tmp_path):
+    def test_invalid_interval_rejected(self, monkeypatch, tmp_path):
         """Case 18.8: SVLEN < 0 (end < pos) → should not produce negative SVLEN."""
         header = _make_vcf_header(contigs={"chr1": None}, samples=["S1"])
-        written = _run_integrate_main(
-            monkeypatch, tmp_path,
-            vcf_records=[], vcf_header=header,
-            gd_table_rows=[{
-                "chr": "chr1", "start": 5000, "end": 1000,
-                "gd_id": "GD_REVERSED", "svtype": "DEL", "nahr": "yes",
-                "cluster": "clusterA", "bp1": "1", "bp2": "2",
-            }],
-            gd_calls_entries=[{
-                "chrom": "chr1", "pos": 5000, "end": 1000,
-                "region_id": "GD_REVERSED", "svtype": "DEL", "samples": ["S1"],
-            }],
-        )
-        # end < pos → inverted interval → rejected in Phase 1 → no output
-        assert len(written) == 0
+        with pytest.raises(ValueError, match="Invalid interval"):
+            _run_integrate_main(
+                monkeypatch, tmp_path,
+                vcf_records=[], vcf_header=header,
+                gd_table_rows=[{
+                    "chr": "chr1", "start": 5000, "end": 1000,
+                    "gd_id": "GD_REVERSED", "svtype": "DEL", "nahr": "yes",
+                    "cluster": "clusterA", "bp1": "1", "bp2": "2",
+                }],
+                gd_calls_entries=[{
+                    "chrom": "chr1", "pos": 5000, "end": 1000,
+                    "region_id": "GD_REVERSED", "svtype": "DEL", "samples": ["S1"],
+                }],
+            )
 
     def test_variant_stop_after_pos(self, monkeypatch, tmp_path):
         """Case 18.9: VCF record with stop > pos → normal handling."""
@@ -5069,7 +5081,7 @@ class TestHeaderFormatInfoEdgeCases:
         assert written[0].info.get("GD_BP2") == "Y"
 
     def test_format_gq_nonzero(self, monkeypatch, tmp_path):
-        """Case 19.10: FORMAT GQ is non-zero (99)."""
+        """Case 19.10: FORMAT GQ is missing without calibrated genotype confidence."""
         header = _make_vcf_header(contigs={"chr1": None}, samples=["S1"])
         written = _run_integrate_main(
             monkeypatch, tmp_path,
@@ -5085,8 +5097,8 @@ class TestHeaderFormatInfoEdgeCases:
             }],
         )
         assert len(written) == 1
-        assert written[0].samples["S1"]["GQ"] == 99
-        assert written[0].samples["S1"]["RD_GQ"] == 99
+        assert written[0].samples["S1"]["GQ"] is None
+        assert written[0].samples["S1"]["RD_GQ"] is None
 
 
 # ── Section 24: Contig Naming Consistency ──────────────────────────────
@@ -5316,24 +5328,22 @@ class TestUpdateGenotypeEdgeCases:
     """Section 11: update_genotype edge cases."""
 
     def test_ecn_zero_carrier_no_call(self):
-        """Case 11.1: ecn=0, carrier → no-call (None,None), RD_CN=0."""
+        """Case 11.1: ecn=0 has no-call GT and missing RD_CN."""
         gt = {"GT": (0, 0)}
         integrate.update_genotype(gt, "S1", is_carrier=True, ecn=0, svtype="DEL")
         assert gt["GT"] == (None, None)
-        assert gt["RD_CN"] == 0
-        assert gt["RD_GQ"] == 0
+        assert gt["RD_CN"] is None
+        assert gt["RD_GQ"] is None
 
     def test_ecn_one_carrier_del(self):
-        """Case 11.2: ecn=1, carrier, DEL → RD_CN=0.
-
-        FIX 5: ploidy-aware GT arity -- ecn=1 carrier -> GT=(1,), not (0,1).
+        """Case 11.2: ecn=1 DEL carrier has RD_CN=0 and GT=(0,1).
         """
         gt = {"GT": (0, 0)}
         integrate.update_genotype(gt, "S1", is_carrier=True, ecn=1, svtype="DEL")
-        assert gt["GT"] == (1,)
+        assert gt["GT"] == (0, 1)
         assert gt["RD_CN"] == 0  # max(1-1, 0)
-        assert gt["RD_GQ"] == 99
-        assert gt["GQ"] == 99
+        assert gt["RD_GQ"] is None
+        assert gt["GQ"] is None
 
     def test_ecn_two_carrier_del(self):
         """Case 11.3: ecn=2, carrier, DEL → RD_CN=1."""
@@ -5341,8 +5351,8 @@ class TestUpdateGenotypeEdgeCases:
         integrate.update_genotype(gt, "S1", is_carrier=True, ecn=2, svtype="DEL")
         assert gt["GT"] == (0, 1)
         assert gt["RD_CN"] == 1  # max(2-1, 0)
-        assert gt["RD_GQ"] == 99
-        assert gt["GQ"] == 99
+        assert gt["RD_GQ"] is None
+        assert gt["GQ"] is None
 
     def test_ecn_two_carrier_dup(self):
         """Case 11.4: ecn=2, carrier, DUP → RD_CN=3."""
@@ -5350,8 +5360,8 @@ class TestUpdateGenotypeEdgeCases:
         integrate.update_genotype(gt, "S1", is_carrier=True, ecn=2, svtype="DUP")
         assert gt["GT"] == (0, 1)
         assert gt["RD_CN"] == 3  # ecn+1
-        assert gt["RD_GQ"] == 99
-        assert gt["GQ"] == 99
+        assert gt["RD_GQ"] is None
+        assert gt["GQ"] is None
 
     def test_non_carrier_homref(self):
         """Case 11.5: Non-carrier → homref (0,0), RD_CN=ecn."""
@@ -5359,8 +5369,8 @@ class TestUpdateGenotypeEdgeCases:
         integrate.update_genotype(gt, "S1", is_carrier=False, ecn=2, svtype="DEL")
         assert gt["GT"] == (0, 0)
         assert gt["RD_CN"] == 2
-        assert gt["RD_GQ"] == 99
-        assert gt["GQ"] == 99
+        assert gt["RD_GQ"] is None
+        assert gt["GQ"] is None
 
     def test_pe_sr_reset_when_present(self):
         """Case 11.6: PE/SR FORMAT fields reset when present."""
@@ -5372,10 +5382,10 @@ class TestUpdateGenotypeEdgeCases:
             "SR_GQ": 25,
         }
         integrate.update_genotype(gt, "S1", is_carrier=False, ecn=2, svtype="DEL")
-        assert gt["PE_GT"] == (0,)
-        assert gt["PE_GQ"] == 99
-        assert gt["SR_GT"] == (0,)
-        assert gt["SR_GQ"] == 99
+        assert gt["PE_GT"] is None
+        assert gt["PE_GQ"] is None
+        assert gt["SR_GT"] is None
+        assert gt["SR_GQ"] is None
 
     def test_pe_sr_skipped_when_absent(self):
         """Case 11.7: PE/SR FORMAT fields skipped when absent."""
@@ -5386,14 +5396,14 @@ class TestUpdateGenotypeEdgeCases:
         assert "SR_GT" not in gt
         assert "SR_GQ" not in gt
 
-    def test_gq_set_to_99(self):
-        """Case 11.9: GQ field set to 99 for all genotypes."""
+    def test_gq_missing_without_calibrated_confidence(self):
+        """Case 11.9: GQ is missing when calibrated genotype confidence is unavailable."""
         gt = {"GT": (0, 0)}
         integrate.update_genotype(gt, "S1", is_carrier=True, ecn=2, svtype="DEL")
-        assert gt["GQ"] == 99
+        assert gt["GQ"] is None
         gt2 = {"GT": (0, 0)}
         integrate.update_genotype(gt2, "S1", is_carrier=False, ecn=2, svtype="DEL")
-        assert gt2["GQ"] == 99
+        assert gt2["GQ"] is None
 
     def test_ev_field_set_to_rd(self):
         """Case 11.11: EV field set to ('RD',) for all genotypes."""
@@ -5648,8 +5658,8 @@ class TestPhase2NAHRMatchingEdgeCases:
         # No carriers → all hom-ref → record skipped
         assert len(written) == 0
 
-    def test_higher_sample_overlap_wins(self, monkeypatch, tmp_path):
-        """Case 14.17: Higher sample overlap wins."""
+    def test_overlapping_carrier_sets_share_one_event(self, monkeypatch, tmp_path):
+        """Carrier sets are reconciled per sample without duplicate sites."""
         header = _make_vcf_header(contigs={"chr1": None}, samples=["S1", "S2"])
         rec = _FakeRecord(
             chrom="chr1", pos=1001, stop=5000,
@@ -5677,15 +5687,13 @@ class TestPhase2NAHRMatchingEdgeCases:
                  "region_id": "GD2", "svtype": "DEL", "samples": ["S1", "S2"]},
             ],
         )
-        # Both have same RO (identical coords), GD1 has higher SO → GD1 matched
-        # GD2 unmatched → novel record emitted (S1 becomes carrier)
-        assert len(written) == 2
-        # The matched record should be GD1 (higher SO)
-        gd_ids = {r.info.get("GENOMIC_DISORDER") for r in written}
-        assert "GD1" in gd_ids
+        # Cohort carrier overlap must not create a second call in S1.
+        assert len(written) == 1
+        assert written[0].info["GD_CALL_IDS"] == ("GD1", "GD2")
+        assert all(written[0].samples[s]["GT"] == (0, 1) for s in ("S1", "S2"))
 
-    def test_equal_sample_overlap_size_tiebreak(self, monkeypatch, tmp_path):
-        """Case 14.18: Equal sample overlap → size difference breaks tie."""
+    def test_nested_calls_preserve_all_gd_ids(self, monkeypatch, tmp_path):
+        """Nested detections retain both labels on one event."""
         header = _make_vcf_header(contigs={"chr1": None}, samples=["S1"])
         rec = _FakeRecord(
             chrom="chr1", pos=2001, stop=4000,
@@ -5713,12 +5721,9 @@ class TestPhase2NAHRMatchingEdgeCases:
                  "region_id": "GD_SMALL", "svtype": "DEL", "samples": ["S1"]},
             ],
         )
-        # Per-GD-call processing (FIX 1/2/6/7): both GD_LARGE (RO=0.5) and
-        # GD_SMALL (RO=0.75) independently match the single VCF record.
-        # Both have carrier S1, so both emit their own record.
-        assert len(written) == 2
-        gd_ids = {r.info.get("GENOMIC_DISORDER") for r in written}
-        assert gd_ids == {"GD_LARGE", "GD_SMALL"}
+        assert len(written) == 1
+        assert (written[0].start, written[0].stop) == (1000, 5000)
+        assert written[0].info["GD_CALL_IDS"] == ("GD_LARGE", "GD_SMALL")
 
     def test_no_carriers_size_fallback(self, monkeypatch, tmp_path):
         """Case 14.19: No carriers in VCF or gd_calls → None → size fallback."""
@@ -6410,8 +6415,8 @@ class TestPhase3NovelRecordsRemaining:
         )
         assert len(written) == 0
 
-    def test_novel_record_contig_absent_skipped(self, monkeypatch, tmp_path):
-        """Case 15.3: Contig absent from header → skipped."""
+    def test_novel_record_contig_absent_registered(self, monkeypatch, tmp_path):
+        """New contigs are registered before emitting a detected GD call."""
         header = _make_vcf_header(contigs={"chr1": None}, samples=["S1"])
         written = _run_integrate_main(
             monkeypatch, tmp_path,
@@ -6427,7 +6432,10 @@ class TestPhase3NovelRecordsRemaining:
                 "samples": ["S1"],
             }],
         )
-        assert len(written) == 0
+        assert len(written) == 1
+        assert written[0].chrom == "chr99"
+        assert "chr99" in header.contigs
+        assert written[0].samples["S1"]["GT"] == (0, 1)
 
     def test_novel_record_missing_metadata_uses_fallback(self, monkeypatch, tmp_path):
         """Case 15.4: GD entry in gd_calls but not in gd_metadata → fallback meta used.
@@ -7757,9 +7765,9 @@ class TestBcftoolsSortBranchCoverage:
 
 
 class TestStreaming:
-    """T1: Single-pass streaming — memory O(GD entries), never O(records)."""
+    """Stream unaffected records and reconcile affected overlap components."""
 
-    def test_single_pass_matches_buffered(self, monkeypatch, tmp_path):
+    def test_streaming_reconciles_nested_calls(self, monkeypatch, tmp_path):
         """Output with 10 records matches the expected GD-call-centric result.
 
         Verifies that the streaming design produces the same final set of
@@ -7814,20 +7822,11 @@ class TestStreaming:
             ],
             extra_argv=["--non-nahr-overlap", "0.02"],
         )
-
-        # rec_nahr dropped by GD_NAHR; GD_NAHR emitted (matched, not novel).
-        # rec_annot: overlaps GD_NNAHR non-NAHR → annotated, written.
-        # rec_pass (INV): not in gd_call_index for DEL, passes through.
-        # GD_NOVEL: novel (no matching record), emitted.
-        # GD_NNAHR gd_call: non-NAHR → no synthesized record.
-        assert len(written) == 4  # GD_NAHR + rec_annot + rec_pass + GD_NOVEL
-        gd_ids = {r.info.get("GENOMIC_DISORDER") for r in written}
-        assert "GD_NAHR" in gd_ids
-        assert "GD_NOVEL" in gd_ids
-        assert "GD_NNAHR" in gd_ids  # rec_annot got non-NAHR annotation
-        # rec_nahr must be absent (it was dropped by GD_NAHR)
-        ids = [r.id for r in written]
-        assert "var_nahr" not in ids
+        # The small nested event falls below the replacement threshold.
+        assert len(written) == 4
+        assert {r.id for r in written} == {"GD_NAHR", "var_annot", "var_pass", "GD_NOVEL_DEL_novel"}
+        assert next(r for r in written if r.id == "var_annot").info["GENOMIC_DISORDER"] == "GD_NNAHR"
+        assert next(r for r in written if r.id == "GD_NAHR").info["GD_SOURCE_IDS"] == ("var_nahr",)
 
     def test_no_buffer_growth(self, monkeypatch, tmp_path):
         """Large N records: gd_call_index holds O(GD entries), not O(records).
@@ -8293,3 +8292,224 @@ class TestConcatInputsIndexedBeforeConcat:
             f"These concat inputs lacked a .tbi at call time: {not_indexed}"
         )
 
+
+
+@pytest.mark.parametrize("matched", [False, True])
+@pytest.mark.parametrize("copy_number", [0, 1, 3, 4, 5, 6])
+def test_posterior_copy_state_reaches_integrated_genotypes(monkeypatch, tmp_path, matched, copy_number):
+    from types import SimpleNamespace
+
+    import pandas as pd
+
+    from gatk_sv_gd.call import call_cnvs_from_posteriors
+    from gatk_sv_gd.models import GDLocus
+
+    svtype = "DEL" if copy_number < 2 else "DUP"
+    entry = {
+        "GD_ID": "GD1", "start_GRCh38": 1000, "end_GRCh38": 2000,
+        "svtype": svtype, "BP1": "A", "BP2": "B",
+    }
+    # The target is the second locus, testing local versus global bin indices.
+    loci = {
+        name: GDLocus(
+            cluster=name, chrom="chr1", breakpoints=[(start, start), (end, end)],
+            breakpoint_names=["A", "B"], gd_entries=entries, is_nahr=True, is_terminal=False,
+        )
+        for name, start, end, entries in [("decoy", 100, 200, []), ("target", 1000, 2000, [entry])]
+    }
+    mappings = pd.DataFrame([
+        {"array_idx": idx, "cluster": name, "interval": "A-B", "chr": "chr1", "start": start, "end": end}
+        for idx, (name, start, end) in enumerate([("decoy", 100, 200), ("target", 1000, 2000)])
+    ])
+    rows = []
+    for sample in ["S1", "S2"]:
+        for mapping in mappings.to_dict("records"):
+            carrier = sample == "S1" and mapping["cluster"] == "target"
+            rows.append({
+                **mapping, "sample": sample, "depth": 2.0,
+                "prob_pair_1_1": 0.0 if carrier else 1.0,
+                f"prob_pair_0_{copy_number}": 1.0 if carrier else 0.0,
+            })
+    ploidy = pd.DataFrame({"sample": ["S1", "S2"], "contig": ["chr1", "chr1"], "ploidy": [2, 2]})
+    calls, _ = call_cnvs_from_posteriors(pd.DataFrame(rows), mappings, SimpleNamespace(loci=loci), ploidy)
+    carrier_call = calls.loc[calls["sample"] == "S1"].iloc[0]
+    assert carrier_call["is_carrier"]
+    assert carrier_call["cn_state"] == copy_number
+    calls_path = tmp_path / "posterior_calls.tsv.gz"
+    calls.to_csv(calls_path, sep="\t", index=False)
+    monkeypatch.setattr(sys.modules[__name__], "_make_gd_calls_file", lambda *args: str(calls_path))
+
+    records = [_FakeRecord(
+        chrom="chr1", pos=1001, stop=2000, record_id="old", info={"SVTYPE": svtype},
+        samples={"S1": {"GT": (0, 1)}, "S2": {"GT": (1, 1)}},
+    )] if matched else []
+    written = _run_integrate_main(
+        monkeypatch, tmp_path, vcf_records=records, vcf_header=_make_vcf_header(),
+        gd_table_rows=[{
+            "chr": "chr1", "start": 1000, "end": 2000, "gd_id": "GD1", "svtype": svtype,
+            "nahr": "yes", "cluster": "target", "bp1": "A", "bp2": "B",
+        }],
+        gd_calls_entries=[],
+    )
+    assert len(written) == 1
+    record = written[0]
+    assert record.id == ("GD1" if matched else f"GD1_{svtype}_novel")
+    assert record.samples["S1"]["GT"] == ((0, 1) if copy_number in (1, 3) else (1, 1))
+    assert record.samples["S1"]["RD_CN"] == copy_number
+    assert record.samples["S2"]["GT"] == (0, 0)
+    assert record.samples["S2"]["RD_CN"] == 2
+    for sample in record.samples.values():
+        assert sample["GQ"] == 99
+        assert sample["RD_GQ"] == 99
+
+
+@pytest.mark.parametrize(
+    "ecn, svtype, cn_state, expected_gt",
+    [(1, "DEL", 0, (0, 1)), (1, "DUP", 4, (1, 1)), (3, "DEL", 1, (1, 1)),
+     (3, "DUP", 6, (1, 1)), (0, "DUP", 4, (None, None))],
+)
+def test_copy_state_genotypes_respect_ploidy(ecn, svtype, cn_state, expected_gt):
+    gt = {}
+    integrate.update_genotype(gt, "S1", True, ecn, svtype, cn_state=cn_state)
+    assert gt["GT"] == expected_gt
+    assert gt["RD_CN"] == (cn_state if ecn else None)
+
+
+@pytest.mark.parametrize("cn_text", ["", ".", "NaN", "NA"])
+def test_missing_copy_state_preserves_legacy_carrier_genotype(tmp_path, cn_text):
+    path = tmp_path / "calls.tsv"
+    path.write_text(
+        "sample\tGD_ID\tchrom\tstart\tend\tsvtype\tis_carrier\tcn_state\n"
+        f"S1\tGD1\tchr1\t1000\t2000\tDEL\tTrue\t{cn_text}\n"
+    )
+    info = integrate.read_gd_calls(str(path))[("GD1", "DEL")]
+    gt = {}
+    integrate.update_genotype(gt, "S1", True, 2, "DEL", cn_state=info["copy_states"].get("S1"))
+    assert gt["GT"] == (0, 1)
+    assert gt["RD_CN"] == 1
+
+
+@pytest.mark.parametrize("cn_text", ["-1", "1.5", "inf", "invalid"])
+def test_invalid_copy_state_is_rejected(tmp_path, cn_text):
+    path = tmp_path / "calls.tsv"
+    path.write_text(
+        "sample\tGD_ID\tchrom\tstart\tend\tsvtype\tis_carrier\tcn_state\n"
+        f"S1\tGD1\tchr1\t1000\t2000\tDEL\tTrue\t{cn_text}\n"
+    )
+    with pytest.raises(ValueError):
+        integrate.read_gd_calls(str(path))
+
+
+@pytest.mark.parametrize("svtype, cn_state", [("DEL", 2), ("DUP", 1), ("DEL", -1), ("DUP", 3.5)])
+def test_carrier_copy_state_must_agree_with_event(svtype, cn_state):
+    with pytest.raises(ValueError, match="cn_state"):
+        integrate.update_genotype({}, "S1", True, 2, svtype, cn_state=cn_state)
+
+
+@pytest.mark.parametrize("ecn, baseline_cn, cn_state, expected_gt", [
+    (1, 2, 0, (1, 1)), (1, 2, 1, (0, 1)), (1, 2, 4, (1, 1)),
+    (0, 2, 0, (None, None)),
+])
+def test_par_uses_diploid_baseline_and_retains_contig_ecn(ecn, baseline_cn, cn_state, expected_gt):
+    gt = {}
+    integrate.update_genotype(
+        gt, "S1", True, ecn, "DEL" if cn_state < 2 else "DUP", cn_state, baseline_cn,
+    )
+    assert gt["GT"] == expected_gt
+    assert gt["ECN"] == ecn
+    assert gt["GQ"] is None
+    assert gt["RD_GQ"] is None
+
+
+@pytest.mark.parametrize("genotypes, expected", [
+    ([(0,), (0, 0)], True), ([(0, 0), (None, None)], True), ([None], True),
+    ([(0, 0), (None, 1)], False), ([(0, 1)], False), ([(1, 1)], False),
+])
+def test_record_emission_requires_a_called_alternate_allele(genotypes, expected):
+    assert integrate.all_homref_record({"GT": gt} for gt in genotypes) is expected
+
+
+def test_wide_calls_missing_a_vcf_sample_fail_before_replacement(monkeypatch, tmp_path):
+    with pytest.raises(ValueError, match="missing evaluations for 1 VCF sample"):
+        _run_integrate_main(
+            monkeypatch, tmp_path,
+            vcf_header=_make_vcf_header(),
+            vcf_records=[_FakeRecord(
+                "chr1", 1001, 2000, info={"SVTYPE": "DEL"},
+                samples={"S1": {"GT": (0, 0)}, "S2": {"GT": (0, 1)}},
+            )],
+            gd_table_rows=[{
+                "chr": "chr1", "start": 1000, "end": 2000, "gd_id": "GD1", "svtype": "DEL",
+                "nahr": "yes", "cluster": "C", "bp1": "A", "bp2": "B",
+            }],
+            gd_calls_entries=[{
+                "chrom": "chr1", "pos": 1000, "end": 2000, "region_id": "GD1", "svtype": "DEL", "samples": [],
+            }],
+            complete_cohort=False,
+        )
+    assert not list(tmp_path.glob("*.passthrough.vcf.gz"))
+
+
+def test_zero_ploidy_clears_existing_evidence():
+    gt = {"GT": (0, 1), "RD_CN": 4, "GQ": 99, "PE_GT": 1, "PE_GQ": 40, "EV": ("PE",)}
+    integrate.update_genotype(gt, "S1", True, 0, "DUP", 4)
+    assert gt["ECN"] == 0
+    assert gt["GT"] == (None, None)
+    assert gt["EV"] == (".",)
+    for field in ("RD_CN", "GQ", "RD_GQ", "PE_GT", "PE_GQ"):
+        assert gt[field] is None
+
+
+def test_ambiguous_copy_state_does_not_acquire_high_genotype_quality():
+    import numpy as np
+
+    from gatk_sv_gd.call import infer_call_copy_state
+
+    cn = infer_call_copy_state(
+        np.array([[0.51, 0.49, 0.0]]), [(0, 0), (0, 1), (1, 1)], np.array([0]), "DEL", 2,
+    )
+    gt = {}
+    integrate.update_genotype(gt, "S1", True, 2, "DEL", cn_state=cn)
+    assert gt["GT"] == (1, 1)
+    assert gt["RD_CN"] == 0
+    assert gt["GQ"] is None
+    assert gt["RD_GQ"] is None
+
+
+@pytest.mark.parametrize("svtype, ecn, cn, carrier, probabilities, gq, rd_gq", [
+    ("DEL", 2, 0, True, {0: 0.51, 1: 0.49}, 3, 3),
+    ("DEL", 2, 1, True, {0: 0.01, 1: 0.99}, 20, 20),
+    ("DUP", 2, 4, True, {4: 0.51, 5: 0.49}, 99, 3),
+    ("DUP", 1, 3, True, {3: 0.51, 4: 0.49}, 99, 3),
+    ("DEL", 1, 0, True, {0: 0.99, 1: 0.01}, 20, 20),
+    ("DEL", 2, None, False, {1: 0.01, 2: 0.5, 3: 0.49}, 20, 3),
+    ("DEL", 2, 0, True, {0: 0.051, 1: 0.049}, 0, 0),
+    ("DEL", 2, 0, True, {0: 0.0, 1: 0.0}, 0, 0),
+    ("DEL", 0, 0, True, {0: 1.0}, None, None),
+])
+def test_model_based_genotype_and_copy_number_qualities(svtype, ecn, cn, carrier, probabilities, gq, rd_gq):
+    gt = {}
+    integrate.update_genotype(gt, "S1", carrier, ecn, svtype, cn_state=cn, cn_probabilities=probabilities)
+    assert gt["GQ"] == gq
+    assert gt["RD_GQ"] == rd_gq
+
+
+def test_par_quality_uses_effective_baseline():
+    gt = {}
+    integrate.update_genotype(
+        gt, "S1", True, 1, "DEL", cn_state=0, baseline_cn=2, cn_probabilities={0: 0.51, 1: 0.49},
+    )
+    assert gt["ECN"] == 1
+    assert gt["GT"] == (1, 1)
+    assert gt["GQ"] == 3
+
+
+@pytest.mark.parametrize("value", ['[]', '{"0":-0.1}', '{"0":1.1}', '{"0":0.6,"1":0.6}',
+                                       '{"-1":1}', '{"1.5":1}', '{"01":1}', '{"0":NaN}', 'null'])
+def test_invalid_copy_probability_summary_rejected(value):
+    with pytest.raises(ValueError, match="cn_probabilities"):
+        integrate._parse_copy_probabilities(value)
+
+
+def test_copy_probability_summary_tolerates_floating_point_roundoff():
+    assert integrate._parse_copy_probabilities('{"0":1.00000001}') == {0: 1.0}

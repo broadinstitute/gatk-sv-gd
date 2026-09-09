@@ -207,6 +207,82 @@ gatk-sv-gd call \
 
 * **`posterior-marginal` (Default):** Direct scoring from pair-state posterior marginals. Converts posterior mass into signed, Phred-like QUAL values using a correlation-adjusted effective independent bin penalty to neutralize counting inflation. It enforces a flank non-event check to discard broad, cross-locus megabase alterations.
 
+The calls TSV includes `cn_state`, the total copy number selected within each
+row's DEL/DUP class. Pair-state probabilities with the same total copy number
+are summed, then averaged across the event's body bins; the state with the most
+support wins, with ties favoring the smaller change from sample ploidy. Flanks
+and null-state probability do not contribute. The field is empty when no
+informative event-state support exists; `is_carrier` still determines whether
+the event is called.
+
+`integrate` carries this state into `RD_CN` and assigns diploid carrier genotypes
+as follows:
+
+| Event | Total copy number | `GT` |
+|---|---|---|
+| DEL | 0 | `1/1` |
+| DEL | 1 | `0/1` |
+| DUP | 3 | `0/1` |
+| DUP | 4 or more | `1/1` |
+
+GATK-SV uses two-allele `GT` values on all chromosomes and stores biological
+contig ploidy in `ECN`. With `ECN=1` outside PAR, DEL CN0 and DUP CN2 are `0/1`;
+DUP CN3 or higher is `1/1`. Non-carriers are `0/0`. In PAR, genotype assignment
+and reference `RD_CN` use a diploid baseline while `ECN` retains contig ploidy.
+Samples with `ECN=0` have `./.` and missing depth/quality values. Records without
+any called alternate allele are omitted.
+
+The calls TSV also carries `cn_probabilities`, a JSON object mapping total copy
+numbers to mean posterior probabilities across the event's body bins. Pair
+states with the same total CN are summed; probabilities are averaged over bins
+to avoid multiplying correlated evidence. Null-state mass remains uncertainty.
+
+Integration computes model-based qualities as `round(-10 * log10(1 - P))`,
+capped at 99. `RD_GQ` uses the probability of the emitted `RD_CN`; `GQ` sums the
+probabilities of all copy states mapping to the emitted genotype. For example,
+diploid DUP CN4 and CN5 both support `1/1`. For reference genotypes, `GQ` measures
+absence of that record's event type, while `RD_GQ` measures the expected CN.
+A 51% CN0 / 49% CN1 deletion gets `GQ=3`; 99% support gets `GQ=20`.
+These scores are model-based approximations, without calibration against truth.
+Older TSVs without these probabilities retain missing qualities (`.`).
+Regenerated records use positive `SVLEN=END-POS`, following the GATK-SV convention.
+
+Wide calls TSVs must contain an evaluation for every VCF sample at each NAHR
+entry, including rows with `is_carrier=False`. Integration rejects incomplete
+entries before replacing any records. Legacy six-column carrier-list files
+retain their implicit whole-cohort contract: every unlisted sample is treated
+as a non-carrier, so only use them for the same complete cohort.
+
+Older TSVs without `cn_state`, or rows with a missing state, retain the
+single-alternate-allele assignment. Re-run `call` and `integrate` on existing
+posteriors to obtain copy-state genotypes.
+
+Integration gives positive NAHR GD calls precedence in each sample. A VCF
+DEL/DUP matches when its reciprocal overlap with that sample's GD interval is
+at least `--reciprocal-overlap` (default 0.5: at least half of both intervals).
+The entire matched VCF call is removed for that sample, including any flanks:
+GD coordinates, copy state, and model qualities take precedence even when the
+VCF has a different copy state or the opposite DEL/DUP type. Other samples can
+retain their original call on the same VCF record. For example, a VCF deletion
+at 900–2100 replaced by a GD deletion at 1000–2000 becomes just 1000–2000.
+
+Weak overlaps and unmatched atypical calls keep their original breakpoints and
+annotations. Matching does not spread through chains of neighboring VCF calls.
+Canonical events (both endpoints within the GD table's breakpoint windows and
+sufficient reciprocal overlap) remain subject to complete-cohort reevaluation,
+including negative GD results. Original zero-carrier or missing records are
+preserved unless explicitly replaced. Non-NAHR regions remain annotation-only.
+
+Overlapping same-state GD detections share an event and retain all GD IDs;
+conflicting GD states raise an error before replacing the output. Sample-specific
+GD coordinates remain distinct, and new contigs are added to the header.
+`GD_ATYPICAL` marks noncanonical GD geometry; `GD_CALL_IDS` identifies the GD
+calls represented and `GD_SOURCE_IDS` lists replaced original VCF events.
+Changed sites recalculate `AC`, `AN`, and `AF` when present. GD qualities never
+inherit confidence from replaced VCF calls; redundant GD detections use their
+lowest constituent quality. Integration uses supplied coordinates and does not
+infer new breakpoints from per-bin posteriors.
+
 #### Step 4: Visualize Regional Diagnostics
 
 Renders summaries of call distributions, QUAL spreads, and high-fidelity multi-panel locus tracks.

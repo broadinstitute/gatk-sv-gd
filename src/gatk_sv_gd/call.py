@@ -1,6 +1,7 @@
 """GD CNV calling from model posteriors."""
 
 import argparse
+import json
 import os
 import re
 from typing import Dict, List, Optional, Tuple
@@ -620,6 +621,52 @@ def _get_mean_null_probability_for_call(
     return float(np.clip(np.mean(cluster_null_probability[covered_bin_indices]), 0.0, 1.0))
 
 
+def mean_copy_state_probabilities(
+    sample_pair_probs: np.ndarray,
+    pair_states: List[Tuple[int, int]],
+    covered_bin_indices: np.ndarray,
+) -> dict:
+    """Average body-bin posterior mass by total CN, retaining null uncertainty.
+
+    Do not renormalize away the null state or multiply correlated bin
+    probabilities. Missing/invalid evidence yields no probability summary.
+    """
+    if covered_bin_indices.size == 0:
+        return {}
+    probabilities = sample_pair_probs[covered_bin_indices].mean(axis=0)
+    if not np.all(np.isfinite(probabilities)) or np.any(probabilities < 0):
+        return {}
+    totals = np.array([h1 + h2 for h1, h2 in pair_states])
+    return {int(cn): float(probabilities[totals == cn].sum()) for cn in np.unique(totals)}
+
+
+def infer_call_copy_state(
+    sample_pair_probs: np.ndarray,
+    pair_states: List[Tuple[int, int]],
+    covered_bin_indices: np.ndarray,
+    svtype: str,
+    sample_ploidy: int,
+) -> float:
+    """Choose total CN from event-compatible posterior mass over body bins.
+
+    Sum probabilities of pairs with the same total CN before averaging
+    across bins. Exclude flanks and the uninformative null state. Ties
+    favor the smaller change from the expected copy number.
+    """
+    if covered_bin_indices.size == 0:
+        return np.nan
+    event_mask = build_event_pair_mask(pair_states, svtype, sample_ploidy)
+    if not np.any(event_mask):
+        return np.nan
+    totals = np.array([h1 + h2 for h1, h2 in pair_states])[event_mask]
+    mean_probs = sample_pair_probs[covered_bin_indices][:, event_mask].mean(axis=0)
+    states = sorted(set(totals), key=lambda cn: abs(cn - sample_ploidy))
+    masses = np.array([mean_probs[totals == cn].sum() for cn in states])
+    if not np.all(np.isfinite(masses)) or masses.sum() <= 0:
+        return np.nan
+    return int(states[int(np.argmax(masses))])
+
+
 def score_call_from_posterior_marginals(
     locus,
     entry: dict,
@@ -692,7 +739,7 @@ def score_call_from_posterior_marginals(
             interval_bin_arrays,
             raw_event_probabilities,
         )
-    return _score_posterior_call_from_event_probabilities(
+    call = _score_posterior_call_from_event_probabilities(
         locus=locus,
         entry_spec=entry_spec,
         event_probabilities=event_probabilities,
@@ -705,6 +752,14 @@ def score_call_from_posterior_marginals(
         raw_flank_confidences=raw_flank_confidences,
         cluster_depth=cluster_depth,
     )
+    call["cn_state"] = infer_call_copy_state(
+        sample_pair_probs, pair_states, entry_spec["covered_bin_indices"],
+        entry_spec["svtype"], sample_ploidy,
+    )
+    call["cn_probabilities"] = json.dumps(mean_copy_state_probabilities(
+        sample_pair_probs, pair_states, entry_spec["covered_bin_indices"],
+    ), separators=(",", ":"))
+    return call
 
 
 def call_cnvs_from_posteriors(
@@ -963,7 +1018,7 @@ def call_cnvs_from_posteriors(
                 score_call_from_posterior_marginals(
                     locus=locus,
                     entry=entry_spec["entry"],
-                    sample_pair_probs=pair_prob_3d[s_idx],
+                    sample_pair_probs=cluster_pair_probs,
                     pair_states=pair_state_labels,
                     interval_bin_arrays=interval_bin_arrays_local,
                     sample_ploidy=sample_ploidy,
@@ -1028,6 +1083,8 @@ def call_cnvs_from_posteriors(
                     "n_bins": call["n_bins"],
                     "mean_depth": mean_depth,
                     "sample_ploidy": call.get("sample_ploidy", sample_ploidy),
+                    "cn_state": call.get("cn_state", np.nan),
+                    "cn_probabilities": call.get("cn_probabilities", "{}"),
                     "matched_haplotype": call.get("haplotype", np.nan),
                     "hap_cn_state": call.get("hap_cn_state", np.nan),
                     "matched_seg_start": call.get("matched_seg_start", np.nan),
@@ -1106,6 +1163,8 @@ def call_cnvs_from_posteriors(
             "n_bins",
             "mean_depth",
             "sample_ploidy",
+            "cn_state",
+            "cn_probabilities",
             "matched_haplotype",
             "hap_cn_state",
             "matched_seg_start",
