@@ -1281,7 +1281,7 @@ class TestNovelEmission:
     """Tests for NovelEmission scenarios."""
     @pytest.mark.integration
     def test_scenario_003_cross_svtype_gd_replacement(self, monkeypatch, tmp_path):
-        """Scenario 3: cross_svtype_no_match."""
+        """Scenario 3: cross_svtype_gd_replacement."""
         # The model DUP replaces a sufficiently overlapping original DEL in the same sample.
 
         vcf_records = [
