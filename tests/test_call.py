@@ -1034,3 +1034,53 @@ def test_call_cnvs_marks_best_match_without_confident_carrier(monkeypatch):
     assert calls_df["null_anomaly_score"].tolist() == pytest.approx([0.25, 0.25])
     assert calls_df["is_null_anomalous"].tolist() == [True, True]
     assert calls_df["call_criteria_null_anomaly_score"].tolist() == pytest.approx([0.2, 0.2])
+
+@pytest.mark.parametrize(
+    "svtype, probs, expected",
+    [
+        ("DEL", [0.8, 0.2, 0, 0, 0, 0], 0),
+        ("DEL", [0.5, 0.5, 0, 0, 0, 0], 1),
+        ("DUP", [0, 0, 0.4, 0.2, 0.2, 0.2], 4),
+        ("DUP", [0, 0, 0.5, 0.5, 0, 0], 3),
+    ],
+)
+def test_copy_state_uses_total_posterior_mass_in_body(svtype, probs, expected):
+    # CN=4 has three pair representations; aggregate them before choosing CN.
+    pair_states = [(0, 0), (0, 1), (1, 2), (0, 4), (1, 3), (2, 2)]
+    matrix = np.array([[0, 0, 1, 0, 0, 0], probs, probs, [1, 0, 0, 0, 0, 0]])
+    actual = call_module.infer_call_copy_state(matrix, pair_states, np.array([1, 2]), svtype, 2)
+    assert actual == expected
+
+
+@pytest.mark.parametrize(
+    "pair_states, probs, indices",
+    [
+        ([(0, 0)], [[1.0]], []),
+        ([(1, 1)], [[1.0]], [0]),
+        ([(0, 0)], [[0.0]], [0]),
+        ([(0, 0)], [[np.nan]], [0]),
+    ],
+)
+def test_copy_state_is_missing_without_informative_event_bins(pair_states, probs, indices):
+    actual = call_module.infer_call_copy_state(
+        np.array(probs), pair_states, np.array(indices, dtype=int), "DEL", 2,
+    )
+    assert np.isnan(actual)
+
+
+def test_mean_copy_probabilities_aggregate_pairs_and_preserve_null_uncertainty():
+    states = [(0, 0), (1, 1), (0, 2), (1, 2)]
+    probs = np.array([[0.1, 0.2, 0.3, 0.0], [0.3, 0.1, 0.2, 0.0], [0.0, 0.0, 0.0, 1.0]])
+    summary = call_module.mean_copy_state_probabilities(probs, states, np.array([0, 1]))
+    assert summary == pytest.approx({0: 0.2, 2: 0.4, 3: 0.0})
+    assert sum(summary.values()) == pytest.approx(0.6)
+    # Duplicating correlated bins must not increase confidence.
+    repeated = call_module.mean_copy_state_probabilities(probs, states, np.array([0, 1, 0, 1]))
+    assert repeated == pytest.approx(summary)
+
+
+@pytest.mark.parametrize("indices, probs", [([], [[1.0]]), ([0], [[np.nan]]), ([0], [[-1.0]])])
+def test_mean_copy_probabilities_missing_or_invalid_evidence(indices, probs):
+    assert call_module.mean_copy_state_probabilities(
+        np.array(probs), [(1, 1)], np.array(indices, dtype=int),
+    ) == {}

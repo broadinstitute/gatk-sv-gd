@@ -1,35 +1,16 @@
 """
 Integrate GD calls into a GATK-SV final VCF.
 
-Single-pass streaming design — O(GD entries) memory, never O(records):
+Positive NAHR GD calls replace sufficiently overlapping original DEL/DUP calls
+in each sample, regardless of copy-state or event-type disagreement. Matched
+VCF calls are removed entirely; GD coordinates, genotypes, and qualities win.
+Canonical events are reevaluated using complete-cohort GD calls, including
+negative evaluations. Other original calls retain their coordinates and fields.
 
-1. Build a ``gd_call_index`` (chrom → IntervalTree of NAHR gd_calls with
-   svtype, start, stop) from the GD-calls TSV.  Identify NAHR / non-NAHR by
-   the GD table (``nahr_trees`` / ``non_nahr_trees``), not by gd_calls
-   membership.
-
-2. Stream the input VCF once.  For each record:
-
-   a. **NAHR drop** — DEL/DUP matching a NAHR ``gd_call_index`` entry by
-      SVTYPE + reciprocal overlap >= ``--reciprocal-overlap``:
-      *do not write*; mark the gd_call as matched.
-   b. **Non-NAHR annotate** — else, if the record overlaps a non-NAHR region
-      by ``fraction_covered >= --non-nahr-overlap``:
-      set ``GENOMIC_DISORDER`` / ``GD_CLUSTER`` INFO in place and *write*.
-      Every overlapping record is annotated; none are dropped.  The existing
-      per-sample genotypes ARE the non-NAHR calls.
-   c. Otherwise — *write* unchanged.
-
-   Records are written to a coordinate-sorted passthrough temp file (order
-   preserved from sorted input).
-
-3. After the stream: for each NAHR gd_call emit one ``_build_gd_record``
-   (``is_novel`` = gd_call not matched) with carriers from the TSV into a
-   small separate GD-records file.
-
-4. Sort only the small GD file (``bcftools sort``); merge with the
-   already-sorted passthrough via ``bcftools concat -a`` (allow-overlaps
-   positional merge) → final output, bgzipped + tabix-indexed.
+Only direct GD overlaps are considered; VCF overlap chains do not extend the
+replacement region. The sorted input streams once, retaining direct overlaps
+for sample-level replacement. Reconciled records are sorted with bcftools and
+merged with passthrough records into a bgzipped, tabix-indexed VCF.
 
 Non-NAHR gd_calls rows are not expected in the calls TSV (``infer``/``call``
 emit nothing for non-NAHR sites); they are handled exclusively via
@@ -53,6 +34,8 @@ Requirements:
 import argparse
 import csv
 import gzip
+import json
+import math
 import os
 import subprocess
 import sys
@@ -77,15 +60,18 @@ from gatk_sv_gd.models import GDTable
 GENOMIC_DISORDER_KEY = "GENOMIC_DISORDER"
 
 RESET_PESR_FORMATS_DICT = {
-    "SR_GT": (0,),
-    "SR_GQ": 99,
-    "PE_GT": (0,),
-    "PE_GQ": 99,
+    "SR_GT": None,
+    "SR_GQ": None,
+    "PE_GT": None,
+    "PE_GQ": None,
 }
 
 # Standard header lines that must be present before writing genotypes /
 # novel records.  Only added if the field is absent.
 _INFO_HEADERS_REQUIRED = [
+    '##INFO=<ID=GD_ATYPICAL,Number=0,Type=Flag,Description="Noncanonical GD event breakpoints">',
+    '##INFO=<ID=GD_CALL_IDS,Number=.,Type=String,Description="GD calls represented by this event">',
+    '##INFO=<ID=GD_SOURCE_IDS,Number=.,Type=String,Description="Original VCF events replaced by this GD event">',
     f'##INFO=<ID={GENOMIC_DISORDER_KEY},Number=1,Type=String,'
     'Description="Genomic disorder region">',
     '##INFO=<ID=GD_CLUSTER,Number=1,Type=String,'
@@ -96,8 +82,8 @@ _INFO_HEADERS_REQUIRED = [
     'Description="Genomic disorder breakpoint 2">',
     '##INFO=<ID=SVTYPE,Number=1,Type=String,'
     'Description="Type of structural variant">',
-    '##INFO=<ID=SVLEN,Number=.,Type=Integer,'
-    'Description="Difference in length between REF and ALT alleles">',
+    '##INFO=<ID=SVLEN,Number=1,Type=Integer,'
+    'Description="Length of affected segment on the reference">',
     '##INFO=<ID=END,Number=1,Type=Integer,'
     'Description="End position of the structural variant">',
     '##INFO=<ID=ALGORITHMS,Number=.,Type=String,'
@@ -107,6 +93,8 @@ _INFO_HEADERS_REQUIRED = [
 ]
 
 _FORMAT_HEADERS_REQUIRED = [
+    '##FORMAT=<ID=ECN,Number=1,Type=Integer,Description="Expected copy number for ref genotype">',
+    '##FORMAT=<ID=EV,Number=.,Type=String,Description="Classes of evidence supporting final genotype">',
     '##FORMAT=<ID=GT,Number=1,Type=String,Description="Genotype">',
     '##FORMAT=<ID=GQ,Number=1,Type=Integer,'
     'Description="Genotype quality">',
@@ -174,6 +162,11 @@ def _build_trees_from_gd_table(
                 "bp2": entry["BP2"],
                 "nahr": is_nahr,
                 "svtype": svtype,
+                "start": start,
+                "end": end,
+                "chrom": chrom,
+                "start_range": locus.breakpoints[locus.breakpoint_names.index(entry["BP1"])],
+                "end_range": locus.breakpoints[locus.breakpoint_names.index(entry["BP2"])],
             }
 
             # Store (GD_ID, svtype) as interval data so NAHR matching is
@@ -198,7 +191,9 @@ def read_gd_calls(calls_path: str) -> Dict[Tuple[str, str], dict]:
        A header row followed by tabular data with columns including
        ``sample``, ``GD_ID``, ``chrom``, ``start``, ``end``, ``svtype``,
        ``is_carrier``.  Rows with ``is_carrier == "True"`` (or ``True``)
-       are grouped by ``(GD_ID, svtype)`` and carrier samples collected.
+       are grouped by ``(GD_ID, svtype)`` and carrier samples collected,
+       along with optional per-sample total copy numbers from ``cn_state``
+       and posterior summaries from ``cn_probabilities``.
 
     2. **Legacy narrow format** (6-column TSV, no header):
        ``chrom``, ``pos`` (0-based), ``end``, ``region_id``, ``svtype``,
@@ -210,7 +205,8 @@ def read_gd_calls(calls_path: str) -> Dict[Tuple[str, str], dict]:
     Returns
     -------
     dict mapping ``(region_id, svtype)`` to
-    ``{chrom, pos, end, samples}``
+    ``{chrom, pos, end, samples}``, plus ``copy_states`` and
+    ``copy_probabilities`` and ``evaluated_samples`` in wide format.
     """
     # Open file transparently (support .gz and plain text)
     if calls_path.endswith(".gz"):
@@ -279,11 +275,52 @@ def _read_wide_format(
                 "pos": int(row["start"]),
                 "end": int(row["end"]),
                 "samples": set(),
+                "copy_states": {},
+                "copy_probabilities": {},
+                "evaluated_samples": set(),
+                "carrier_calls": {},
+                "intervals": set(),
             }
+        groups[key]["evaluated_samples"].add(row["sample"])
+        coordinates = (row["chrom"], int(row["start"]), int(row["end"]))
+        groups[key]["intervals"].add(coordinates)
+        probability_text = (row.get("cn_probabilities") or "").strip()
+        probabilities = None
+        if probability_text.lower() not in ("", ".", "nan", "na"):
+            probabilities = _parse_copy_probabilities(probability_text)
+            groups[key]["copy_probabilities"][row["sample"]] = probabilities
         is_carrier = row.get("is_carrier", "").strip()
         if is_carrier in ("True", "true", "1"):
             groups[key]["samples"].add(row["sample"])
+            cn = None
+            cn_text = (row.get("cn_state") or "").strip()
+            if cn_text.lower() not in ("", ".", "nan", "na"):
+                cn = float(cn_text)
+                if not cn.is_integer() or cn < 0:
+                    raise ValueError("cn_state must be a non-negative integer or missing")
+                groups[key]["copy_states"][row["sample"]] = int(cn)
+            groups[key]["carrier_calls"].setdefault(row["sample"], []).append({
+                "chrom": coordinates[0], "pos": coordinates[1], "end": coordinates[2],
+                "cn_state": int(cn) if cn is not None else None,
+                "cn_probabilities": probabilities,
+            })
     return groups
+
+
+def _parse_copy_probabilities(value: str) -> dict:
+    """Read a total-CN posterior summary; missing mass is null uncertainty."""
+    try:
+        raw = json.loads(value)
+        probabilities = {int(cn): float(prob) for cn, prob in raw.items()}
+        if any(str(int(cn)) != cn for cn in raw):
+            raise ValueError("Copy numbers must be non-negative integers")
+        if any(cn < 0 or not math.isfinite(p) or p < 0 or p > 1 + 1e-6 for cn, p in probabilities.items()):
+            raise ValueError("Invalid copy-state probability")
+        if sum(probabilities.values()) > 1 + 1e-6:
+            raise ValueError("Copy-state probability mass exceeds one")
+        return {cn: min(p, 1.0) for cn, p in probabilities.items()}
+    except (ValueError, TypeError, AttributeError) as exc:
+        raise ValueError("cn_probabilities must be a JSON object of total CN to probability (mass <= 1)") from exc
 
 
 def _read_narrow_format(
@@ -394,22 +431,6 @@ def get_expected_cn(
     return ploidy_dict[sample].get(chrom, 2)
 
 
-# ── Carrier extraction ───────────────────────────────────────────────
-
-
-def _is_homref(gt) -> bool:
-    """Check if a genotype represents a hom-ref state.
-
-    Handles both tuple ``(0, 0)`` (pysam / real VCF) and list ``[0, 0]``
-    (JSON-encoded scenario data, test stubs).  Also handles ``None``
-    (no-call) which is treated as non-hom-ref.
-    """
-    if gt is None:
-        return False
-    gt_tuple = tuple(gt) if not isinstance(gt, tuple) else gt
-    return gt_tuple == (0, 0)
-
-
 # ── Genotype update ──────────────────────────────────────────────────
 
 
@@ -419,48 +440,73 @@ def update_genotype(
     is_carrier: bool,
     ecn: int,
     svtype: str,
+    cn_state: Optional[int] = None,
+    baseline_cn: Optional[int] = None,
+    cn_probabilities: Optional[Dict[int, float]] = None,
 ) -> None:
-    """Update per-sample genotype dict in-place.
+    """Write GATK-SV diploid-encoded GT and biological contig ploidy (ECN).
 
-    Ploidy-aware genotype arity (supersedes the old "always het (0,1)"
-    decision): the number of alleles in ``GT`` matches ``ecn`` (the
-    expected copy number / contig ploidy, with PAR forced to 2), so a
-    haploid contig (e.g. male chrX non-PAR, ecn==1) gets a haploid
-    genotype rather than a diploid het.
-
-    - ecn == 0    -> no-call (None, None), RD_CN=0, RD_GQ=0, return early
-    - carrier     -> GT = (0,) * (ecn - 1) + (1,)  (one alt allele, rest ref)
-                     DEL: RD_CN=max(ecn-1,0); DUP: RD_CN=ecn+1
-    - non-carrier -> GT = (0,) * ecn  (all-ref); RD_CN=ecn
-    PE/SR FORMAT fields are reset only when present.
-
-    For ecn == 2 (the diploid default) this is byte-identical to the old
-    behaviour: carrier -> (0, 1), non-carrier -> (0, 0).
+    baseline_cn may differ from ECN in PAR, where the reference copy number
+    is two. Each lost/gained copy contributes an alternate allele, capped at
+    two: haploid DEL CN=0 is 0/1; haploid DUP CN>=3 is 1/1. Zero-ploidy
+    samples have missing genotype/evidence fields. Missing copy states use
+    the legacy single-alt assignment. Qualities use body-averaged model
+    probabilities when available and remain missing for older calls TSVs.
     """
+    gt["ECN"] = ecn
     if ecn == 0:
+        for key in list(gt):
+            if key != "ECN":
+                gt[key] = None
         gt["GT"] = (None, None)
-        gt["RD_CN"] = 0
-        gt["RD_GQ"] = 0
+        gt["RD_CN"] = None
+        gt["RD_GQ"] = None
+        gt["GQ"] = None
+        gt["EV"] = (".",)
         return
 
+    ref_cn = ecn if baseline_cn is None else baseline_cn
     gt["EV"] = ("RD",)
     for key, val in RESET_PESR_FORMATS_DICT.items():
         if key in gt:
             gt[key] = val
 
     if is_carrier:
-        gt["GT"] = (0,) * (ecn - 1) + (1,)
-        if svtype == "DEL":
-            gt["RD_CN"] = max(ecn - 1, 0)
+        alt_count = 1
+        if cn_state is not None:
+            if cn_state < 0 or int(cn_state) != cn_state:
+                raise ValueError("cn_state must be a non-negative integer")
+            cn_state = int(cn_state)
+            delta = ref_cn - cn_state if svtype == "DEL" else cn_state - ref_cn
+            if delta <= 0:
+                raise ValueError("Carrier cn_state must agree with svtype and expected copy number")
+            alt_count = min(delta, 2)
+        gt["GT"] = (0, 1) if alt_count == 1 else (1, 1)
+        if cn_state is not None:
+            gt["RD_CN"] = cn_state
+        elif svtype == "DEL":
+            gt["RD_CN"] = max(ref_cn - 1, 0)
         elif svtype == "DUP":
-            gt["RD_CN"] = ecn + 1
-        gt["RD_GQ"] = 99
-        gt["GQ"] = 99
+            gt["RD_CN"] = ref_cn + 1
     else:
-        gt["GT"] = (0,) * ecn  # Force HomRef
-        gt["RD_CN"] = ecn
-        gt["RD_GQ"] = 99
-        gt["GQ"] = 99
+        gt["GT"] = (0, 0)
+        gt["RD_CN"] = ref_cn
+    gt["RD_GQ"] = None
+    gt["GQ"] = None
+    if cn_probabilities and gt.get("RD_CN") is not None:
+        selected_alt_count = sum(gt["GT"])
+        genotype_probability = 0.0
+        for cn, probability in cn_probabilities.items():
+            delta = ref_cn - cn if svtype == "DEL" else cn - ref_cn
+            if min(max(delta, 0), 2) == selected_alt_count:
+                genotype_probability += probability
+        gt["GQ"] = _probability_to_gq(genotype_probability)
+        gt["RD_GQ"] = _probability_to_gq(cn_probabilities.get(gt["RD_CN"], 0.0))
+
+
+def _probability_to_gq(probability: float) -> int:
+    """Rounded Phred error probability, capped at 99."""
+    return int(round(-10 * math.log10(max(1 - min(probability, 1.0), 10 ** -9.9))))
 
 
 # ── Header helpers ───────────────────────────────────────────────────
@@ -562,8 +608,8 @@ def _parse_args(argv: Optional[List[Text]] = None) -> argparse.Namespace:
     parser.add_argument(
         "--reciprocal-overlap", type=float, default=0.5,
         help=(
-            "Reciprocal overlap cutoff for VCF record clearing. Only VCF "
-            "records with RO >= this value are touched by GD calls."
+            "Minimum reciprocal overlap for a positive GD call to replace an entire VCF call "
+            "in the same sample, regardless of copy state or DEL/DUP type (default: 0.5)."
         ),
     )
     parser.add_argument(
@@ -601,8 +647,8 @@ def _build_gd_call_index(
 
     Only NAHR gd_calls entries are indexed (non-NAHR is handled exclusively
     via ``non_nahr_trees`` from the GD table).  Each interval stores
-    ``(gd_id, svtype, start, stop)`` so the drop test can check SVTYPE and
-    reciprocal overlap without re-reading the gd_calls dict.
+    ``(gd_id, svtype, start, stop)`` for locating directly overlapping VCF records.
+    Every sample-specific interval is indexed.
 
     Non-NAHR entries (``gd_metadata[gd_id]["nahr"] is False``) are silently
     skipped — they are annotate-only and never drop VCF records.
@@ -614,11 +660,10 @@ def _build_gd_call_index(
         if not is_nahr:
             # Non-NAHR entries: annotate-only path, not drop+replace.
             continue
-        chrom = gd_info["chrom"]
-        start = gd_info["pos"]
-        stop = gd_info["end"]
-        if start < stop:
-            index[chrom].addi(start, stop, (gd_id, svtype, start, stop))
+        intervals = gd_info.get("intervals", {(gd_info["chrom"], gd_info["pos"], gd_info["end"])})
+        for chrom, start, stop in sorted(intervals):
+            if start < stop:
+                index[chrom].addi(start, stop, (gd_id, svtype, start, stop))
     return index
 
 
@@ -637,10 +682,12 @@ def _build_gd_record(
     ploidy_dict: Dict[str, Dict[str, int]],
     par_trees: Dict[str, "IntervalTree"],
     is_novel: bool,
+    copy_states: Optional[Dict[str, int]] = None,
+    copy_probabilities: Optional[Dict[str, dict]] = None,
 ) -> "pysam.VariantRecord":
     """Construct a new VCF record from GD call metadata.
 
-    Uses GD coordinates. Carriers → het, all others → hom-ref.
+    Uses GD coordinates and copy-state genotypes; non-carriers are hom-ref.
 
     Parameters
     ----------
@@ -654,6 +701,8 @@ def _build_gd_record(
     ploidy_dict : sample -> {contig -> ploidy}.
     par_trees : PAR region interval trees.
     is_novel : True if no VCF record matched (novel GD call).
+    copy_states : optional sample -> total copy number for carriers.
+    copy_probabilities : optional sample -> total CN posterior summary.
 
     Returns
     -------
@@ -682,11 +731,17 @@ def _build_gd_record(
         new_rec.info["GD_BP2"] = meta["bp2"]
 
     for sample, gt in new_rec.samples.items():
-        ecn = get_expected_cn(
+        baseline_cn = get_expected_cn(
             chrom, pos, stop, sample, ploidy_dict, par_trees
         )
+        ecn = ploidy_dict.get(sample, {}).get(chrom, 2)
         is_carrier = sample in carriers
-        update_genotype(gt, sample, is_carrier, ecn, svtype)
+        update_genotype(
+            gt, sample, is_carrier, ecn, svtype,
+            cn_state=(copy_states or {}).get(sample),
+            baseline_cn=baseline_cn,
+            cn_probabilities=(copy_probabilities or {}).get(sample),
+        )
 
     return new_rec
 
@@ -697,10 +752,8 @@ def _build_gd_record(
 def main(argv: Optional[List[Text]] = None) -> None:
     """Entry point for the *integrate* subcommand.
 
-    Single-pass streaming over the input VCF — memory is O(GD entries),
-    never O(records).  NAHR gd_calls drop+replace overlapping records; non-NAHR
-    regions annotate overlapping records in place (no drop, no synthesized
-    record).  See module docstring for the full algorithm.
+    Replace overlapping VCF calls per sample; annotate non-NAHR regions.
+    See the module docstring for replacement and breakpoint rules.
     """
     args = _parse_args(argv)
 
@@ -734,9 +787,15 @@ def main(argv: Optional[List[Text]] = None) -> None:
     )
     par_trees = _read_bed_to_trees(args.par_bed)
 
+    for region_id, svtype in gd_calls:
+        if svtype not in ("DEL", "DUP") and gd_metadata.get(region_id, {}).get("nahr", True):
+            raise ValueError(f"Unsupported GD copy-number SVTYPE {svtype}; expected DEL or DUP")
+        if region_id not in gd_metadata:
+            logger.warning("GD entry %s/%s missing from GD table; using call coordinates", region_id, svtype)
+
     os.makedirs(args.temp_dir, exist_ok=True)
 
-    # Build the per-chrom index of NAHR gd_calls for O(log N) drop decisions.
+    # Index all evaluated NAHR intervals, including sample-specific coordinates.
     gd_call_index = _build_gd_call_index(gd_calls, gd_metadata)
 
     with pysam.VariantFile(args.vcf) as vcf_in:
@@ -744,6 +803,21 @@ def main(argv: Optional[List[Text]] = None) -> None:
         _ensure_headers(header)
 
         vcf_samples = set(header.samples)
+
+        # A wide table distinguishes evaluated non-carriers from missing samples.
+        # Reject incomplete NAHR entries before opening any output or dropping records.
+        for (region_id, svtype), gd_info in gd_calls.items():
+            if not gd_metadata.get(region_id, {}).get("nahr", True):
+                continue
+            evaluated = gd_info.get("evaluated_samples")
+            if evaluated is not None:
+                missing = vcf_samples - evaluated
+                if missing:
+                    raise ValueError(
+                        f"GD calls for {region_id}/{svtype} are missing evaluations for "
+                        f"{len(missing)} VCF sample(s); provide a row for every sample, "
+                        "including non-carriers, before integration"
+                    )
 
         # Warn about carriers absent from VCF header
         for (region_id, svtype), gd_info in gd_calls.items():
@@ -756,9 +830,17 @@ def main(argv: Optional[List[Text]] = None) -> None:
                         svtype,
                     )
 
-        # matched_calls: set of (gd_id, svtype) whose VCF records were dropped.
-        # is_novel = (gd_id, svtype) not in matched_calls after the stream.
-        matched_calls: Set[Tuple[str, str]] = set()
+        # Register contigs before any output header is written. Positive GD
+        # calls on a contig absent from the original VCF must still be emitted.
+        for (gd_id, svtype), info in gd_calls.items():
+            if not gd_metadata.get(gd_id, {}).get("nahr", True) or not info["samples"]:
+                continue
+            for chrom, start, end in sorted(info.get("intervals", {(info["chrom"], info["pos"], info["end"])})):
+                if start < 0 or start >= end:
+                    raise ValueError(f"Invalid interval for detected GD call {gd_id}/{svtype}")
+                if chrom not in header.contigs:
+                    header.contigs.add(chrom)
+        affected_records = []
 
         with tempfile.NamedTemporaryFile(
             dir=args.temp_dir, suffix=".passthrough.vcf.gz", delete=False
@@ -778,7 +860,9 @@ def main(argv: Optional[List[Text]] = None) -> None:
             with pysam.VariantFile(
                 passthrough_path, mode="w", header=header
             ) as vcf_pass:
-                for record in vcf_in:
+                from gatk_sv_gd.reconcile import affected_records as select_affected_records
+
+                for record, loci in select_affected_records(vcf_in, gd_call_index):
                     svtype = record.info.get("SVTYPE", "")
                     if isinstance(svtype, (tuple, list)):
                         svtype = svtype[0] if svtype else ""
@@ -789,29 +873,7 @@ def main(argv: Optional[List[Text]] = None) -> None:
                     stop = record.stop    # 0-based end (half-open)
                     record_len = stop - start
 
-                    # ── NAHR drop check (constraint 4 / 5) ──────────
-                    # Check if this record is matched by any NAHR gd_call
-                    # (any svtype).  If matched → drop the record (write
-                    # nothing) and mark the gd_call as matched.
-                    # NAHR drop takes precedence over non-NAHR annotation
-                    # (constraint 5).
-                    dropped = False
-                    if chrom in gd_call_index and record_len > 0:
-                        for iv in gd_call_index[chrom].overlap(start, stop):
-                            iv_gd_id, iv_svtype, iv_start, iv_stop = iv.data
-                            if iv_svtype != svtype:
-                                continue
-                            ro = reciprocal_overlap(start, stop, iv_start, iv_stop)
-                            if ro >= args.reciprocal_overlap:
-                                matched_calls.add((iv_gd_id, iv_svtype))
-                                dropped = True
-                                # Continue checking other overlapping gd_calls
-                                # so all matching entries are marked.
-
-                    if dropped:
-                        continue  # Record dropped — NAHR wins.
-
-                    # Non-DEL/DUP records pass through (after NAHR drop check).
+                    # Other variant classes pass through unchanged.
                     # Non-NAHR annotation is DEL/DUP-specific.
                     if svtype not in ("DEL", "DUP"):
                         vcf_pass.write(record)
@@ -842,83 +904,18 @@ def main(argv: Optional[List[Text]] = None) -> None:
                                 # region (deterministic: first overlap wins).
                                 break
 
+                    if loci and svtype in ("DEL", "DUP") and record_len > 0:
+                        affected_records.append((record.copy(), set(loci)))
+                        continue
+
                     vcf_pass.write(record)
 
-            # ── Emit one GD record per NAHR gd_call ─────────────────
-            # Writes GD records to a small separate file (not the large
-            # passthrough). Only NAHR gd_calls go through _build_gd_record.
-            gd_records: List["pysam.VariantRecord"] = []
+            from gatk_sv_gd.reconcile import reconcile_records
 
-            for (gd_id, svtype), gd_info in gd_calls.items():
-                # Only process NAHR entries through the drop+replace path.
-                is_nahr = gd_metadata.get(gd_id, {}).get("nahr", True)
-                if not is_nahr:
-                    # Non-NAHR: annotate-only; no synthesized record.
-                    continue
-
-                carriers = gd_info["samples"]
-                chrom = gd_info["chrom"]
-                start = gd_info["pos"]    # 0-based
-                stop = gd_info["end"]     # 0-based exclusive
-
-                # Skip inverted or zero-length intervals (coordinates from
-                # gd_calls may not have been validated by the GD table loader).
-                if start >= stop:
-                    logger.warning(
-                        "GD call %r/%s has inverted/zero interval "
-                        "(start=%d >= stop=%d); skipping.",
-                        gd_id, svtype, start, stop,
-                    )
-                    continue
-
-                # T2: GD-ID fallback — use the gd_calls coordinates and a
-                # synthetic meta when gd_id is absent from the GD table.
-                # This handles calls produced against an older GD-table version.
-                if gd_id not in gd_metadata:
-                    logger.warning(
-                        "GD ID %r has no metadata in the GD table; "
-                        "using fallback metadata.",
-                        gd_id,
-                    )
-                    meta = {
-                        "cluster": gd_id,
-                        "bp1": "",
-                        "bp2": "",
-                        "nahr": True,
-                        "svtype": svtype,
-                    }
-                else:
-                    meta = gd_metadata[gd_id]
-
-                is_novel = (gd_id, svtype) not in matched_calls
-
-                # Novel call with no carriers: nothing to assert and nothing
-                # to clear → skip entirely.
-                if is_novel and not carriers:
-                    continue
-
-                # Novel call on a contig absent from the header: cannot
-                # place a record.
-                if is_novel and chrom not in header.contigs:
-                    logger.warning(
-                        "Contig %r not in VCF header; skipping novel "
-                        "record for %s/%s",
-                        chrom,
-                        gd_id,
-                        svtype,
-                    )
-                    continue
-
-                new_rec = _build_gd_record(
-                    header, chrom, start, stop,
-                    gd_id, svtype, meta,
-                    carriers,
-                    ploidy_dict, par_trees,
-                    is_novel,
-                )
-
-                if not all_homref_record(new_rec.samples.values()):
-                    gd_records.append(new_rec)
+            gd_records = reconcile_records(
+                header, gd_calls, gd_metadata, affected_records,
+                ploidy_dict, par_trees, args.reciprocal_overlap,
+            )
 
             # Write GD records to the small separate file.
             with pysam.VariantFile(
@@ -954,11 +951,16 @@ def main(argv: Optional[List[Text]] = None) -> None:
 
 
 def all_homref_record(sample_dicts) -> bool:
-    """Return True if all sample genotype dicts represent hom-ref."""
-    for gt_dict in sample_dicts:
-        if not _is_homref(gt_dict.get("GT", (0, 0))):
-            return False
-    return True
+    """Return True when no sample has a called alternate allele.
+
+    Reference and missing genotypes (including zero-ploidy allosomes) cannot
+    justify emitting a GD variant. Partial calls with an alternate allele can.
+    """
+    return not any(
+        allele is not None and allele > 0
+        for gt_dict in sample_dicts
+        for allele in (gt_dict.get("GT") or ())
+    )
 
 
 # ── Legacy main for backward compatibility ───────────────────────────
