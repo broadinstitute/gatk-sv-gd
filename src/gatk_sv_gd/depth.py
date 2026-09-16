@@ -1314,6 +1314,11 @@ class CNVModel:
         )
 
     def _pair_state_prior_mean_values_for_ploidy(self, sample_ploidy: int) -> np.ndarray:
+        if int(sample_ploidy) <= 0:
+            # Ploidy 0 marks a sample/contig pair GATK-SV cannot genotype, not
+            # an expectation of zero copies, so no state is favoured and the
+            # prior stays uninformative rather than fighting the observed depth.
+            return np.asarray(self._pair_state_prior_mean_values(), dtype=np.float64)
         reference_state_idx = self._reference_state_idx_for_ploidy(int(sample_ploidy))
         if reference_state_idx is None:
             return np.asarray(self._pair_state_prior_mean_values(), dtype=np.float64)

@@ -385,6 +385,14 @@ def parse_args():
              "the low-res input and contain raw (un-normalised) counts.",
     )
     parser.add_argument(
+        "--ploidy-table",
+        required=False,
+        help="Wide GATK-SV ploidy table (sample + one column per contig), taken "
+             "as the authority on per-contig ploidy when this command runs its "
+             "own preprocessing. Ignored with --preprocessed-dir, where ploidy "
+             "comes from the preprocess output.",
+    )
+    parser.add_argument(
         "--preprocessed-dir",
         required=False,
         help="Directory produced by 'gatk-sv-gd preprocess'.  When set, "
@@ -919,9 +927,11 @@ def main():
             print(f"    per-sample means: min={np.nanmean(norm_depths, axis=0).min():.4f}, "
                   f"max={np.nanmean(norm_depths, axis=0).max():.4f}")
 
-        # Estimate ploidy (before quality filtering so the ploidy map is
+        # Determine ploidy (before quality filtering so the ploidy map is
         # available for ploidy-adjusted median/MAD computation)
-        ploidy_df = estimate_ploidy(df, args.output_dir)
+        ploidy_df = estimate_ploidy(
+            df, args.output_dir, ploidy_table=getattr(args, "ploidy_table", None)
+        )
         ploidy_map = build_ploidy_map(ploidy_df)
 
         # Filter low quality bins

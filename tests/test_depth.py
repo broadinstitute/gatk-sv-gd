@@ -1738,6 +1738,24 @@ def test_fixed_pair_state_priors_use_dirichlet_mean(monkeypatch):
     assert np.allclose(tensor_values[:, 0, :], np.vstack([expected, expected]))
 
 
+def test_pair_state_prior_for_zero_ploidy_stays_uninformative():
+    model = object.__new__(CNVModel)
+    model.pair_states = [(0, 0), (0, 1), (1, 1)]
+    model.n_states = 3
+    model.alpha_ref = 50.0
+    model.alpha_non_ref = 1.0
+    model._pair_state_prior_mean_np = np.asarray([0.2, 0.3, 0.5], dtype=np.float32)
+
+    # Ploidy 1 centers the prior on the matching (0, 1) state ...
+    haploid_prior = CNVModel._pair_state_prior_mean_values_for_ploidy(model, 1)
+    assert np.argmax(haploid_prior) == 1
+    assert haploid_prior[1] == pytest.approx(50.0 / 52.0)
+
+    # ... but ploidy 0 means "not genotypable", not "expect (0, 0)".
+    zero_prior = CNVModel._pair_state_prior_mean_values_for_ploidy(model, 0)
+    assert np.allclose(zero_prior, model._pair_state_prior_mean_np)
+
+
 def test_run_discrete_inference_always_uses_full_pair_state_prior():
     model = object.__new__(CNVModel)
     model.pair_states = [(1, 1), (1, 2)]

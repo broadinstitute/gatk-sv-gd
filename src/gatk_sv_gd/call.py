@@ -903,6 +903,7 @@ def call_cnvs_from_posteriors(
 
     processed_loci = 0
     skipped_loci = 0
+    skipped_zero_ploidy = 0
     breakpoint_masked_bins = 0
     missing_flank_sets = 0
     interval_sets = 0
@@ -927,6 +928,12 @@ def call_cnvs_from_posteriors(
 
         for s_idx, sample_id in enumerate(sample_ids):
             sample_ploidy = ploidy_lookup[(str(sample_id), locus.chrom)]
+            if sample_ploidy <= 0:
+                # GATK-SV cannot genotype this sample on this contig (e.g. an
+                # allosome of a sex=0 sample), so a carrier call here would be
+                # unrepresentable downstream in integrate.
+                skipped_zero_ploidy += 1
+                continue
 
             cluster_pair_probs = pair_prob_3d[s_idx, cluster_bin_indices, :]
             cluster_null_probs = null_prob_2d[s_idx, cluster_bin_indices]
@@ -1144,7 +1151,8 @@ def call_cnvs_from_posteriors(
         "  Calling summary: "
         f"loci={processed_loci}, skipped_no_bins={skipped_loci}, "
         f"interval_sets={interval_sets}, breakpoint_bins_masked={breakpoint_masked_bins}, "
-        f"missing_flank_sets={missing_flank_sets}"
+        f"missing_flank_sets={missing_flank_sets}, "
+        f"skipped_zero_ploidy_sample_loci={skipped_zero_ploidy}"
     )
 
     calls_df = pd.DataFrame(

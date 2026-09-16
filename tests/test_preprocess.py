@@ -182,6 +182,8 @@ def test_parse_args_accepts_expected_preprocess_cli_options(monkeypatch):
             "3.5",
             "--mad-max",
             "0.3",
+            "--ploidy-table",
+            "ploidy.tsv",
             "--verbose",
         ],
     )
@@ -198,6 +200,7 @@ def test_parse_args_accepts_expected_preprocess_cli_options(monkeypatch):
     assert args.high_res_counts == "highres.tsv.gz"
     assert args.baf_table == "baf.tsv.gz"
     assert args.ref_fasta == "ref.fasta.gz"
+    assert args.ploidy_table == "ploidy.tsv"
     assert args.locus_padding == 5000
     assert args.exclusion_threshold == pytest.approx(0.2)
     assert args.exclusion_bypass_threshold == pytest.approx(0.9)
@@ -928,6 +931,7 @@ def test_main_runs_happy_path_and_writes_filtered_gd_table(tmp_path, monkeypatch
         min_flank_coverage=0.2,
         baf_table="baf.tsv.gz",
         ref_fasta=None,
+        ploidy_table=None,
     )
 
     mask_calls = []
@@ -955,7 +959,11 @@ def test_main_runs_happy_path_and_writes_filtered_gd_table(tmp_path, monkeypatch
     )
     monkeypatch.setattr(preprocess_module, "read_data", lambda path: input_df.copy())
     monkeypatch.setattr(preprocess_module, "get_sample_columns", lambda df: ["sample1", "sample2"])
-    monkeypatch.setattr(preprocess_module, "estimate_ploidy", lambda df, output_dir: pd.DataFrame([{"sample": "sample1"}]))
+    monkeypatch.setattr(
+        preprocess_module,
+        "estimate_ploidy",
+        lambda df, output_dir, ploidy_table=None: pd.DataFrame([{"sample": "sample1"}]),
+    )
     monkeypatch.setattr(
         preprocess_module,
         "build_ploidy_map",
@@ -1053,6 +1061,7 @@ def test_main_requires_par_intervals_when_chr_x_bins_are_present(tmp_path, monke
         min_flank_coverage=0.0,
         baf_table=None,
         ref_fasta=None,
+        ploidy_table=None,
     )
 
     monkeypatch.setattr(preprocess_module, "parse_args", lambda: args)
@@ -1103,6 +1112,7 @@ def test_main_rejects_empty_preprocessed_output(tmp_path, monkeypatch):
         min_flank_coverage=0.0,
         baf_table=None,
         ref_fasta=None,
+        ploidy_table=None,
     )
 
     monkeypatch.setattr(preprocess_module, "parse_args", lambda: args)
@@ -1118,7 +1128,11 @@ def test_main_rejects_empty_preprocessed_output(tmp_path, monkeypatch):
         ),
     )
     monkeypatch.setattr(preprocess_module, "get_sample_columns", lambda df: ["sample1"])
-    monkeypatch.setattr(preprocess_module, "estimate_ploidy", lambda df, output_dir: pd.DataFrame([{"sample": "sample1"}]))
+    monkeypatch.setattr(
+        preprocess_module,
+        "estimate_ploidy",
+        lambda df, output_dir, ploidy_table=None: pd.DataFrame([{"sample": "sample1"}]),
+    )
     monkeypatch.setattr(preprocess_module, "build_ploidy_map", lambda ploidy_df: {("sample1", "chr1"): 2})
     monkeypatch.setattr(preprocess_module, "filter_low_quality_bins", lambda df, **kwargs: df.copy())
     monkeypatch.setattr(
@@ -1180,6 +1194,7 @@ def test_main_without_baf_table_skips_baf_outputs_and_reports_seven_tables(tmp_p
         min_flank_coverage=0.0,
         baf_table=None,
         ref_fasta=None,
+        ploidy_table=None,
     )
 
     monkeypatch.setattr(preprocess_module, "parse_args", lambda: args)
@@ -1193,7 +1208,11 @@ def test_main_without_baf_table_skips_baf_outputs_and_reports_seven_tables(tmp_p
         lambda path: pd.DataFrame({"Chr": ["chr1"], "Start": [100], "End": [150], "sample1": [10.0]}),
     )
     monkeypatch.setattr(preprocess_module, "get_sample_columns", lambda df: ["sample1"])
-    monkeypatch.setattr(preprocess_module, "estimate_ploidy", lambda df, output_dir: pd.DataFrame([{"sample": "sample1"}]))
+    monkeypatch.setattr(
+        preprocess_module,
+        "estimate_ploidy",
+        lambda df, output_dir, ploidy_table=None: pd.DataFrame([{"sample": "sample1"}]),
+    )
     monkeypatch.setattr(preprocess_module, "build_ploidy_map", lambda ploidy_df: {("sample1", "chr1"): 2})
     monkeypatch.setattr(preprocess_module, "filter_low_quality_bins", lambda df, **kwargs: df.copy())
     monkeypatch.setattr(
