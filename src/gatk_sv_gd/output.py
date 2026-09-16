@@ -468,9 +468,10 @@ def estimate_ploidy(
     value is retained only as QC. Using GATK-SV's own (sex-assignment derived)
     table keeps GD calls encodable by ``integrate``: a pair whose authoritative
     ploidy is 0 is not genotypable by GATK-SV at all, and the depth-derived
-    estimate never agrees with that. The depth estimate is also biased by the
-    events being called, because it is a median over GD loci and their flanks
-    rather than over the whole contig.
+    estimate never agrees with that. The depth estimate is taken over every
+    input bin on the contig, before quality filtering and before locus
+    collection, so it is robust to individual events but says nothing about
+    which pairs GATK-SV is willing to genotype.
 
     Args:
         df: Filtered DataFrame with bins as rows and samples as columns.
