@@ -17,6 +17,8 @@ Optional data inputs:
 --high-res-counts FILE             Optional bgzipped tabix-indexed high-res counts
 --high-res-depth FILE              Alias for --high-res-counts
 --baf-table FILE                   Optional BAF table
+--ploidy-table FILE                Wide GATK-SV ploidy table (sample + contig columns);
+                                   authoritative per-contig ploidy, recommended
 
 Optional annotation and mask inputs:
 --segdup-bed FILE
@@ -62,6 +64,7 @@ WORK_DIR=""
 INPUT_DEPTH=""
 HIGH_RESOLUTION_DEPTH=""
 BAF_TABLE=""
+GATKSV_PLOIDY_TABLE=""
 GD_TABLE=""
 REF_FASTA=""
 SEG_DUP_BED=""
@@ -101,6 +104,10 @@ while [[ $# -gt 0 ]]; do
             ;;
         --baf-table)
             BAF_TABLE="$2"
+            shift 2
+            ;;
+        --ploidy-table)
+            GATKSV_PLOIDY_TABLE="$2"
             shift 2
             ;;
         --ref-fasta)
@@ -234,6 +241,8 @@ CN_POSTERIORS="${INFER_DIR}/cn_posteriors.tsv.gz"
 SAMPLE_POSTERIORS="${INFER_DIR}/sample_posteriors.tsv.gz"
 GD_CALLS="${CALL_DIR}/gd_cnv_calls.tsv.gz"
 EVENT_MARGINALS="${CALL_DIR}/event_marginals.tsv.gz"
+# Long-format table written by preprocess; its ploidy column is copied from
+# --ploidy-table when one is given, so call/eval/plot stay consistent with it.
 PLOIDY_TABLE="${PREPROCESS_DIR}/ploidy_estimates.tsv"
 PREPROCESSED_BINS="${PREPROCESS_DIR}/preprocessed_bins.tsv.gz"
 EVAL_REPORT="${EVAL_DIR}/truth_evaluation_report.tsv"
@@ -254,6 +263,10 @@ PREPROCESS_CMD=(
 
 if [[ -n "${HIGH_RESOLUTION_DEPTH}" ]]; then
     PREPROCESS_CMD+=(--high-res-counts "${HIGH_RESOLUTION_DEPTH}")
+fi
+
+if [[ -n "${GATKSV_PLOIDY_TABLE}" ]]; then
+    PREPROCESS_CMD+=(--ploidy-table "${GATKSV_PLOIDY_TABLE}")
 fi
 
 if [[ -n "${BAF_TABLE}" ]]; then

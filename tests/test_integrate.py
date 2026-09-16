@@ -3918,16 +3918,18 @@ class TestReaderErrorPaths:
             integrate.read_gd_calls(str(p))
 
     def test_ploidy_table_row_shorter_than_header(self, tmp_path):
-        """Case 20.8: Row shorter than header → reads only available columns."""
+        """Case 20.8: Row shorter than header → rejected.
+
+        Dropping the trailing columns silently would make them read back as
+        the default ploidy 2 for contigs the table never described.
+        """
         p = tmp_path / "ploidy.tsv"
         p.write_text(
             "sample\tchr1\tchr2\n"
             "S1\t2\n"  # Missing chr2 value
         )
-        result = integrate.read_ploidy_table(str(p))
-        # Only available columns are read
-        assert result["S1"]["chr1"] == 2
-        assert "chr2" not in result["S1"]
+        with pytest.raises(ValueError, match="has 2 field"):
+            integrate.read_ploidy_table(str(p))
 
 
 # ── Section 4: GDTable Class Internals (cases 3.1-3.10) ────────────
@@ -8448,6 +8450,31 @@ def test_wide_calls_missing_a_vcf_sample_fail_before_replacement(monkeypatch, tm
             complete_cohort=False,
         )
     assert not list(tmp_path.glob("*.passthrough.vcf.gz"))
+
+
+def test_wide_calls_may_omit_samples_with_no_ploidy_on_the_contig(monkeypatch, tmp_path):
+    # S2 has no ploidy on chrX, so `call` emits no row for it at all. That is
+    # not an incomplete cohort — nothing there is genotypable.
+    written = _run_integrate_main(
+        monkeypatch, tmp_path,
+        vcf_header=_make_vcf_header(contigs={"chrX": None}),
+        vcf_records=[_FakeRecord(
+            "chrX", 1001, 2000, info={"SVTYPE": "DEL"},
+            samples={"S1": {"GT": (0, 1)}, "S2": {"GT": (0, 0)}},
+        )],
+        gd_table_rows=[{
+            "chr": "chrX", "start": 1000, "end": 2000, "gd_id": "GD1", "svtype": "DEL",
+            "nahr": "yes", "cluster": "C", "bp1": "A", "bp2": "B",
+        }],
+        gd_calls_entries=[{
+            "chrom": "chrX", "pos": 1000, "end": 2000, "region_id": "GD1",
+            "svtype": "DEL", "samples": ["S1"],
+        }],
+        samples_ploidy=[("S1", {"chrX": 2}), ("S2", {"chrX": 0})],
+        complete_cohort=False,
+    )
+
+    assert written
 
 
 def test_zero_ploidy_clears_existing_evidence():

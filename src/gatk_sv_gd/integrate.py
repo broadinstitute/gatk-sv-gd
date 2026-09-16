@@ -50,6 +50,7 @@ from gatk_sv_gd._util import (
     fraction_covered,
     get_logger,
     overlap_bases,
+    read_wide_ploidy_table,
     reciprocal_overlap,
     setup_logging,
 )
@@ -360,19 +361,7 @@ def read_ploidy_table(path: str) -> Dict[str, Dict[str, int]]:
     -------
     dict sample -> {contig -> ploidy_int}
     """
-    ploidy_dict: Dict[str, Dict[str, int]] = {}
-    with open(path, "r") as f:
-        header = f.readline().strip().split("\t")
-        for line in f:
-            tokens = line.strip().split("\t")
-            if not tokens or tokens[0].startswith("#"):
-                continue
-            sample = tokens[0]
-            ploidy_dict[sample] = {
-                header[i]: int(tokens[i])
-                for i in range(1, min(len(header), len(tokens)))
-            }
-    return ploidy_dict
+    return read_wide_ploidy_table(path)
 
 
 def _read_bed_to_trees(bed_path: str) -> Dict[str, "IntervalTree"]:
@@ -811,7 +800,13 @@ def main(argv: Optional[List[Text]] = None) -> None:
                 continue
             evaluated = gd_info.get("evaluated_samples")
             if evaluated is not None:
-                missing = vcf_samples - evaluated
+                chrom = gd_info.get("chrom") or gd_metadata.get(region_id, {}).get("chrom")
+                # Samples with no ploidy on this contig cannot be genotyped here,
+                # so the caller has nothing to evaluate and omits them by design.
+                missing = {
+                    sample for sample in vcf_samples - evaluated
+                    if ploidy_dict.get(sample, {}).get(chrom, 2) > 0
+                }
                 if missing:
                     raise ValueError(
                         f"GD calls for {region_id}/{svtype} are missing evaluations for "

@@ -446,3 +446,64 @@ def test_write_locus_metadata_and_estimate_ploidy_round_trip(tmp_path):
     assert ploidy_df.set_index(["sample", "contig"]).loc[("S2", "chr1"), "median_depth"] == pytest.approx(3.0)
     written_ploidy_df = pd.read_csv(tmp_path / "ploidy_estimates.tsv", sep="\t")
     pd.testing.assert_frame_equal(ploidy_df, written_ploidy_df)
+    assert set(ploidy_df["ploidy_source"]) == {"depth"}
+
+
+def _ploidy_depth_df() -> pd.DataFrame:
+    return pd.DataFrame(
+        {
+            "Chr": ["chr1", "chr1", "chrX", "chrX"],
+            "Start": [0, 100, 0, 100],
+            "End": [100, 200, 100, 200],
+            "S1": [2.1, 1.9, 1.1, 0.9],
+            "S2": [2.2, 1.8, 2.1, 1.9],
+        }
+    )
+
+
+def test_estimate_ploidy_prefers_ploidy_table_and_reports_discordance(tmp_path, capsys):
+    table = tmp_path / "ploidy.tsv"
+    table.write_text(
+        "sample\tchr1\tchrX\n"
+        "S1\t2\t1\n"
+        "S2\t2\t0\n"
+    )
+
+    ploidy_df = estimate_ploidy(
+        _ploidy_depth_df(), str(tmp_path), ploidy_table=str(table)
+    )
+    ploidy_lookup = build_ploidy_map(ploidy_df)
+
+    # S2/chrX has a depth-derived estimate of 2 but is not genotypable at all.
+    assert ploidy_lookup == {
+        ("S1", "chr1"): 2,
+        ("S2", "chr1"): 2,
+        ("S1", "chrX"): 1,
+        ("S2", "chrX"): 0,
+    }
+    assert set(ploidy_df["ploidy_source"]) == {"table"}
+    estimated = ploidy_df.set_index(["sample", "contig"])["estimated_ploidy"]
+    assert estimated.loc[("S2", "chrX")] == 2
+
+    stdout = capsys.readouterr().out
+    assert "1 sample/contig pair(s) where the depth-derived ploidy disagrees" in stdout
+    assert "S2/chrX: table=0, depth=2" in stdout
+    assert "1 sample/contig pair(s) have ploidy 0 on chrX" in stdout
+
+
+def test_estimate_ploidy_rejects_ploidy_table_missing_analyzed_pairs(tmp_path):
+    table = tmp_path / "ploidy.tsv"
+    table.write_text(
+        "sample\tchr1\n"
+        "S1\t2\n"
+        "S2\t2\n"
+    )
+
+    with pytest.raises(ValueError, match="missing 2 analyzed sample/contig"):
+        estimate_ploidy(_ploidy_depth_df(), str(tmp_path), ploidy_table=str(table))
+
+
+def test_estimate_ploidy_warns_when_no_ploidy_table_is_given(tmp_path, capsys):
+    estimate_ploidy(_ploidy_depth_df(), str(tmp_path))
+
+    assert "No --ploidy-table given" in capsys.readouterr().out

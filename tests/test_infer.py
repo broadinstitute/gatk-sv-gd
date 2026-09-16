@@ -711,7 +711,13 @@ def test_main_without_preprocessed_dir_runs_full_pipeline(monkeypatch, tmp_path)
         "write_normalization_metadata",
         lambda metadata, output_dir: records.setdefault("written_metadata", (metadata.copy(), output_dir)),
     )
-    monkeypatch.setattr(infer_module, "estimate_ploidy", lambda df, output_dir: pd.DataFrame({"sample": ["S1"], "contig": ["chr1"], "ploidy": [2]}))
+    monkeypatch.setattr(
+        infer_module,
+        "estimate_ploidy",
+        lambda df, output_dir, ploidy_table=None: pd.DataFrame(
+            {"sample": ["S1"], "contig": ["chr1"], "ploidy": [2]}
+        ),
+    )
     monkeypatch.setattr(infer_module, "build_ploidy_map", lambda df: {("S1", "chr1"): 2})
     monkeypatch.setattr(infer_module, "filter_low_quality_bins", fake_filter_low_quality_bins)
     monkeypatch.setattr(infer_module, "_setup_pyro", lambda passed_args: records.setdefault("setup_pyro", passed_args))
@@ -829,7 +835,13 @@ def test_main_without_preprocessed_dir_uses_all_bins_when_no_autosomes(monkeypat
     monkeypatch.setattr(infer_module, "get_sample_columns", lambda df: ["S1", "S2"])
     monkeypatch.setattr(infer_module, "build_normalization_metadata", fake_build_normalization_metadata)
     monkeypatch.setattr(infer_module, "write_normalization_metadata", lambda metadata, output_dir: records.setdefault("written_metadata", (metadata.copy(), output_dir)))
-    monkeypatch.setattr(infer_module, "estimate_ploidy", lambda df, output_dir: pd.DataFrame({"sample": ["S1"], "contig": ["chrX"], "ploidy": [2]}))
+    monkeypatch.setattr(
+        infer_module,
+        "estimate_ploidy",
+        lambda df, output_dir, ploidy_table=None: pd.DataFrame(
+            {"sample": ["S1"], "contig": ["chrX"], "ploidy": [2]}
+        ),
+    )
     monkeypatch.setattr(infer_module, "build_ploidy_map", lambda df: {("S1", "chrX"): 2})
     monkeypatch.setattr(infer_module, "filter_low_quality_bins", lambda df, **kwargs: df)
     monkeypatch.setattr(infer_module, "_setup_pyro", lambda passed_args: records.setdefault("setup_pyro", passed_args))

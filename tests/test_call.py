@@ -864,6 +864,32 @@ def test_call_cnvs_rejects_posterior_mapping_row_mismatch():
         )
 
 
+def test_call_cnvs_skips_zero_ploidy_sample_contigs(capsys):
+    cn_posteriors_df, bin_mappings_df, gd_table = _minimal_call_inputs()
+    cn_posteriors_df = pd.concat(
+        [cn_posteriors_df, cn_posteriors_df.assign(sample="S2")],
+        ignore_index=True,
+    )
+    ploidy_df = pd.DataFrame(
+        {
+            "sample": ["S1", "S2"],
+            "contig": ["chr1", "chr1"],
+            "ploidy": [2, 0],
+        }
+    )
+
+    calls_df, event_marginals_df = call_cnvs_from_posteriors(
+        cn_posteriors_df,
+        bin_mappings_df,
+        gd_table,
+        ploidy_df=ploidy_df,
+    )
+
+    assert set(event_marginals_df["sample"]) == {"S1"}
+    assert "S2" not in set(calls_df["sample"])
+    assert "skipped_zero_ploidy_sample_loci=1" in capsys.readouterr().out
+
+
 def test_call_cnvs_from_posteriors_uses_null_mass_as_neutral_event_evidence():
     cn_posteriors_df, bin_mappings_df, gd_table = _minimal_call_inputs()
     cn_posteriors_df["prob_pair_1_1"] = 0.0
