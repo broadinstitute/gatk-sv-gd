@@ -6,12 +6,12 @@ to disk after model inference.
 """
 
 import os
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
 
-from gatk_sv_gd._util import get_sample_columns
+from gatk_sv_gd._util import get_sample_columns, read_wide_ploidy_table
 from gatk_sv_gd.bins import LocusBinMapping
 from gatk_sv_gd.models import GDLocus
 
@@ -455,42 +455,71 @@ def write_locus_metadata(
 def estimate_ploidy(
     df: pd.DataFrame,
     output_dir: str,
+    ploidy_table: Optional[str] = None,
 ) -> pd.DataFrame:
     """
-    Estimate ploidy for each sample/contig pair from the filtered bin set.
+    Determine ploidy for each sample/contig pair over the filtered bin set.
 
-    Uses the median normalized depth across all filtered bins on each
-    chromosome for each sample. Since the data is normalized so that CN=2
-    corresponds to a depth of 2.0, the rounded median gives the ploidy.
+    The median normalized depth across all filtered bins on each chromosome is
+    always computed: since the data is normalized so that CN=2 corresponds to a
+    depth of 2.0, its rounded value is a depth-derived ploidy estimate.
+
+    When *ploidy_table* is given it is the authority and the depth-derived
+    value is retained only as QC. Using GATK-SV's own (sex-assignment derived)
+    table keeps GD calls encodable by ``integrate``: a pair whose authoritative
+    ploidy is 0 is not genotypable by GATK-SV at all, and the depth-derived
+    estimate never agrees with that. The depth estimate is taken over every
+    input bin on the contig, before quality filtering and before locus
+    collection, so it is robust to individual events but says nothing about
+    which pairs GATK-SV is willing to genotype.
 
     Args:
         df: Filtered DataFrame with bins as rows and samples as columns.
             Expected to already be normalized so diploid depth ≈ 2.0.
         output_dir: Directory to write the ploidy table.
+        ploidy_table: Optional path to a wide GATK-SV ploidy table
+            (sample + one column per contig) taken as authoritative.
 
     Returns:
-        DataFrame with columns: sample, contig, median_depth, ploidy
+        DataFrame with columns: sample, contig, median_depth,
+        estimated_ploidy, ploidy, ploidy_source
     """
     sample_cols = get_sample_columns(df)
 
     print(f"\n{'=' * 80}")
-    print("ESTIMATING PLOIDY PER SAMPLE / CONTIG")
+    print("DETERMINING PLOIDY PER SAMPLE / CONTIG")
     print(f"{'=' * 80}")
+
+    authoritative = None
+    if ploidy_table:
+        authoritative = read_wide_ploidy_table(ploidy_table)
+        print(f"  Authoritative ploidy table: {ploidy_table}")
+        print(f"  Samples in ploidy table: {len(authoritative)}")
+    else:
+        print(
+            "  No --ploidy-table given; falling back to depth-derived ploidy. "
+            "GD calls may not be encodable by integrate if GATK-SV assigns a "
+            "ploidy of 0 to an allosome of any analyzed sample."
+        )
 
     rows = []
     for contig, contig_df in df.groupby("Chr"):
         depths = contig_df[sample_cols].values  # bins × samples
         medians = np.median(depths, axis=0)     # per-sample median
         for sample_id, med in zip(sample_cols, medians):
-            ploidy = int(np.round(med))
+            estimated = int(np.round(med))
             rows.append({
                 "sample": sample_id,
                 "contig": contig,
                 "median_depth": float(med),
-                "ploidy": ploidy,
+                "estimated_ploidy": estimated,
+                "ploidy": estimated,
+                "ploidy_source": "depth",
             })
 
     ploidy_df = pd.DataFrame(rows)
+    if authoritative is not None:
+        ploidy_df = _apply_authoritative_ploidy(ploidy_df, authoritative)
 
     # Summary
     n_samples = len(sample_cols)
@@ -507,6 +536,71 @@ def estimate_ploidy(
     print("  Saved ploidy estimate table")
     print(f"  Rows: {len(ploidy_df):,}")
     print(f"{'=' * 80}\n")
+
+    return ploidy_df
+
+
+def _apply_authoritative_ploidy(
+    ploidy_df: pd.DataFrame,
+    authoritative: Dict[str, Dict[str, int]],
+) -> pd.DataFrame:
+    """Overwrite depth-derived ploidy with the GATK-SV table and report QC.
+
+    Every analyzed sample/contig pair must be present in the table: a silent
+    fallback to the depth estimate for part of the cohort would reintroduce
+    exactly the inconsistency the table is meant to remove.
+    """
+    lookup = [
+        authoritative.get(str(sample), {}).get(str(contig))
+        for sample, contig in zip(ploidy_df["sample"], ploidy_df["contig"])
+    ]
+
+    missing = [
+        f"{sample}/{contig}"
+        for (sample, contig), value in zip(
+            zip(ploidy_df["sample"], ploidy_df["contig"]), lookup
+        )
+        if value is None
+    ]
+    if missing:
+        examples = ", ".join(missing[:5])
+        raise ValueError(
+            f"Ploidy table is missing {len(missing)} analyzed sample/contig "
+            f"pair(s), for example: {examples}"
+        )
+
+    ploidy_df = ploidy_df.copy()
+    ploidy_df["ploidy"] = [int(value) for value in lookup]
+    ploidy_df["ploidy_source"] = "table"
+
+    discordant = ploidy_df[
+        (ploidy_df["ploidy"] - ploidy_df["estimated_ploidy"]).abs() >= 1
+    ]
+    if len(discordant):
+        print(
+            f"  WARNING: {len(discordant)} sample/contig pair(s) where the "
+            "depth-derived ploidy disagrees with the ploidy table by >= 1 "
+            "copy. The table wins; depth-visible aneuploidy or a sex "
+            "mismatch is called as an event relative to the table ploidy."
+        )
+        for row in discordant.head(10).itertuples(index=False):
+            print(
+                f"    {row.sample}/{row.contig}: table={row.ploidy}, "
+                f"depth={row.estimated_ploidy} (median {row.median_depth:.3f})"
+            )
+        if len(discordant) > 10:
+            print(f"    ... and {len(discordant) - 10} more")
+
+    n_zero = int((ploidy_df["ploidy"] == 0).sum())
+    if n_zero:
+        zero_contigs = sorted(
+            ploidy_df.loc[ploidy_df["ploidy"] == 0, "contig"].unique()
+        )
+        print(
+            f"  {n_zero} sample/contig pair(s) have ploidy 0 on "
+            f"{', '.join(zero_contigs)} and are not genotypable; they are "
+            "excluded from bin statistics and emit no calls."
+        )
 
     return ploidy_df
 

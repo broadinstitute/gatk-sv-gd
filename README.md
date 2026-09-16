@@ -172,12 +172,46 @@ gatk-sv-gd preprocess \
   --flank-exclusion-intervals "${RESOURCES_DIR}/hg38_SD.bed.gz" \
   --hard-inclusion-intervals "${RESOURCES_DIR}/hg38_GD_inclusion_intervals.bed" \
   --par-intervals "${RESOURCES_DIR}/hg38.par.bed" \
+  --ploidy-table ploidy_table.tsv \
   --baf-table all_samples.baf.txt.gz \
   --high-res-counts highres.rd.txt.gz \
   --output-dir preprocessed
 ```
 
 *Note: If specific target bins must bypass quality and exclusion filtering to guarantee spatial continuity, pass their coordinates via `--hard-inclusion-intervals`. If chrX bins are present, `--par-intervals` must be provided to accurately isolate pseudoautosomal segments.*
+
+##### Ploidy is taken from GATK-SV
+
+`--ploidy-table` accepts the wide GATK-SV ploidy table (a `sample` column plus one
+column per contig) and makes it the authority on per-contig ploidy, which is what
+keeps GD calls consistent with the genotypes `integrate` has to write.  Pass the
+same table to `integrate`.  Two consequences:
+
+* A sample/contig pair with ploidy 0 — allosomes of a `sex=0` sample, for example —
+  is not genotypable by GATK-SV, so it is excluded from bin statistics and emits no
+  calls.  Without this, `call` scores those samples against a depth-derived ploidy
+  and `integrate` then fails with `has zero sample ploidy`.  `integrate` accepts
+  the resulting gap: its complete-cohort check exempts samples with ploidy 0 on
+  the call's contig, so pass it the same table.
+* Depth-visible aneuploidy that the table does not describe (XXY, 45,X, mosaic X
+  loss) is called as an event relative to the table ploidy.  Preprocess keeps the
+  depth-derived value in `ploidy_estimates.tsv` as `estimated_ploidy` and warns for
+  every pair that disagrees with the table by a copy or more, so those samples are
+  visible rather than silent.
+
+Omitting `--ploidy-table` falls back to the depth-derived estimate: the rounded
+median normalized depth per sample and contig, taken over every input bin on the
+contig before quality filtering and locus collection.  That estimate is robust,
+but it describes the DNA rather than GATK-SV's sex assignment, so it can never
+produce the ploidy 0 that marks a pair as not genotypable.
+
+Preprocess fails if a body interval keeps fewer than `--min-bins-per-interval` bins after
+masking, rebinning, and the high-resolution fallback.  The error names the locus (cluster,
+`GD_ID`s, coordinates) and each offending interval with its bounds, width, surviving bin
+count, exclusion-mask overlap, and the number of raw high-resolution bins available, which
+separates "interval too short for the bin size" from "bins were masked away".  See
+[`--gd-table`](#2-genomic-disorder-locus-definitions---gd-table) for the breakpoint-labelling
+convention that avoids intervals which are unmappable by construction.
 
 #### Step 2: Model Inference
 

@@ -51,6 +51,49 @@ def test_evaluate_against_truth_uses_call_emitted_carriers(tmp_path):
     assert row["anomalous_discrepancy_samples"] == "S2,S3"
 
 
+def test_truth_carriers_with_no_ploidy_on_the_contig_are_not_false_negatives(tmp_path, capsys):
+    # S2 has no ploidy on chrX, so `call` emits no row for it at all. Scoring
+    # its truth carrier state would book a guaranteed false negative.
+    calls_df = pd.DataFrame(
+        {
+            "GD_ID": ["GDX", "GDX"],
+            "sample": ["S1", "S3"],
+            "is_carrier": [True, False],
+            "is_best_match": [True, True],
+            "qual_score": [20.0, 5.0],
+            "chrom": ["chrX", "chrX"],
+            "start": [100, 100],
+            "end": [200, 200],
+            "cluster": ["clusterX", "clusterX"],
+            "svtype": ["DEL", "DEL"],
+        }
+    )
+    truth_df = pd.DataFrame(
+        [{
+            "GD_ID": "GDX",
+            "carrier_set": {"S1", "S2"},
+            "chr": "chrX",
+            "start": 100,
+            "end": 200,
+            "cluster_ID": "clusterX",
+            "SVTYPE": "DEL",
+        }]
+    )
+
+    report_df = evaluate_against_truth(
+        calls_df,
+        truth_df,
+        str(tmp_path),
+        batch_samples={"S1", "S2", "S3"},
+        ploidy_lookup={("S1", "chrX"): 1, ("S2", "chrX"): 0, ("S3", "chrX"): 2},
+    )
+
+    row = report_df.iloc[0]
+    assert row["TP_samples"] == "S1"
+    assert row["FN_samples"] == ""
+    assert "Excluded 1 truth carrier(s) with ploidy 0" in capsys.readouterr().out
+
+
 def test_load_truth_table_bed_format_filters_to_canonical_nahr(tmp_path):
     truth_path = tmp_path / "truth_bed.tsv"
     truth_path.write_text(

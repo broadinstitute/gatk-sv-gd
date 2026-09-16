@@ -174,6 +174,7 @@ def evaluate_against_truth(
     truth_df: pd.DataFrame,
     output_dir: str,
     batch_samples: Optional[set] = None,
+    ploidy_lookup: Optional[Dict[tuple, int]] = None,
 ) -> pd.DataFrame:
     """
     Cross-reference predicted GD calls against a truth table and report
@@ -194,6 +195,10 @@ def evaluate_against_truth(
         batch_samples: Optional set of sample IDs present in the current
             batch.  If provided, truth carriers not in this set are removed
             before scoring.
+        ploidy_lookup: Optional ``{(sample, contig): ploidy}`` map.  Truth
+            carriers whose ploidy on the locus contig is 0 are removed as
+            well: the call step cannot emit a genotype for them, so scoring
+            them would count guaranteed false negatives.
 
     Returns:
         Per-site report DataFrame.
@@ -237,11 +242,28 @@ def evaluate_against_truth(
 
     # Build truth carrier sets keyed by GD_ID
     truth_by_gd: Dict[str, dict] = {}
+    n_ungenotypable = 0
     for _, row in truth_df.iterrows():
         gd_id = str(row["GD_ID"])
         carrier_set = row["carrier_set"]
         if batch_samples is not None:
             carrier_set = carrier_set & batch_samples
+        if ploidy_lookup:
+            # The call step emits nothing for a sample with no ploidy on this
+            # contig, so scoring its truth carriers would book guaranteed false
+            # negatives for events the pipeline is not allowed to call.
+            chrom = str(
+                pred_meta_by_gd.get(gd_id, {}).get("chr")
+                or row.get("chr", "")
+                or ""
+            )
+            if chrom:
+                ungenotypable = {
+                    sample for sample in carrier_set
+                    if ploidy_lookup.get((str(sample), chrom), 2) <= 0
+                }
+                n_ungenotypable += len(ungenotypable)
+                carrier_set = carrier_set - ungenotypable
         truth_by_gd[gd_id] = {
             "carrier_set": carrier_set,
             "chr": row.get("chr", ""),
@@ -250,6 +272,10 @@ def evaluate_against_truth(
             "cluster_ID": row.get("cluster_ID", ""),
             "SVTYPE": row.get("SVTYPE", ""),
         }
+
+    if n_ungenotypable:
+        print(f"  Excluded {n_ungenotypable} truth carrier(s) with ploidy 0 on "
+              "the locus contig; those samples are not genotypable here.")
 
     # Union of all GD_IDs with at least one truth or predicted carrier
     pred_gd_ids = {gd for gd, s in pred_by_gd.items() if len(s) > 0}
@@ -409,6 +435,12 @@ def main():
     ploidy_df = pd.read_csv(args.ploidy_table, sep="\t")
     batch_samples = set(ploidy_df["sample"].astype(str).unique())
     print(f"    {len(batch_samples)} samples in batch")
+    ploidy_lookup = None
+    if {"contig", "ploidy"}.issubset(ploidy_df.columns):
+        ploidy_lookup = {
+            (str(row.sample), str(row.contig)): int(row.ploidy)
+            for row in ploidy_df.itertuples(index=False)
+        }
 
     # Load truth table
     print("\n  Loading truth table")
@@ -441,6 +473,7 @@ def main():
     evaluate_against_truth(
         calls_df, truth_df, args.output_dir,
         batch_samples=batch_samples,
+        ploidy_lookup=ploidy_lookup,
     )
 
     print("\n" + "=" * 80)

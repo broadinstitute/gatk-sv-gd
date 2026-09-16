@@ -1649,6 +1649,14 @@ def parse_args():
              "filtered to the retained GD regions and analyzed samples.",
     )
     parser.add_argument(
+        "--ploidy-table", required=False,
+        help="Wide GATK-SV ploidy table (sample + one column per contig), taken "
+             "as the authority on per-contig ploidy. Strongly recommended: it "
+             "keeps GD calls consistent with GATK-SV genotype encoding, and "
+             "sample/contig pairs with ploidy 0 emit no calls. Without it, "
+             "ploidy is derived from median bin depth.",
+    )
+    parser.add_argument(
         "--ref-fasta", required=True,
         help="Path to an indexed reference FASTA file. "
              "Required to compute per-bin GC fractions for GC bias correction.",
@@ -1796,9 +1804,9 @@ def main():
     # Normalise: CN=2 corresponds to depth of 2.0
     df[sample_cols] = 2.0 * df[sample_cols] / column_medians[np.newaxis, :]
 
-    # Estimate ploidy (before quality filtering so the ploidy map is
+    # Determine ploidy (before quality filtering so the ploidy map is
     # available for ploidy-adjusted median/MAD computation)
-    ploidy_df = estimate_ploidy(df, args.output_dir)
+    ploidy_df = estimate_ploidy(df, args.output_dir, ploidy_table=args.ploidy_table)
     ploidy_map = build_ploidy_map(ploidy_df)
 
     # Filter low quality bins

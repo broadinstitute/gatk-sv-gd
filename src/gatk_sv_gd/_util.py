@@ -310,6 +310,57 @@ def posterior_probability_to_qual(
     return qual
 
 
+def read_wide_ploidy_table(path: str) -> Dict[str, Dict[str, int]]:
+    """Read a wide GATK-SV ploidy table (sample + one column per contig).
+
+    This is the sex-assignment-derived table GATK-SV uses to encode genotypes,
+    so it is the authority on which sample/contig pairs are genotypable at all:
+    a ploidy of 0 (e.g. allosomes of a ``sex=0`` sample) means no genotype can
+    be emitted there.
+
+    Returns
+    -------
+    dict sample -> {contig -> ploidy_int}
+    """
+    ploidy_dict: Dict[str, Dict[str, int]] = {}
+    with open(path, "r") as f:
+        header = []
+        line_offset = 1
+        for line_offset, line in enumerate(f, start=1):
+            # Leading comments precede the header; consuming one as the header
+            # would leave every sample with no contigs and silently fall back
+            # to the default ploidy of 2 everywhere.
+            if not line.startswith("#"):
+                header = line.strip().split("\t")
+                break
+        if len(header) < 2:
+            # An empty or comment-only table would otherwise parse to {}, and
+            # every lookup would fall back to the default ploidy of 2 — exactly
+            # the silent disagreement this table is meant to settle.
+            raise ValueError(
+                f"Ploidy table {path} has no header row with a sample column "
+                "and at least one contig column"
+            )
+        for line_number, line in enumerate(f, start=line_offset + 1):
+            tokens = line.strip().split("\t")
+            if not tokens or tokens[0].startswith("#"):
+                continue
+            if len(tokens) != len(header):
+                # A short row would silently drop trailing contigs, which then
+                # read back as the default ploidy 2 and quietly genotype a
+                # sample the table never described.
+                raise ValueError(
+                    f"Ploidy table line {line_number} has {len(tokens)} field(s) "
+                    f"but the header has {len(header)}: {tokens[0]!r}"
+                )
+            sample = tokens[0]
+            ploidy_dict[sample] = {
+                header[i]: int(tokens[i])
+                for i in range(1, len(header))
+            }
+    return ploidy_dict
+
+
 def posterior_called_state_to_qual(
     event_probability: Any,
     called_event: Any,
