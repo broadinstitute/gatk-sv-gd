@@ -200,9 +200,10 @@ same table to `integrate`.  Two consequences:
   visible rather than silent.
 
 Omitting `--ploidy-table` falls back to the depth-derived estimate: the rounded
-median normalized depth per sample and contig, taken over GD loci and their flanks
-rather than the whole contig, so a large event can bias it toward its own carrier
-state.
+median normalized depth per sample and contig, taken over every input bin on the
+contig before quality filtering and locus collection.  That estimate is robust,
+but it describes the DNA rather than GATK-SV's sex assignment, so it can never
+produce the ploidy 0 that marks a pair as not genotypable.
 
 Preprocess fails if a body interval keeps fewer than `--min-bins-per-interval` bins after
 masking, rebinning, and the high-resolution fallback.  The error names the locus (cluster,

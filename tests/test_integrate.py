@@ -840,7 +840,9 @@ def _make_narrow_gd_calls_file(tmp_path, entries):
 
 def _make_ploidy_file(tmp_path, samples_chroms):
     """Write a ploidy table and return its path."""
-    chroms = sorted({c for _, d in samples_chroms for c in d})
+    # A header with no contig columns describes nothing and is rejected, so
+    # fixtures that declare no samples still get one column.
+    chroms = sorted({c for _, d in samples_chroms for c in d}) or ["chr1"]
     header = "sample\t" + "\t".join(chroms) + "\n"
     body = ""
     for sample, d in samples_chroms:
@@ -3326,6 +3328,14 @@ class TestPloidyTableReadingExtended:
         assert result["S1"]["chr2"] == 3
         assert result["S1"]["chr3"] == 2
 
+    def test_comment_only_ploidy_table_is_rejected(self, tmp_path):
+        """A comment-only table parsed to {}, and every lookup then fell back
+        to the default ploidy of 2."""
+        p = tmp_path / "ploidy.tsv"
+        p.write_text("# only a comment\n")
+        with pytest.raises(ValueError, match="no header row"):
+            integrate.read_ploidy_table(str(p))
+
     def test_empty_ploidy_table(self, tmp_path):
         """Case 5.4: Empty ploidy table (header only)."""
         p = tmp_path / "ploidy.tsv"
@@ -3871,11 +3881,11 @@ class TestReaderErrorPaths:
             integrate.read_gd_calls(str(p))
 
     def test_ploidy_table_empty_file(self, tmp_path):
-        """Case 20.2: Empty file (no header) → returns empty dict."""
+        """Case 20.2: Empty file (no header) → rejected."""
         p = tmp_path / "ploidy.tsv"
         p.write_text("")
-        result = integrate.read_ploidy_table(str(p))
-        assert result == {}
+        with pytest.raises(ValueError, match="no header row"):
+            integrate.read_ploidy_table(str(p))
 
     def test_ploidy_table_non_integer_value(self, tmp_path):
         """Case 20.3: Non-integer ploidy → ValueError."""
@@ -6628,11 +6638,11 @@ class TestPloidyTableEdgeCases:
     """Ploidy table reading edge cases (5.1, 5.3, 5.4, 5.6, 5.7, 5.9)."""
 
     def test_ploidy_table_empty_file(self, tmp_path):
-        """Case 5.1: Empty ploidy table → empty dict."""
+        """Case 5.1: Empty ploidy table → rejected."""
         p = tmp_path / "ploidy.tsv"
         p.write_text("")
-        result = integrate.read_ploidy_table(str(p))
-        assert result == {}
+        with pytest.raises(ValueError, match="no header row"):
+            integrate.read_ploidy_table(str(p))
 
     def test_ploidy_table_header_only(self, tmp_path):
         """Case 5.3: Header only → empty dict."""
@@ -6642,13 +6652,15 @@ class TestPloidyTableEdgeCases:
         assert result == {}
 
     def test_ploidy_table_missing_column(self, tmp_path):
-        """Case 5.4: Missing ploidy columns → sample with empty inner dict."""
+        """Case 5.4: Missing ploidy columns → rejected.
+
+        A table with no contig columns describes nothing, so every lookup
+        would fall back to the default ploidy of 2.
+        """
         p = tmp_path / "ploidy.tsv"
         p.write_text("sample\nS1\n")
-        result = integrate.read_ploidy_table(str(p))
-        # sample is present but inner dict is empty (no contigs to map)
-        assert "S1" in result
-        assert result["S1"] == {}
+        with pytest.raises(ValueError, match="no header row"):
+            integrate.read_ploidy_table(str(p))
 
     def test_ploidy_table_short_rows(self, tmp_path):
         """Case 5.6: Row with fewer columns → parses what's available."""

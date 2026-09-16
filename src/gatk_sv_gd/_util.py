@@ -333,6 +333,14 @@ def read_wide_ploidy_table(path: str) -> Dict[str, Dict[str, int]]:
             if not line.startswith("#"):
                 header = line.strip().split("\t")
                 break
+        if len(header) < 2:
+            # An empty or comment-only table would otherwise parse to {}, and
+            # every lookup would fall back to the default ploidy of 2 — exactly
+            # the silent disagreement this table is meant to settle.
+            raise ValueError(
+                f"Ploidy table {path} has no header row with a sample column "
+                "and at least one contig column"
+            )
         for line_number, line in enumerate(f, start=line_offset + 1):
             tokens = line.strip().split("\t")
             if not tokens or tokens[0].startswith("#"):
