@@ -18,6 +18,8 @@ SUBCOMMANDS = {
     "extract": "gatk_sv_gd.extract",
     "synthesize": "gatk_sv_gd.synthesize",
     "integrate": "gatk_sv_gd.integrate",
+    "plot-mosaic": "gatk_sv_gd.plot_mosaic",
+    "plot-mode-depth": "gatk_sv_gd.plot_mode_depth",
 }
 
 DESCRIPTIONS = {
@@ -30,6 +32,8 @@ DESCRIPTIONS = {
     "extract": "Extract putative GD events from VCF(s)",
     "synthesize": "Spike synthetic GD CNVs into read-depth matrices",
     "integrate": "Integrate GD calls into a GATK-SV final VCF",
+    "plot-mosaic": "Plot mosaic carrier depth against germline carriers and non-carriers",
+    "plot-mode-depth": "Plot most-common normalized depth per sample across NAHR GD loci",
 }
 
 
@@ -42,7 +46,7 @@ def _print_usage(file=None):
     print("Genomic Disorder CNV detection from binned read counts.\n", file=file)
     print("Subcommands:", file=file)
     for name, desc in DESCRIPTIONS.items():
-        print(f"  {name:8s}  {desc}", file=file)
+        print(f"  {name:15s}  {desc}", file=file)
     print(f"\nRun '{prog} <subcommand> --help' for subcommand-specific options.", file=file)
 
 
