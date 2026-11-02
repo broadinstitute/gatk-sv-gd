@@ -1,14 +1,16 @@
 """
-Most-common normalized read depth per sample at every NAHR-mediated GD locus.
+Most-common normalized read depth per sample at every autosomal NAHR GD locus.
 
 Backs the ``PlotGDModeDepth`` WDL.  Three subcommands, run in this order:
 
 ``summarize``
-    Per batch.  Reads ``cn_posteriors.tsv.gz`` from ``CallGenomicDisorderCNVs``.
-    For every sample at every NAHR locus, rounds the normalized depth of each
-    locus body bin to the nearest 0.1, finds the most commonly observed
-    rounded value, and reports the median of the actual (unrounded) depths
-    that rounded to it.  Flank bins are ignored.
+    Per batch.  Reads a low-resolution read-count matrix and normalizes it as
+    ``plot.py`` does for its raw-depth overlay (counts scaled so each sample's
+    autosomal median is CN 2, via ``_compute_raw_sample_medians`` and
+    ``_build_raw_region_df``).  For every sample at every locus, bins between
+    the locus breakpoints (the GD body intervals) are rounded to the nearest
+    0.1, the most commonly observed rounded value is found, and the median of
+    the actual (unrounded) depths that rounded to it is reported.
 ``merge``
     Once.  Concatenates the per-batch tables into one dataset.
 ``plot``
@@ -17,12 +19,13 @@ Backs the ``PlotGDModeDepth`` WDL.  Three subcommands, run in this order:
     loci with probable mosaic carriers are labeled.  Several datasets can be
     stacked, sharing the x-axis.
 
-Expected behaviour of the mode depth (CN 2 baseline = 2.0): non-carriers sit
-near 2, germline het DEL carriers near 1 (het DUP near 3), mosaic carriers
+Expected behaviour of the reported depth (CN 2 baseline = 2.0): non-carriers
+sit near 2, germline het DEL carriers near 1 (het DUP near 3), mosaic carriers
 between (1-2 for DEL, 2-3 for DUP), and carriers of an event that covers only
 part of the locus sit near 2 or near the carrier value, never between.
 
-Loci on chrX and chrY are included; depth is not rescaled for ploidy.
+Loci on chrX and chrY are excluded: normalization is autosomal and depth is
+not rescaled for ploidy.
 """
 
 import argparse
@@ -37,9 +40,16 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
-from gatk_sv_gd.models import GDTable
+from gatk_sv_gd.models import GDLocus, GDTable
+from gatk_sv_gd.plot import (
+    _build_raw_region_df,
+    _compute_raw_sample_medians,
+    estimate_lowres_bin_size,
+)
 
 ROUND_DECIMALS = 1
+SKIP_CHROMS = {"chrX", "chrY", "X", "Y"}
+RASTER_DPI = 1000
 
 # Median depth windows (inclusive) that flag a probable mosaic carrier.
 MOSAIC_DEL_RANGE = (1.2, 1.8)
@@ -82,7 +92,7 @@ def locus_order(gd_table_path: str) -> pd.DataFrame:
 
     rows = []
     for cluster, locus in table.loci.items():
-        if not locus.is_nahr:
+        if not locus.is_nahr or str(locus.chrom) in SKIP_CHROMS:
             continue
         rows.append((str(cluster), locus_label(locus.display_label), locus.chrom,
                      rank.get(str(cluster), len(rank))))
@@ -97,61 +107,102 @@ def locus_order(gd_table_path: str) -> pd.DataFrame:
 # =============================================================================
 
 
-def mode_of_rounded(counts: pd.Series) -> float:
-    """Most common rounded depth; ties go to the value nearest 2."""
-    top = counts[counts == counts.max()]
-    return float(min(top.index, key=lambda v: (abs(v - 2.0), v)))
+def mode_and_median(values: np.ndarray) -> Optional[Tuple[float, float, int, int]]:
+    """Most common 0.1-rounded value of *values*, and the median of the actual
+    values that rounded to it.
 
-
-def summarize_depth(chunks, clusters: Sequence[str], batch: str) -> pd.DataFrame:
-    """Per (cluster, sample): mode of 0.1-rounded body-bin depth, and the
-    median of the actual depths that rounded to that mode.
-
-    *chunks* yields DataFrames with cluster, interval, sample and depth.
+    Ties go to the rounded value nearest 2, then the lower one.  Returns
+    ``(mode, median, n_bins, mode_bins)`` or ``None`` when no finite values.
     """
-    wanted = set(clusters)
-    parts = []
-    for chunk in chunks:
-        chunk = chunk[chunk["cluster"].astype(str).isin(wanted)]
-        chunk = chunk[~chunk["interval"].astype(str).str.contains("flank", case=False)]
-        depth = chunk["depth"].astype(float)
-        keep = np.isfinite(depth)
-        if not keep.any():
-            continue
-        parts.append(pd.DataFrame({
-            "cluster": chunk["cluster"].astype(str)[keep].to_numpy(),
-            "sample": chunk["sample"].astype(str)[keep].to_numpy(),
-            "depth": depth[keep].to_numpy(),
-            "rounded": np.round(depth[keep].to_numpy(), ROUND_DECIMALS),
-        }))
-    if not parts:
-        return pd.DataFrame(columns=COLUMNS)
-    bins = pd.concat(parts, ignore_index=True)
+    values = values[np.isfinite(values)]
+    if values.size == 0:
+        return None
+    scale = 10 ** ROUND_DECIMALS
+    codes = np.round(values * scale).astype(np.int64)
+    uniq, counts = np.unique(codes, return_counts=True)
+    top = uniq[counts == counts.max()]
+    mode_code = min(top, key=lambda c: (abs(c - 2 * scale), c))
+    in_mode = values[codes == mode_code]
+    return (round(mode_code / scale, ROUND_DECIMALS), float(np.median(in_mode)),
+            int(values.size), int(in_mode.size))
 
-    counts = bins.groupby(["cluster", "sample", "rounded"]).size()
+
+def body_intervals(locus: GDLocus) -> List[Tuple[int, int]]:
+    """Intervals between adjacent breakpoints (breakpoint ranges excluded)."""
+    return [(s, e) for s, e, _ in locus.get_intervals() if e > s]
+
+
+def summarize_locus(depth: pd.DataFrame, locus: GDLocus, batch: str) -> pd.DataFrame:
+    """Per-sample most-common depth over the body bins of one locus.
+
+    *depth* is a normalized region frame (Chr, Start, End, one column per
+    sample), as returned by ``_build_raw_region_df``.
+    """
+    if depth is None or len(depth) == 0:
+        return pd.DataFrame(columns=COLUMNS)
+    mids = (depth["Start"].to_numpy() + depth["End"].to_numpy()) / 2
+    in_body = np.zeros(len(depth), dtype=bool)
+    for start, end in body_intervals(locus):
+        in_body |= (mids >= start) & (mids < end)
+    samples = [c for c in depth.columns if c not in ("Chr", "Start", "End")]
+    matrix = depth.loc[in_body, samples].to_numpy(dtype=float)
     rows = []
-    for (cluster, sample), series in counts.groupby(level=[0, 1]):
-        series = series.droplevel([0, 1])
-        mode = mode_of_rounded(series)
-        rows.append((cluster, sample, mode, int(series.sum()), int(series.loc[mode])))
-    modes = pd.DataFrame(rows, columns=["cluster", "sample", "mode_depth",
-                                        "n_bins", "mode_bins"])
-    hit = bins.merge(modes[["cluster", "sample", "mode_depth"]], how="inner",
-                     left_on=["cluster", "sample", "rounded"],
-                     right_on=["cluster", "sample", "mode_depth"])
-    med = (hit.groupby(["cluster", "sample"])["depth"].median()
-           .rename("median_depth").reset_index())
-    out = modes.merge(med, on=["cluster", "sample"])
-    out["batch"] = batch
-    return out[COLUMNS]
+    for j, sample in enumerate(samples):
+        res = mode_and_median(matrix[:, j])
+        if res is not None:
+            rows.append((batch, locus.cluster, sample, res[0], res[1], res[2], res[3]))
+    return pd.DataFrame(rows, columns=COLUMNS)
+
+
+def read_count_matrix(path: str) -> pd.DataFrame:
+    """Read a low-res count matrix (Chr, Start, End, samples) compactly."""
+    header = pd.read_csv(path, sep="\t", compression="infer", nrows=0).columns
+    coord = {"#Chr", "Chr", "Start", "End"}
+    dtypes = {c: np.float32 for c in header if c not in coord}
+    df = pd.read_csv(path, sep="\t", compression="infer", dtype=dtypes)
+    if "#Chr" in df.columns:
+        df = df.rename(columns={"#Chr": "Chr"})
+    df["Start"] = df["Start"].astype(int)
+    df["End"] = df["End"].astype(int)
+    return df
+
+
+def summarize_matrix(counts: pd.DataFrame, gd_table_path: str,
+                     batch: str) -> pd.DataFrame:
+    """Normalize *counts* as plot.py does and summarize every autosomal NAHR locus."""
+    order = locus_order(gd_table_path)
+    loci_by_key = {str(k): v for k, v in GDTable(gd_table_path).loci.items()}
+    samples = [c for c in counts.columns if c not in ("Chr", "Start", "End")]
+    medians = _compute_raw_sample_medians(counts)
+    usable = [s for s in samples if s in medians]
+    dropped = sorted(set(samples) - set(usable))
+    if dropped:
+        print(f"WARNING: no usable autosomal median for {len(dropped)} sample(s): "
+              f"{', '.join(dropped[:10])}{' ...' if len(dropped) > 10 else ''}",
+              file=sys.stderr)
+    if not usable:
+        return pd.DataFrame(columns=COLUMNS)
+    bin_size = estimate_lowres_bin_size(counts)
+
+    parts = []
+    for cluster in order["cluster"]:
+        locus = loci_by_key[cluster]
+        depth = _build_raw_region_df(
+            locus, locus.start, locus.end, counts, usable, medians, bin_size,
+            highres_path=None)
+        res = summarize_locus(depth, locus, batch)
+        if len(res) == 0:
+            print(f"WARNING: no body bins for locus {locus.display_label} in {batch}",
+                  file=sys.stderr)
+        res["cluster"] = str(cluster)
+        parts.append(res)
+    return pd.concat(parts, ignore_index=True)[COLUMNS] if parts else \
+        pd.DataFrame(columns=COLUMNS)
 
 
 def cmd_summarize(args) -> None:
-    order = locus_order(args.gd_table)
-    chunks = pd.read_csv(
-        args.cn_posteriors, sep="\t", compression="infer",
-        usecols=["cluster", "interval", "sample", "depth"], chunksize=500_000)
-    out = summarize_depth(chunks, list(order["cluster"]), args.batch)
+    counts = read_count_matrix(args.low_res_counts)
+    out = summarize_matrix(counts, args.gd_table, args.batch)
     out.to_csv(args.out, sep="\t", index=False, compression="infer")
     print(f"{args.batch}: {out['sample'].nunique()} samples, "
           f"{out['cluster'].nunique()} loci, {len(out)} values")
@@ -241,10 +292,13 @@ def draw_mode_depth_plot(
         for cluster in mosaic_clusters:
             ax.axvspan(xmap[cluster] - 0.4, xmap[cluster] + 0.4,
                        color=COLOR_MOSAIC_BAND, linewidth=0, zorder=0)
-        # Vector filled dots; colors alternate between adjacent loci.
+        # Dots are one high-resolution raster layer (a vector dot per sample
+        # makes multi-MB PDFs that many viewers fail to draw); text, axes and
+        # bands stay vector.  Colors alternate between adjacent loci.
         colors = np.where(data["cluster"].map(xmap).to_numpy(int) % 2 == 0,
                           COLOR_POINT_EVEN, COLOR_POINT_ODD)
-        ax.scatter(x, y, s=1.6, c=colors, linewidths=0, clip_on=False, zorder=3)
+        ax.scatter(x, y, s=1.6, c=colors, linewidths=0, clip_on=False, zorder=3,
+                   rasterized=True)
         for level in (1, 2, 3):
             ax.axhline(level, color=COLOR_BASELINE, lw=0.3, zorder=1)
         top = min(ymax, float(y.max())) if len(y) else ymax
@@ -264,7 +318,7 @@ def draw_mode_depth_plot(
                        rotation_mode="anchor")
     ax.set_xlim(-0.7, len(order) - 0.3)
     fig.tight_layout(pad=0.3, h_pad=0.4)
-    fig.savefig(out_pdf)
+    fig.savefig(out_pdf, dpi=RASTER_DPI)
     plt.close(fig)
     return list(labeled["label"])
 
@@ -301,7 +355,8 @@ def build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser("summarize", help="Per-batch most-common depth per sample and locus")
     p.add_argument("--batch", required=True)
     p.add_argument("--gd-table", required=True)
-    p.add_argument("--cn-posteriors", required=True)
+    p.add_argument("--low-res-counts", required=True,
+                   help="Low-resolution read-count matrix (.rd.txt.gz style)")
     p.add_argument("--out", required=True, help="Output TSV(.gz)")
 
     p = sub.add_parser("merge", help="Concatenate per-batch tables")
