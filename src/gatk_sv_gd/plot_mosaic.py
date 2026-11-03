@@ -6,7 +6,11 @@ Backs the ``PlotGDMosaicDepth`` WDL.  Four subcommands, run in this order:
 ``classify``
     Per batch.  Reads the ``CallGenomicDisorderCNVs`` outputs and labels every
     sample modelled at the locus's cluster as a germline carrier of the target
-    GD, a non-carrier of every GD in the cluster, or neither.
+    GD, a non-carrier of every GD in the cluster, or neither.  With the
+    batch's low-res counts it also flags samples whose normalised depth is
+    abnormal in the flanks or in cluster intervals outside the target GD (a
+    larger or different event), so ``select`` leaves them out of the
+    germline and non-carrier comparators.
 ``select``
     Once.  Finds the batches holding the mosaic carriers, draws random
     non-carrier comparators from those batches, and draws min(requested,
@@ -150,6 +154,58 @@ def _load_cluster_bins(cn_posteriors: str, cluster: str) -> pd.DataFrame:
     return pd.concat(parts, ignore_index=True)
 
 
+def flag_abnormal_samples(
+    depth: Optional[pd.DataFrame],
+    locus: GDLocus,
+    gd_id: str,
+    ploidy: Dict[str, int],
+    samples: List[str],
+    max_deviation: float,
+    min_region_bins: int = 3,
+) -> pd.DataFrame:
+    """Flag samples with abnormal depth outside the target GD.
+
+    *depth* is the normalised region frame (Chr, Start, End, one column per
+    sample; CN 2 = 2.0).  Bins are grouped into the left flank, the right
+    flank, and each cluster interval whose midpoint lies outside the target
+    GD's span.  A sample is abnormal when the median depth of any
+    *min_region_bins* consecutive bins within a group differs from its ploidy
+    by more than *max_deviation* (so a short event is caught, a lone noisy
+    bin is not).  Samples missing from *depth* are not flagged.
+
+    Returns columns sample, abnormal, abnormal_region, max_deviation.
+    """
+    gd_start, gd_end = locus.get_gd_intervals()[str(gd_id)]
+    regions: List[Tuple[str, np.ndarray]] = []
+    if depth is not None and len(depth):
+        mid = (depth["Start"].to_numpy() + depth["End"].to_numpy()) / 2
+        regions.append(("left_flank", mid < locus.start))
+        regions.append(("right_flank", mid >= locus.end))
+        for start, end, name in locus.get_intervals():
+            if end <= start or gd_start <= (start + end) / 2 < gd_end:
+                continue
+            regions.append((name, (mid >= start) & (mid < end)))
+
+    rows = []
+    for sample in samples:
+        worst_region, worst = "", 0.0
+        if depth is not None and sample in depth.columns:
+            values = depth[sample].to_numpy(dtype=float)
+            expected = float(ploidy.get(sample, 2))
+            for name, mask in regions:
+                v = values[mask & np.isfinite(values)]
+                if len(v) < min_region_bins:
+                    continue
+                windows = np.lib.stride_tricks.sliding_window_view(v, min_region_bins)
+                dev = float(np.abs(np.median(windows, axis=1) - expected).max())
+                if dev > worst:
+                    worst_region, worst = name, dev
+        bad = worst > max_deviation
+        rows.append((sample, bool(bad), worst_region if bad else "", worst))
+    return pd.DataFrame(rows, columns=["sample", "abnormal", "abnormal_region",
+                                       "max_deviation"])
+
+
 def _ploidy_for(ploidy_path: Optional[str], chrom: str,
                 samples: List[str]) -> Dict[str, int]:
     ploidy = {s: 2 for s in samples}
@@ -178,13 +234,28 @@ def cmd_classify(args) -> None:
     ploidy = _ploidy_for(args.ploidy_table, locus.chrom, samples)
     classes["batch"] = args.batch
     classes["ploidy"] = classes["sample"].map(ploidy)
-    classes[["sample", "batch", "status", "ploidy"]].to_csv(
-        f"{args.out_prefix}.classes.tsv", sep="\t", index=False)
 
     unique_bins = (
         bins[["start", "end"]].drop_duplicates().rename(
             columns={"start": "Start", "end": "End"}).sort_values("Start")
     )
+
+    depth = None
+    if args.low_res_counts and len(unique_bins):
+        raw = _read_depth_columns(args.low_res_counts, samples)
+        medians = _compute_raw_sample_medians(raw)
+        usable = [s for s in samples if s in medians]
+        if usable:
+            depth = _build_raw_region_df(
+                locus, int(unique_bins["Start"].min()), int(unique_bins["End"].max()),
+                raw, usable, medians, estimate_lowres_bin_size(raw),
+                highres_path=None)
+    flags = flag_abnormal_samples(depth, locus, args.gd_id, ploidy, samples,
+                                  args.max_flank_deviation, args.min_region_bins)
+    classes = classes.merge(flags[["sample", "abnormal", "abnormal_region"]],
+                            on="sample", how="left")
+    classes[["sample", "batch", "status", "ploidy", "abnormal", "abnormal_region"]].to_csv(
+        f"{args.out_prefix}.classes.tsv", sep="\t", index=False)
 
     with open(f"{args.out_prefix}.region.json", "w") as handle:
         json.dump({
@@ -197,7 +268,8 @@ def cmd_classify(args) -> None:
         }, handle)
     print(f"{args.batch}: {len(samples)} samples at {locus.cluster}; "
           f"{(classes['status'] == STATUS_GERMLINE).sum()} germline carriers, "
-          f"{(classes['status'] == STATUS_NON_CARRIER).sum()} non-carriers")
+          f"{(classes['status'] == STATUS_NON_CARRIER).sum()} non-carriers; "
+          f"{int(classes['abnormal'].sum())} with abnormal flank/cluster depth")
 
 
 # =============================================================================
@@ -264,6 +336,19 @@ def select_samples(
     mosaic = classes[classes["sample"].isin(mosaic_samples)]
     mosaic_batches = set(mosaic["batch"])
     ploidy = int(mosaic["ploidy"].mode().iloc[0])
+
+    if "abnormal" in classes.columns:
+        bad = classes["abnormal"].fillna(False).astype(bool)
+        flagged = classes[bad & classes["sample"].isin(mosaic_samples)]
+        if len(flagged):
+            print("WARNING: mosaic sample(s) with abnormal flank/cluster depth "
+                  "(kept): " + ", ".join(
+                      f"{r.sample} ({r.abnormal_region})" for r in flagged.itertuples()),
+                  file=sys.stderr)
+        n_bad = int((bad & ~classes["sample"].isin(mosaic_samples)).sum())
+        print(f"Excluding {n_bad} comparator sample(s) with abnormal flank/cluster "
+              "depth", file=sys.stderr)
+        classes = classes[~bad | classes["sample"].isin(mosaic_samples)]
 
     candidates = classes[
         ~classes["sample"].isin(mosaic_samples) & (classes["ploidy"] == ploidy)
@@ -520,7 +605,7 @@ def draw_mosaic_plot(
 
     handles = [
         Line2D([0], [0], color=COLOR_MOSAIC, lw=0.6,
-               path_effects=[pe.Stroke(linewidth=0.6, foreground=COLOR_MOSAIC_OUTLINE),
+               path_effects=[pe.Stroke(linewidth=0.8, foreground=COLOR_MOSAIC_OUTLINE),
                              pe.Normal()],
                label=f"Mosaic (n={counts[GROUP_MOSAIC]})"),
         Line2D([0], [0], color=COLOR_GERMLINE, lw=0.6,
@@ -573,6 +658,15 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--calls", required=True, help="call/gd_cnv_calls.tsv.gz")
     p.add_argument("--cn-posteriors", required=True, help="infer/cn_posteriors.tsv.gz")
     p.add_argument("--ploidy-table", help="preprocess/ploidy_estimates.tsv")
+    p.add_argument("--low-res-counts",
+                   help="Batch low-res count matrix; enables flagging of samples with "
+                        "abnormal depth in the flanks / other cluster intervals")
+    p.add_argument("--max-flank-deviation", type=float, default=0.5,
+                   help="Flag a sample whose windowed median depth in a flank or other "
+                        "cluster interval differs from its ploidy by more than this")
+    p.add_argument("--min-region-bins", type=int, default=3,
+                   help="Consecutive bins whose median depth is tested in each "
+                        "flank/interval group (groups shorter than this are ignored)")
     p.add_argument("--out-prefix", required=True)
     p.set_defaults(func=cmd_classify)
 

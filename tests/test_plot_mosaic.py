@@ -283,3 +283,38 @@ def test_select_cli_flags_extra_batches(dataset):
     assert len(used) == 2 and "b1" in used
     flags = (tmp_path / "sel.use_batch.txt").read_text().split()
     assert flags.count("true") == 2
+
+
+def _halve(path, sample, start, end):
+    df = pd.read_csv(path, sep="\t")
+    m = (df["Chr"] == CHROM) & (df["Start"] >= start) & (df["End"] <= end)
+    df.loc[m, sample] = (df.loc[m, sample] / 2).round().astype(int)
+    df.to_csv(path, sep="\t", index=False, compression="gzip")
+
+
+def test_classify_flags_abnormal_flank_and_other_interval(dataset):
+    tmp_path, files = dataset
+    f = files["b1"]
+    _halve(f["lowres"], "b1_s5", 1_100_000, 1_300_000)      # left flank
+    _halve(f["lowres"], "b1_s6", 2_010_000, 2_070_000)      # GD_B interval, outside GD_A
+    _halve(f["lowres"], "b1_s7", 1_100_000, 1_110_000)      # 1 flank bin: ignored
+    pm.main(["classify", "--batch", "b1", "--gd-table", str(tmp_path / "gd.tsv"),
+             "--gd-id", "GD_A", "--calls", f["calls"], "--cn-posteriors", f["post"],
+             "--low-res-counts", f["lowres"], "--out-prefix", str(tmp_path / "b1")])
+    c = pd.read_csv(tmp_path / "b1.classes.tsv", sep="\t").set_index("sample")
+    assert c.loc["b1_s5", "abnormal"] and c.loc["b1_s5", "abnormal_region"] == "left_flank"
+    assert c.loc["b1_s6", "abnormal"] and c.loc["b1_s6", "abnormal_region"] == "2-3"
+    assert not c.loc["b1_s7", "abnormal"]
+    assert not c.loc["b1_s10", "abnormal"] and not c.loc["mos1", "abnormal"]
+
+
+def test_select_excludes_abnormal_comparators_but_keeps_mosaic():
+    rows = [("m", "b1", pm.STATUS_NON_CARRIER, 2, True, "left_flank"),
+            ("g1", "b1", pm.STATUS_GERMLINE, 2, True, "left_flank"),
+            ("g2", "b1", pm.STATUS_GERMLINE, 2, False, ""),
+            ("n1", "b1", pm.STATUS_NON_CARRIER, 2, True, "right_flank"),
+            ("n2", "b1", pm.STATUS_NON_CARRIER, 2, False, "")]
+    classes = pd.DataFrame(rows, columns=["sample", "batch", "status", "ploidy",
+                                          "abnormal", "abnormal_region"])
+    out = pm.select_samples(classes, ["m"], 10, 10, 1)
+    assert set(out["sample"]) == {"m", "g2", "n2"}
