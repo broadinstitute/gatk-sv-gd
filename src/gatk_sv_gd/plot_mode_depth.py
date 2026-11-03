@@ -29,6 +29,7 @@ not rescaled for ploidy.
 """
 
 import argparse
+import dataclasses
 import os
 import re
 import sys
@@ -55,7 +56,7 @@ RASTER_DPI = 1000
 MOSAIC_DEL_RANGE = (1.2, 1.8)
 MOSAIC_DUP_RANGE = (2.2, 2.8)
 
-COLUMNS = ["batch", "cluster", "sample", "mode_depth", "median_depth",
+COLUMNS = ["batch", "locus", "sample", "mode_depth", "median_depth",
            "n_bins", "mode_bins"]
 
 COLOR_POINT_EVEN = "#2b2b2b"
@@ -74,32 +75,74 @@ def locus_label(gd_id: str) -> str:
     return re.split(r"_(?:DEL|DUP)", str(gd_id), maxsplit=1)[0]
 
 
-def locus_order(gd_table_path: str) -> pd.DataFrame:
-    """NAHR loci in gd_table order, one row per locus (cluster).
+def _bp_name(value) -> str:
+    """Breakpoint name as GDTable normalizes it ("2", not "2.0")."""
+    if isinstance(value, float) and value == int(value):
+        return str(int(value))
+    return str(value)
 
-    Columns: cluster, label, chrom, x.  The label is the first GD_ID of the
-    locus up to its "_DEL"/"_DUP" suffix, so a DEL and DUP at the same locus
-    share one label and one x position.
+
+def interval_loci(gd_table_path: str) -> Dict[str, GDLocus]:
+    """One locus per distinct GD interval (chr, start, end), in gd_table order.
+
+    Unlike ``GDTable.loci`` (grouped by cluster), every distinct interval gets
+    its own entry, so nested or adjacent GDs of one cluster are separate loci.
+    DEL and DUP rows of the same interval share one.  Each locus is a copy of
+    its cluster's locus restricted to the breakpoints from the interval's BP1
+    to its BP2 (intermediate breakpoints included), with ``is_nahr`` true when
+    any row of the interval has ``NAHR == "yes"``.  Autosomes only: sex
+    chromosome intervals are omitted, as are non-NAHR intervals.
+
+    Keys are ``chr:start-end``.
     """
     table = GDTable(gd_table_path)
     raw = pd.read_csv(gd_table_path, sep="\t")
-    rank: Dict[str, int] = {}
+    groups: Dict[str, List[int]] = {}
     for i, row in raw.iterrows():
-        cluster = row["cluster"]
-        if pd.isna(cluster) or cluster == "":
-            cluster = GDTable._standalone_locus_key(row)
-        rank.setdefault(str(cluster), i)
+        key = f"{row['chr']}:{int(row['start_GRCh38'])}-{int(row['end_GRCh38'])}"
+        groups.setdefault(key, []).append(i)
 
-    rows = []
-    for cluster, locus in table.loci.items():
-        if not locus.is_nahr or str(locus.chrom) in SKIP_CHROMS:
+    out: Dict[str, GDLocus] = {}
+    for key, idx in groups.items():
+        rows = raw.loc[idx]
+        first = rows.iloc[0]
+        if str(first["chr"]) in SKIP_CHROMS:
             continue
-        rows.append((str(cluster), locus_label(locus.display_label), locus.chrom,
-                     rank.get(str(cluster), len(rank))))
-    out = pd.DataFrame(rows, columns=["cluster", "label", "chrom", "rank"])
-    out = out.sort_values("rank", kind="stable").reset_index(drop=True)
+        nahr = rows["NAHR"].astype(str).str.strip().str.lower().eq("yes").any()
+        if not nahr:
+            continue
+        cluster = first["cluster"]
+        if pd.isna(cluster) or cluster == "":
+            cluster = GDTable._standalone_locus_key(first)
+        parent = table.loci[cluster]
+        bp1, bp2 = first["BP1"], first["BP2"]
+        bp1, bp2 = ("1", "2") if pd.isna(bp1) or pd.isna(bp2) else (_bp_name(bp1), _bp_name(bp2))
+        i1, i2 = sorted((parent.breakpoint_names.index(bp1),
+                         parent.breakpoint_names.index(bp2)))
+        keep = slice(i1, i2 + 1)
+        entries = [e for e in parent.gd_entries
+                   if f"{e['start_GRCh38']}-{e['end_GRCh38']}" == key.split(":", 1)[1]]
+        out[key] = dataclasses.replace(
+            parent, cluster=key,
+            breakpoints=parent.breakpoints[keep],
+            breakpoint_names=parent.breakpoint_names[keep],
+            gd_entries=entries or parent.gd_entries,
+            is_nahr=True)
+    return out
+
+
+def locus_order(gd_table_path: str) -> pd.DataFrame:
+    """NAHR autosomal loci in gd_table order, one row per distinct interval.
+
+    Columns: locus, label, chrom, x.  The label is the first GD_ID of the
+    interval up to its "_DEL"/"_DUP" suffix, so a DEL and DUP of the same
+    interval share one label and one x position.
+    """
+    rows = [(key, locus_label(locus.display_label), locus.chrom)
+            for key, locus in interval_loci(gd_table_path).items()]
+    out = pd.DataFrame(rows, columns=["locus", "label", "chrom"])
     out["x"] = np.arange(len(out))
-    return out[["cluster", "label", "chrom", "x"]]
+    return out
 
 
 # =============================================================================
@@ -175,8 +218,7 @@ def summarize_matrix(counts: pd.DataFrame, gd_table_path: str,
     intervals shorter than 10x the low-res median bin size are taken from the
     high-res bins instead, exactly as plot.py's raw-depth overlay does.
     """
-    order = locus_order(gd_table_path)
-    loci_by_key = {str(k): v for k, v in GDTable(gd_table_path).loci.items()}
+    loci_by_key = interval_loci(gd_table_path)
     samples = [c for c in counts.columns if c not in ("Chr", "Start", "End")]
     medians = _compute_raw_sample_medians(counts)
     usable = [s for s in samples if s in medians]
@@ -190,8 +232,7 @@ def summarize_matrix(counts: pd.DataFrame, gd_table_path: str,
     bin_size = estimate_lowres_bin_size(counts)
 
     parts = []
-    for cluster in order["cluster"]:
-        locus = loci_by_key[cluster]
+    for key, locus in loci_by_key.items():
         depth = _build_raw_region_df(
             locus, locus.start, locus.end, counts, usable, medians, bin_size,
             highres_path=highres_path)
@@ -199,7 +240,7 @@ def summarize_matrix(counts: pd.DataFrame, gd_table_path: str,
         if len(res) == 0:
             print(f"WARNING: no body bins for locus {locus.display_label} in {batch}",
                   file=sys.stderr)
-        res["cluster"] = str(cluster)
+        res["locus"] = key
         parts.append(res)
     return pd.concat(parts, ignore_index=True)[COLUMNS] if parts else \
         pd.DataFrame(columns=COLUMNS)
@@ -210,7 +251,7 @@ def cmd_summarize(args) -> None:
     out = summarize_matrix(counts, args.gd_table, args.batch, args.high_res_counts)
     out.to_csv(args.out, sep="\t", index=False, compression="infer")
     print(f"{args.batch}: {out['sample'].nunique()} samples, "
-          f"{out['cluster'].nunique()} loci, {len(out)} values")
+          f"{out['locus'].nunique()} loci, {len(out)} values")
 
 
 # =============================================================================
@@ -242,11 +283,11 @@ def mosaic_flags(data: pd.DataFrame,
 def probable_mosaic_loci(datasets: Sequence[pd.DataFrame], min_samples: int,
                          del_range=MOSAIC_DEL_RANGE,
                          dup_range=MOSAIC_DUP_RANGE) -> List[str]:
-    """Clusters with at least *min_samples* mosaic-range samples in any dataset."""
+    """Loci with at least *min_samples* mosaic-range samples in any dataset."""
     hits = set()
     for data in datasets:
         flagged = data[mosaic_flags(data, del_range, dup_range)]
-        n = flagged.groupby("cluster")["sample"].nunique()
+        n = flagged.groupby("locus")["sample"].nunique()
         hits.update(n[n >= min_samples].index.astype(str))
     return sorted(hits)
 
@@ -290,22 +331,22 @@ def draw_mode_depth_plot(
                              squeeze=False)
     axes = axes[:, 0]
     rng = np.random.RandomState(seed)
-    xmap = dict(zip(order["cluster"], order["x"]))
+    xmap = dict(zip(order["locus"], order["x"]))
 
-    mosaic_clusters = probable_mosaic_loci(
+    mosaic_loci = probable_mosaic_loci(
         datasets, min_mosaic_samples, del_range, dup_range) if flag_mosaics else []
     for ax, data, label in zip(axes, datasets, dataset_labels):
-        data = data[data["cluster"].isin(xmap)]
-        x = data["cluster"].map(xmap).to_numpy(float)
+        data = data[data["locus"].isin(xmap)]
+        x = data["locus"].map(xmap).to_numpy(float)
         x = x + rng.uniform(-jitter, jitter, len(x))
         y = data["median_depth"].to_numpy(float)
-        for cluster in mosaic_clusters:
-            ax.axvspan(xmap[cluster] - 0.4, xmap[cluster] + 0.4,
+        for locus_key in mosaic_loci:
+            ax.axvspan(xmap[locus_key] - 0.4, xmap[locus_key] + 0.4,
                        color=COLOR_MOSAIC_BAND, linewidth=0, zorder=0)
         # Dots are one high-resolution raster layer (a vector dot per sample
         # makes multi-MB PDFs that many viewers fail to draw); text, axes and
         # bands stay vector.  Colors alternate between adjacent loci.
-        colors = np.where(data["cluster"].map(xmap).to_numpy(int) % 2 == 0,
+        colors = np.where(data["locus"].map(xmap).to_numpy(int) % 2 == 0,
                           COLOR_POINT_EVEN, COLOR_POINT_ODD)
         ax.scatter(x, y, s=1.6, c=colors, linewidths=0, clip_on=False, zorder=3,
                    rasterized=True)
@@ -322,7 +363,7 @@ def draw_mode_depth_plot(
             ax.set_title(label, fontsize=6, loc="left", pad=1, color="black")
 
     ax = axes[-1]
-    labeled = order[order["cluster"].isin(mosaic_clusters)] if flag_mosaics else order
+    labeled = order[order["locus"].isin(mosaic_loci)] if flag_mosaics else order
     # Shrink the font when many loci are labeled so labels stay legible.
     label_size = min(5.5, max(1.5, 0.8 * width * 72 / max(len(labeled), 1)))
     ax.set_xticks(labeled["x"])

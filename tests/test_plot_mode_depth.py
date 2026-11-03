@@ -120,7 +120,7 @@ def test_mode_and_median():
 def test_category_depths(setup):
     gd, counts, tmp = setup
     out = _summarize(gd, counts, tmp / "b1.tsv.gz")
-    sub = out[out["cluster"] == L1].copy()
+    sub = out[out["locus"] == L1].copy()
     sub["cat"] = sub["sample"].str.rsplit("_", n=1).str[0]
     g = sub.groupby("cat")["median_depth"]
 
@@ -141,15 +141,15 @@ def test_category_depths(setup):
 def test_non_carriers_unaffected_at_other_locus(setup):
     gd, counts, tmp = setup
     out = _summarize(gd, counts, tmp / "b1.tsv.gz")
-    other = out[out["cluster"] == _locus_key("chr2", 2_000_000, 2_400_000)]
-    assert len(other) == len(out[out["cluster"] == L1])
+    other = out[out["locus"] == _locus_key("chr2", 2_000_000, 2_400_000)]
+    assert len(other) == len(out[out["locus"] == L1])
     assert (abs(other["median_depth"] - 2.0) <= 0.2).all()
 
 
 def test_non_nahr_and_sex_loci_excluded(setup):
     gd, counts, tmp = setup
     out = _summarize(gd, counts, tmp / "b1.tsv.gz")
-    assert set(out["cluster"]) == {L1, _locus_key("chr2", 2_000_000, 2_400_000)}
+    assert set(out["locus"]) == {L1, _locus_key("chr2", 2_000_000, 2_400_000)}
 
 
 def test_mosaic_flags_and_loci(setup):
@@ -214,7 +214,7 @@ def test_pdf_size_independent_of_point_count(tmp_path):
     order = pmd.locus_order(str(gd))
     r = np.random.RandomState(0)
     n = 20000
-    df = pd.DataFrame({"batch": "b", "cluster": r.choice(order["cluster"], n),
+    df = pd.DataFrame({"batch": "b", "locus": r.choice(order["locus"], n),
                        "sample": [f"s{i}" for i in range(n)],
                        "mode_depth": 2.0, "median_depth": 2 + r.normal(0, .05, n),
                        "n_bins": 30, "mode_bins": 25})
@@ -278,3 +278,39 @@ def test_flag_mosaics_off_labels_all_no_band(setup):
                                    flag_mosaics=False)
     assert len(on) < len(order)
     assert off == list(order["label"])
+
+
+def test_each_interval_in_a_cluster_is_its_own_locus(tmp_path):
+    """Nested GDs of one cluster get separate x positions, NAHR flags and depth."""
+    rng = np.random.RandomState(3)
+    rows = []
+    # cluster c1 on chr3: BP1 1.00M, BP2 1.30M, BP3 1.60M (10 kb wide each)
+    bps = {"1": 1_000_000, "2": 1_300_000, "3": 1_600_000}
+    for gd, a, b, svtype, nahr in [
+            ("X_A_DEL", "1", "2", "DEL", "yes"), ("X_A_DUP", "1", "2", "DUP", "yes"),
+            ("X_B_DEL", "2", "3", "DEL", "yes"),
+            ("X_C_DEL", "1", "3", "DEL", "no")]:
+        rows.append(("chr3", bps[a], bps[b] + 10_000, gd, svtype, nahr, "no", "c1", a, b))
+    gd = tmp_path / "gd.tsv"
+    pd.DataFrame(rows, columns=[
+        "chr", "start_GRCh38", "end_GRCh38", "GD_ID", "svtype", "NAHR", "terminal",
+        "cluster", "BP1", "BP2"]).to_csv(gd, sep="\t", index=False)
+
+    order = pmd.locus_order(str(gd))
+    assert list(order["label"]) == ["X_A", "X_B"]            # C is non-NAHR; A DEL/DUP merged
+    assert len(set(order["x"])) == 2
+
+    # Carrier of a het DEL over the A interval only (1.01M-1.30M).
+    starts = np.arange(0, 3_000_000, BIN)
+    low = pd.DataFrame({"Chr": "chr3", "Start": starts, "End": starts + BIN})
+    in_a = (starts >= 1_010_000) & (starts < 1_300_000)
+    for i in range(8):
+        low[f"n{i}"] = rng.poisson(LAMBDA, len(starts))
+        lam = np.where(in_a, LAMBDA / 2, LAMBDA)
+        low[f"c{i}"] = rng.poisson(lam)
+    out = pmd.summarize_matrix(low, str(gd), "b1")
+    assert out["locus"].nunique() == 2
+    a = out[out["locus"] == "chr3:1000000-1310000"].set_index("sample")["median_depth"]
+    b = out[out["locus"] == "chr3:1300000-1610000"].set_index("sample")["median_depth"]
+    assert (abs(a[[f"c{i}" for i in range(8)]] - 1.0) < 0.25).all()   # DEL in A
+    assert (abs(b[[f"c{i}" for i in range(8)]] - 2.0) < 0.25).all()   # normal in B
