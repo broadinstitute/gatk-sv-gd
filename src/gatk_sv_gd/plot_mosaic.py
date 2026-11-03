@@ -154,6 +154,47 @@ def _load_cluster_bins(cn_posteriors: str, cluster: str) -> pd.DataFrame:
     return pd.concat(parts, ignore_index=True)
 
 
+def _max_deviant_in_window(deviant: np.ndarray, window: int) -> int:
+    """Largest count of True values in any run of *window* consecutive entries."""
+    window = min(window, len(deviant))
+    if window <= 0:
+        return 0
+    csum = np.concatenate([[0], np.cumsum(deviant, dtype=int)])
+    return int((csum[window:] - csum[:-window]).max())
+
+
+def load_segdup_intervals(path: str) -> Dict[str, Tuple[np.ndarray, np.ndarray]]:
+    """Merged segdup intervals per chromosome (sorted starts, ends) from a BED."""
+    bed = pd.read_csv(path, sep="\t", header=None, usecols=[0, 1, 2],
+                      names=["chr", "start", "end"], comment="#",
+                      compression="gzip" if path.endswith(".gz") else None)
+    out: Dict[str, Tuple[np.ndarray, np.ndarray]] = {}
+    for chrom, grp in bed.groupby("chr"):
+        starts: List[int] = []
+        ends: List[int] = []
+        for a, b in grp.sort_values("start")[["start", "end"]].itertuples(index=False):
+            if starts and a <= ends[-1]:
+                ends[-1] = max(ends[-1], b)
+            else:
+                starts.append(a)
+                ends.append(b)
+        out[str(chrom)] = (np.array(starts), np.array(ends))
+    return out
+
+
+def overlaps_segdup(segdups: Optional[Dict[str, Tuple[np.ndarray, np.ndarray]]],
+                    chrom: str, starts: np.ndarray, ends: np.ndarray) -> np.ndarray:
+    """True for bins overlapping any segdup by at least 1 bp."""
+    hit = np.zeros(len(starts), dtype=bool)
+    if not segdups or str(chrom) not in segdups:
+        return hit
+    sd_starts, sd_ends = segdups[str(chrom)]
+    idx = np.searchsorted(sd_starts, ends, side="left") - 1  # last SD starting before bin end
+    valid = idx >= 0
+    hit[valid] = sd_ends[idx[valid]] > starts[valid]
+    return hit
+
+
 def flag_abnormal_samples(
     depth: Optional[pd.DataFrame],
     locus: GDLocus,
@@ -161,47 +202,76 @@ def flag_abnormal_samples(
     ploidy: Dict[str, int],
     samples: List[str],
     max_deviation: float,
-    min_region_bins: int = 3,
+    window_bins: int = 5,
+    min_deviant_bins: int = 3,
+    max_population_fraction: float = 0.05,
+    segdups: Optional[Dict[str, Tuple[np.ndarray, np.ndarray]]] = None,
 ) -> pd.DataFrame:
     """Flag samples with abnormal depth outside the target GD.
 
     *depth* is the normalised region frame (Chr, Start, End, one column per
     sample; CN 2 = 2.0).  Bins are grouped into the left flank, the right
     flank, and each cluster interval whose midpoint lies outside the target
-    GD's span.  A sample is abnormal when the median depth of any
-    *min_region_bins* consecutive bins within a group differs from its ploidy
-    by more than *max_deviation* (so a short event is caught, a lone noisy
-    bin is not).  Samples missing from *depth* are not flagged.
+    GD's span.  Bins overlapping a segdup (*segdups*, see
+    :func:`load_segdup_intervals`) are ignored, as are bins where more than
+    max(2, *max_population_fraction* x samples) samples deviate (common
+    polymorphism, not an abnormal sample).
 
-    Returns columns sample, abnormal, abnormal_region, max_deviation.
+    A sample's bin deviates when it differs from the batch median of the
+    samples sharing its ploidy (the ploidy itself when fewer than 5 share it)
+    by more than *max_deviation*.  A sample is abnormal when, in any window of
+    *window_bins* consecutive usable bins of one group, at least
+    *min_deviant_bins* deviate in the same direction (all low or all high).
+    Samples missing from *depth* are not flagged.
+
+    Returns columns sample, abnormal, abnormal_region, max_deviation (the
+    largest windowed count of deviating bins).
     """
     gd_start, gd_end = locus.get_gd_intervals()[str(gd_id)]
-    regions: List[Tuple[str, np.ndarray]] = []
-    if depth is not None and len(depth):
-        mid = (depth["Start"].to_numpy() + depth["End"].to_numpy()) / 2
-        regions.append(("left_flank", mid < locus.start))
-        regions.append(("right_flank", mid >= locus.end))
+    present = [s for s in samples if depth is not None and s in depth.columns]
+    worst = {s: (0, "") for s in samples}
+    if depth is not None and len(depth) and present:
+        starts = depth["Start"].to_numpy()
+        ends = depth["End"].to_numpy()
+        mid = (starts + ends) / 2
+        base_ok = ~overlaps_segdup(segdups, locus.chrom, starts, ends)
+        regions: List[Tuple[str, np.ndarray]] = [
+            ("left_flank", mid < locus.start), ("right_flank", mid >= locus.end)]
         for start, end, name in locus.get_intervals():
             if end <= start or gd_start <= (start + end) / 2 < gd_end:
                 continue
             regions.append((name, (mid >= start) & (mid < end)))
 
+        by_ploidy: Dict[int, List[str]] = {}
+        for s in present:
+            by_ploidy.setdefault(int(ploidy.get(s, 2)), []).append(s)
+        for pl, group in by_ploidy.items():
+            values = depth[group].to_numpy(dtype=float)
+            if len(group) >= 5:
+                ref = np.nanmedian(values, axis=1)
+            else:
+                ref = np.full(len(values), float(pl))
+            res = values - ref[:, None]
+            n_dev = (np.abs(res) > max_deviation).sum(axis=1)
+            usable = base_ok & (n_dev <= max(2, max_population_fraction * len(group)))
+            for name, mask in regions:
+                m = mask & usable
+                if m.sum() < min_deviant_bins:
+                    continue
+                r = res[m]
+                for j, sample in enumerate(group):
+                    col = r[:, j]
+                    col = col[np.isfinite(col)]
+                    n = max(_max_deviant_in_window(col < -max_deviation, window_bins),
+                            _max_deviant_in_window(col > max_deviation, window_bins))
+                    if n > worst[sample][0]:
+                        worst[sample] = (n, name)
+
     rows = []
     for sample in samples:
-        worst_region, worst = "", 0.0
-        if depth is not None and sample in depth.columns:
-            values = depth[sample].to_numpy(dtype=float)
-            expected = float(ploidy.get(sample, 2))
-            for name, mask in regions:
-                v = values[mask & np.isfinite(values)]
-                if len(v) < min_region_bins:
-                    continue
-                windows = np.lib.stride_tricks.sliding_window_view(v, min_region_bins)
-                dev = float(np.abs(np.median(windows, axis=1) - expected).max())
-                if dev > worst:
-                    worst_region, worst = name, dev
-        bad = worst > max_deviation
-        rows.append((sample, bool(bad), worst_region if bad else "", worst))
+        n, name = worst[sample]
+        bad = n >= min_deviant_bins
+        rows.append((sample, bool(bad), name if bad else "", n))
     return pd.DataFrame(rows, columns=["sample", "abnormal", "abnormal_region",
                                        "max_deviation"])
 
@@ -250,8 +320,11 @@ def cmd_classify(args) -> None:
                 locus, int(unique_bins["Start"].min()), int(unique_bins["End"].max()),
                 raw, usable, medians, estimate_lowres_bin_size(raw),
                 highres_path=None)
+    segdups = load_segdup_intervals(args.segdup_bed) if args.segdup_bed else None
     flags = flag_abnormal_samples(depth, locus, args.gd_id, ploidy, samples,
-                                  args.max_flank_deviation, args.min_region_bins)
+                                  args.max_flank_deviation, args.flank_window_bins,
+                                  args.flank_min_deviant_bins,
+                                  args.flank_max_population_fraction, segdups)
     classes = classes.merge(flags[["sample", "abnormal", "abnormal_region"]],
                             on="sample", how="left")
     classes[["sample", "batch", "status", "ploidy", "abnormal", "abnormal_region"]].to_csv(
@@ -661,12 +734,20 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--low-res-counts",
                    help="Batch low-res count matrix; enables flagging of samples with "
                         "abnormal depth in the flanks / other cluster intervals")
-    p.add_argument("--max-flank-deviation", type=float, default=0.5,
-                   help="Flag a sample whose windowed median depth in a flank or other "
-                        "cluster interval differs from its ploidy by more than this")
-    p.add_argument("--min-region-bins", type=int, default=3,
-                   help="Consecutive bins whose median depth is tested in each "
-                        "flank/interval group (groups shorter than this are ignored)")
+    p.add_argument("--max-flank-deviation", type=float, default=0.4,
+                   help="A flank / other-cluster-interval bin deviates when its depth "
+                        "differs from the sample's ploidy by more than this")
+    p.add_argument("--flank-window-bins", type=int, default=5,
+                   help="Sliding window length (bins) for the abnormal-depth test")
+    p.add_argument("--flank-min-deviant-bins", type=int, default=3,
+                   help="Flag a sample when at least this many bins of a window "
+                        "deviate in the same direction")
+    p.add_argument("--flank-max-population-fraction", type=float, default=0.05,
+                   help="Ignore bins where more than this fraction of the batch deviates "
+                        "(common polymorphism)")
+    p.add_argument("--segdup-bed",
+                   help="Segdup BED(.gz); bins overlapping it are ignored when "
+                        "flagging abnormal flank / cluster-interval depth")
     p.add_argument("--out-prefix", required=True)
     p.set_defaults(func=cmd_classify)
 

@@ -318,3 +318,43 @@ def test_select_excludes_abnormal_comparators_but_keeps_mosaic():
                                           "abnormal", "abnormal_region"])
     out = pm.select_samples(classes, ["m"], 10, 10, 1)
     assert set(out["sample"]) == {"m", "g2", "n2"}
+
+
+def test_common_polymorphism_not_flagged_but_rare_event_is(dataset):
+    tmp_path, files = dataset
+    f = files["b1"]
+    for i in range(8):                                        # common: 8 of 31 samples
+        _halve(f["lowres"], f"b1_s{10 + i}", 1_100_000, 1_300_000)
+    _halve(f["lowres"], "b1_s20", 2_100_000, 2_300_000)        # rare: right flank
+    pm.main(["classify", "--batch", "b1", "--gd-table", str(tmp_path / "gd.tsv"),
+             "--gd-id", "GD_A", "--calls", f["calls"], "--cn-posteriors", f["post"],
+             "--low-res-counts", f["lowres"], "--out-prefix", str(tmp_path / "b1")])
+    c = pd.read_csv(tmp_path / "b1.classes.tsv", sep="\t").set_index("sample")
+    assert not c.loc[[f"b1_s{10 + i}" for i in range(8)], "abnormal"].any()
+    assert c.loc["b1_s20", "abnormal"] and c.loc["b1_s20", "abnormal_region"] == "right_flank"
+
+
+def test_segdup_overlapping_bins_ignored(dataset):
+    tmp_path, files = dataset
+    f = files["b1"]
+    _halve(f["lowres"], "b1_s5", 1_100_000, 1_300_000)       # left-flank dip
+    bed = tmp_path / "flank_sd.bed"
+    bed.write_text(f"{CHROM}\t1099999\t1300001\tsd\t0\t+\n")  # overlaps the whole dip
+    base = ["classify", "--batch", "b1", "--gd-table", str(tmp_path / "gd.tsv"),
+            "--gd-id", "GD_A", "--calls", f["calls"], "--cn-posteriors", f["post"],
+            "--low-res-counts", f["lowres"]]
+    pm.main(base + ["--out-prefix", str(tmp_path / "plain")])
+    pm.main(base + ["--segdup-bed", str(bed), "--out-prefix", str(tmp_path / "sd")])
+    plain = pd.read_csv(tmp_path / "plain.classes.tsv", sep="\t").set_index("sample")
+    masked = pd.read_csv(tmp_path / "sd.classes.tsv", sep="\t").set_index("sample")
+    assert plain.loc["b1_s5", "abnormal"]
+    assert not masked.loc["b1_s5", "abnormal"]
+
+
+def test_overlaps_segdup_one_bp_counts():
+    sd = {"chr1": (np.array([100, 500]), np.array([200, 600]))}
+    starts = np.array([0, 190, 200, 450, 599])
+    ends = starts + 10
+    # bins: [0,10) no, [190,200) yes, [200,210) no (touching), [450,460) no, [599,609) yes
+    assert list(pm.overlaps_segdup(sd, "chr1", starts, ends)) == [False, True, False, False, True]
+    assert not pm.overlaps_segdup(sd, "chr2", starts, ends).any()
