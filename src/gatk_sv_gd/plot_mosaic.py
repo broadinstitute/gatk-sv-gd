@@ -483,8 +483,8 @@ def draw_mosaic_plot(
     counts = {}
     style = [
         (GROUP_NON_CARRIER, COLOR_NON_CARRIER, 0.3, 1.0, 2, None),
-        (GROUP_GERMLINE, COLOR_GERMLINE, 0.45, 0.9, 3, None),
-        (GROUP_MOSAIC, COLOR_MOSAIC, 0.5, 1.0, 4, COLOR_MOSAIC_OUTLINE),
+        (GROUP_GERMLINE, COLOR_GERMLINE, 0.3, 0.9, 3, None),
+        (GROUP_MOSAIC, COLOR_MOSAIC, 0.3, 1.0, 4, COLOR_MOSAIC_OUTLINE),
     ]
     for group, color, lw, alpha, zorder, outline in style:
         members = selected[selected["group"] == group]
@@ -519,13 +519,13 @@ def draw_mosaic_plot(
     ax_ann.set_title(title, loc="left", fontsize=5.5, pad=7 if locus.breakpoints else 2)
 
     handles = [
-        Line2D([0], [0], color=COLOR_MOSAIC, lw=0.5,
-               path_effects=[pe.Stroke(linewidth=1.0, foreground=COLOR_MOSAIC_OUTLINE),
+        Line2D([0], [0], color=COLOR_MOSAIC, lw=0.6,
+               path_effects=[pe.Stroke(linewidth=0.6, foreground=COLOR_MOSAIC_OUTLINE),
                              pe.Normal()],
                label=f"Mosaic (n={counts[GROUP_MOSAIC]})"),
         Line2D([0], [0], color=COLOR_GERMLINE, lw=0.6,
                label=f"Germline (n={counts[GROUP_GERMLINE]})"),
-        Line2D([0], [0], color=COLOR_NON_CARRIER, lw=0.8,
+        Line2D([0], [0], color=COLOR_NON_CARRIER, lw=0.6,
                label=f"Non-carrier (n={counts[GROUP_NON_CARRIER]})"),
     ]
     fig.legend(handles=handles, loc="lower center", ncol=1, frameon=False,
