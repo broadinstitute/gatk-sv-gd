@@ -168,8 +168,13 @@ def read_count_matrix(path: str) -> pd.DataFrame:
 
 
 def summarize_matrix(counts: pd.DataFrame, gd_table_path: str,
-                     batch: str) -> pd.DataFrame:
-    """Normalize *counts* as plot.py does and summarize every autosomal NAHR locus."""
+                     batch: str, highres_path: Optional[str] = None) -> pd.DataFrame:
+    """Normalize *counts* as plot.py does and summarize every autosomal NAHR locus.
+
+    With *highres_path* (bgzipped, tabix-indexed high-res counts), body
+    intervals shorter than 10x the low-res median bin size are taken from the
+    high-res bins instead, exactly as plot.py's raw-depth overlay does.
+    """
     order = locus_order(gd_table_path)
     loci_by_key = {str(k): v for k, v in GDTable(gd_table_path).loci.items()}
     samples = [c for c in counts.columns if c not in ("Chr", "Start", "End")]
@@ -189,7 +194,7 @@ def summarize_matrix(counts: pd.DataFrame, gd_table_path: str,
         locus = loci_by_key[cluster]
         depth = _build_raw_region_df(
             locus, locus.start, locus.end, counts, usable, medians, bin_size,
-            highres_path=None)
+            highres_path=highres_path)
         res = summarize_locus(depth, locus, batch)
         if len(res) == 0:
             print(f"WARNING: no body bins for locus {locus.display_label} in {batch}",
@@ -202,7 +207,7 @@ def summarize_matrix(counts: pd.DataFrame, gd_table_path: str,
 
 def cmd_summarize(args) -> None:
     counts = read_count_matrix(args.low_res_counts)
-    out = summarize_matrix(counts, args.gd_table, args.batch)
+    out = summarize_matrix(counts, args.gd_table, args.batch, args.high_res_counts)
     out.to_csv(args.out, sep="\t", index=False, compression="infer")
     print(f"{args.batch}: {out['sample'].nunique()} samples, "
           f"{out['cluster'].nunique()} loci, {len(out)} values")
@@ -260,8 +265,13 @@ def draw_mode_depth_plot(
     seed: int = 0,
     del_range=MOSAIC_DEL_RANGE,
     dup_range=MOSAIC_DUP_RANGE,
+    flag_mosaics: bool = True,
 ) -> List[str]:
     """Draw stacked scatter panels; return labels of the loci tick-labeled.
+
+    With *flag_mosaics* (default), probable-mosaic loci get a purple band and
+    are the only loci labeled; without it nothing is highlighted and every
+    locus is labeled.
 
     *height* is the whole figure; stacked panels share it.  The y-axis tops
     out at *ymax* or the largest plotted value, whichever is smaller.
@@ -283,7 +293,7 @@ def draw_mode_depth_plot(
     xmap = dict(zip(order["cluster"], order["x"]))
 
     mosaic_clusters = probable_mosaic_loci(
-        datasets, min_mosaic_samples, del_range, dup_range)
+        datasets, min_mosaic_samples, del_range, dup_range) if flag_mosaics else []
     for ax, data, label in zip(axes, datasets, dataset_labels):
         data = data[data["cluster"].isin(xmap)]
         x = data["cluster"].map(xmap).to_numpy(float)
@@ -312,9 +322,11 @@ def draw_mode_depth_plot(
             ax.set_title(label, fontsize=6, loc="left", pad=1, color="black")
 
     ax = axes[-1]
-    labeled = order[order["cluster"].isin(mosaic_clusters)]
+    labeled = order[order["cluster"].isin(mosaic_clusters)] if flag_mosaics else order
+    # Shrink the font when many loci are labeled so labels stay legible.
+    label_size = min(5.5, max(1.5, 0.8 * width * 72 / max(len(labeled), 1)))
     ax.set_xticks(labeled["x"])
-    ax.set_xticklabels(labeled["label"], rotation=60, ha="right", fontsize=5.5,
+    ax.set_xticklabels(labeled["label"], rotation=60, ha="right", fontsize=label_size,
                        rotation_mode="anchor")
     ax.set_xlim(-0.7, len(order) - 0.3)
     fig.tight_layout(pad=0.3, h_pad=0.4)
@@ -338,7 +350,8 @@ def cmd_plot(args) -> None:
         min_mosaic_samples=args.min_mosaic_samples, jitter=args.jitter,
         ymin=args.ymin, ymax=args.ymax, seed=args.seed,
         del_range=(args.mosaic_del_min, args.mosaic_del_max),
-        dup_range=(args.mosaic_dup_min, args.mosaic_dup_max))
+        dup_range=(args.mosaic_dup_min, args.mosaic_dup_max),
+        flag_mosaics=args.flag_mosaics)
     print(f"Wrote {args.out_pdf}; labeled loci: {', '.join(shown) or 'none'}")
 
 
@@ -357,6 +370,9 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--gd-table", required=True)
     p.add_argument("--low-res-counts", required=True,
                    help="Low-resolution read-count matrix (.rd.txt.gz style)")
+    p.add_argument("--high-res-counts",
+                   help="Bgzipped, tabix-indexed high-res count matrix; used for body "
+                        "intervals too small for the low-res bins (as in plot.py)")
     p.add_argument("--out", required=True, help="Output TSV(.gz)")
 
     p = sub.add_parser("merge", help="Concatenate per-batch tables")
@@ -377,6 +393,9 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--mosaic-del-max", type=float, default=MOSAIC_DEL_RANGE[1])
     p.add_argument("--mosaic-dup-min", type=float, default=MOSAIC_DUP_RANGE[0])
     p.add_argument("--mosaic-dup-max", type=float, default=MOSAIC_DUP_RANGE[1])
+    p.add_argument("--flag-mosaics", action=argparse.BooleanOptionalAction, default=True,
+                   help="Highlight probable-mosaic loci in purple and label only those; "
+                        "--no-flag-mosaics highlights nothing and labels every locus")
     p.add_argument("--jitter", type=float, default=0.15)
     p.add_argument("--ymin", type=float, default=0.0)
     p.add_argument("--ymax", type=float, default=4.0)

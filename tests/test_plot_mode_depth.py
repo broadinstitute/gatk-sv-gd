@@ -220,3 +220,61 @@ def test_pdf_size_independent_of_point_count(tmp_path):
                        "n_bins": 30, "mode_bins": 25})
     pmd.draw_mode_depth_plot([df], ["x"], order, str(tmp_path / "big.pdf"))
     assert (tmp_path / "big.pdf").stat().st_size < 2_000_000
+
+
+HR_BIN = 100
+SMALL = _locus_key("chr2", 2_500_000, 2_540_000)  # body ~20 kb: 2 low-res bins
+
+
+def test_small_body_uses_highres_bins(tmp_path, monkeypatch):
+    """A body shorter than 10x the low-res bin size is read from high-res bins."""
+    from gatk_sv_gd import plot as plot_mod
+
+    rng = np.random.RandomState(5)
+    gd = tmp_path / "gd.tsv"
+    pd.DataFrame([("chr2", 2_500_000, 2_540_000, "S1_DEL", "DEL", "yes", "no", "", "1", "2")],
+                 columns=["chr", "start_GRCh38", "end_GRCh38", "GD_ID", "svtype", "NAHR",
+                          "terminal", "cluster", "BP1", "BP2"]).to_csv(gd, sep="\t", index=False)
+    locus = pmd.GDTable(str(gd)).loci[SMALL] if SMALL in pmd.GDTable(str(gd)).loci \
+        else next(iter(pmd.GDTable(str(gd)).loci.values()))
+    (b0, b1), = pmd.body_intervals(locus)
+
+    n_samples = 6
+    lib = rng.uniform(0.6, 1.6, n_samples)
+    names = [f"s{i}" for i in range(n_samples)]
+    starts = np.arange(0, GENOME_END, BIN)
+    low = pd.DataFrame({"Chr": "chr2", "Start": starts, "End": starts + BIN})
+    for i, n in enumerate(names):
+        low[n] = rng.poisson(LAMBDA * lib[i], len(starts))
+    hr_starts = np.arange(b0 - 5_000, b1 + 5_000, HR_BIN)
+    hr = pd.DataFrame({"Chr": "chr2", "Start": hr_starts, "End": hr_starts + HR_BIN})
+    for i, n in enumerate(names):
+        hr[n] = rng.poisson(LAMBDA * lib[i] * HR_BIN / BIN * 0.5, len(hr_starts))  # het DEL
+
+    def fake_query(path, chrom, start, end, sample_cols, max_bins=None):
+        sub = hr[(hr["End"] > start) & (hr["Start"] < end)].copy()
+        sub["source_file"] = "highres"
+        sub.index = sub["Chr"] + ":" + sub["Start"].astype(str) + "-" + sub["End"].astype(str)
+        sub.index.name = "Bin"
+        return sub[["Chr", "Start", "End", "source_file"] + list(sample_cols)]
+
+    monkeypatch.setattr(plot_mod, "query_highres_bins", fake_query)
+
+    # Low-res alone: the body holds no bin midpoint (or a diluted one).
+    base = pmd.summarize_matrix(low, str(gd), "b1")
+    out = pmd.summarize_matrix(low, str(gd), "b1", highres_path="hr.tsv.gz")
+    assert len(out) == n_samples
+    assert out["n_bins"].min() >= (b1 - b0) // HR_BIN - 1
+    assert out["median_depth"].between(0.5, 1.5).all()   # het DEL ~1, not ~2
+    assert len(base) <= len(out)
+
+
+def test_flag_mosaics_off_labels_all_no_band(setup):
+    gd, counts, tmp = setup
+    out = _summarize(gd, counts, tmp / "b1.tsv.gz")
+    order = pmd.locus_order(str(gd))
+    on = pmd.draw_mode_depth_plot([out], ["a"], order, str(tmp / "on.pdf"))
+    off = pmd.draw_mode_depth_plot([out], ["a"], order, str(tmp / "off.pdf"),
+                                   flag_mosaics=False)
+    assert len(on) < len(order)
+    assert off == list(order["label"])
