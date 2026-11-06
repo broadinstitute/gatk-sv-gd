@@ -358,3 +358,33 @@ def test_overlaps_segdup_one_bp_counts():
     # bins: [0,10) no, [190,200) yes, [200,210) no (touching), [450,460) no, [599,609) yes
     assert list(pm.overlaps_segdup(sd, "chr1", starts, ends)) == [False, True, False, False, True]
     assert not pm.overlaps_segdup(sd, "chr2", starts, ends).any()
+
+
+def test_include_samples_restricts_selection():
+    rows = [("m1", "b1", pm.STATUS_NON_CARRIER, 2), ("m2", "b1", pm.STATUS_NON_CARRIER, 2)]
+    rows += [(f"g{i}", "b1", pm.STATUS_GERMLINE, 2) for i in range(6)]
+    rows += [(f"n{i}", "b1", pm.STATUS_NON_CARRIER, 2) for i in range(6)]
+    classes = pd.DataFrame(rows, columns=["sample", "batch", "status", "ploidy"])
+    allowed = ["m1", "g0", "g1", "n0", "n1", "n2"]
+    out = pm.select_samples(classes, ["m1", "m2"], 10, 10, 1, allowed)
+    assert set(out["sample"]) == set(allowed)                 # m2 dropped, comparators capped
+    with pytest.raises(SystemExit):
+        pm.select_samples(classes, ["m2"], 10, 10, 1, allowed)
+
+
+def test_include_samples_cli(dataset):
+    tmp_path, files = dataset
+    for b in ("b1", "b2", "b3"):
+        pm.main(["classify", "--batch", b, "--gd-table", str(tmp_path / "gd.tsv"),
+                 "--gd-id", "GD_A", "--calls", files[b]["calls"],
+                 "--cn-posteriors", files[b]["post"], "--out-prefix", str(tmp_path / b)])
+    (tmp_path / "mos.txt").write_text("mos1\n")
+    keep = ["mos1", "b1_s0", "b1_s10", "b1_s11", "b2_s10"]
+    (tmp_path / "keep.txt").write_text("\n".join(keep) + "\n")
+    pm.main(["select", "--classes"] + [str(tmp_path / f"{b}.classes.tsv") for b in ("b1", "b2", "b3")]
+            + ["--regions"] + [str(tmp_path / f"{b}.region.json") for b in ("b1", "b2", "b3")]
+            + ["--mosaic-samples", str(tmp_path / "mos.txt"),
+               "--include-samples", str(tmp_path / "keep.txt"),
+               "--out-prefix", str(tmp_path / "sel")])
+    sel = pd.read_csv(tmp_path / "sel.selected.tsv", sep="\t")
+    assert set(sel["sample"]) <= set(keep) and "mos1" in set(sel["sample"])

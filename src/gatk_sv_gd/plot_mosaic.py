@@ -31,7 +31,7 @@ import json
 import math
 import os
 import sys
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 import pandas as pd
@@ -388,8 +388,14 @@ def select_samples(
     n_germline: int,
     n_non_carrier: int,
     seed: int,
+    allowed_samples: Optional[Sequence[str]] = None,
 ) -> pd.DataFrame:
     """Pick mosaic carriers plus random comparators.
+
+    With *allowed_samples*, only those samples can be plotted: others are
+    dropped before anything is drawn (mosaic samples outside the list with a
+    warning; at least one mosaic sample must remain), so comparator counts and
+    the batches used reflect the list.
 
     Comparators share the mosaic carriers' (most common) ploidy on the locus
     contig.  Non-carriers come only from batches containing a mosaic carrier.
@@ -405,6 +411,17 @@ def select_samples(
         raise SystemExit(
             "ERROR: mosaic sample(s) not modelled at this locus in any batch: "
             + ", ".join(missing))
+
+    if allowed_samples is not None:
+        allowed = set(allowed_samples)
+        dropped = [s for s in mosaic_samples if s not in allowed]
+        if dropped:
+            print("WARNING: mosaic sample(s) not in the sample list, not plotted: "
+                  + ", ".join(dropped), file=sys.stderr)
+        mosaic_samples = [s for s in mosaic_samples if s in allowed]
+        if not mosaic_samples:
+            raise SystemExit("ERROR: none of the mosaic samples is in the sample list")
+        classes = classes[classes["sample"].isin(allowed)]
 
     mosaic = classes[classes["sample"].isin(mosaic_samples)]
     mosaic_batches = set(mosaic["batch"])
@@ -469,8 +486,9 @@ def cmd_select(args) -> None:
     mosaic_samples = _read_lines(args.mosaic_samples)
     if not mosaic_samples:
         raise SystemExit("ERROR: no mosaic samples given")
+    allowed = _read_lines(args.include_samples) if args.include_samples else None
     selected = select_samples(
-        classes, mosaic_samples, args.n_germline, args.n_non_carrier, args.seed)
+        classes, mosaic_samples, args.n_germline, args.n_non_carrier, args.seed, allowed)
     selected.to_csv(f"{args.out_prefix}.selected.tsv", sep="\t", index=False)
 
     # Every batch that contributes a selected sample needs depth extracted.
@@ -755,6 +773,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--classes", nargs="+", required=True)
     p.add_argument("--regions", nargs="+", required=True)
     p.add_argument("--mosaic-samples", required=True, help="One sample ID per line")
+    p.add_argument("--include-samples",
+                   help="One sample ID per line; only these samples are plotted")
     p.add_argument("--n-germline", type=int, default=10)
     p.add_argument("--n-non-carrier", type=int, default=50)
     p.add_argument("--seed", type=int, default=42)
