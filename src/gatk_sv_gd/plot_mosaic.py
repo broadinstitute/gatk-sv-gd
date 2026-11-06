@@ -85,6 +85,21 @@ def _resolve_locus(gd_table_path: str, gd_id: str) -> GDLocus:
     raise SystemExit(f"ERROR: GD_ID {gd_id!r} not found in GD table")
 
 
+def partner_gd_id(locus: GDLocus, gd_id: str) -> Optional[str]:
+    """GD_ID of the DEL/DUP counterpart of *gd_id* at the same locus, if tabulated.
+
+    The partner's GD_ID differs only where *gd_id* has "DEL" or "DUP".
+    """
+    gd_id = str(gd_id)
+    for a, b in (("DEL", "DUP"), ("DUP", "DEL")):
+        if a in gd_id:
+            partner = gd_id.replace(a, b, 1)
+            if any(str(e["GD_ID"]) == partner for e in locus.gd_entries):
+                return partner
+            return None
+    return None
+
+
 def _read_lines(path: str) -> List[str]:
     with open(path) as handle:
         return [line.strip() for line in handle if line.strip()]
@@ -112,12 +127,17 @@ def classify_samples(
     cluster_samples: List[str],
     cluster: str,
     gd_id: str,
+    partner_id: Optional[str] = None,
+    svtypes: Optional[Dict[str, str]] = None,
 ) -> pd.DataFrame:
     """Label each sample at *cluster* as germline carrier / non-carrier / other.
 
-    A germline carrier is called for the target GD and for no other GD in the
-    cluster.  A non-carrier is called for none.  Samples called for any other
-    GD in the cluster (alone or together with the target) are ``other``.
+    A germline carrier is called for the target GD (or for its DEL/DUP
+    counterpart *partner_id*) and for no other GD in the cluster.  A
+    non-carrier is called for none.  Samples called for any other GD in the
+    cluster (alone or together with another) are ``other``.  Germline
+    carriers also get ``germline_type``, the svtype of the GD they carry
+    (from *svtypes*, empty when unknown).
     """
     carrier_gds: Dict[str, set] = {}
     if len(calls_df) > 0:
@@ -128,16 +148,21 @@ def classify_samples(
         for sample, gd in zip(hits["sample"].astype(str), hits["GD_ID"].astype(str)):
             carrier_gds.setdefault(sample, set()).add(gd)
 
-    status = []
+    germline_gds = {str(gd_id)} | ({str(partner_id)} if partner_id else set())
+    svtypes = svtypes or {}
+    status, gtype = [], []
     for sample in cluster_samples:
         gds = carrier_gds.get(sample, set())
+        gtype.append("")
         if not gds:
             status.append(STATUS_NON_CARRIER)
-        elif gds == {str(gd_id)}:
+        elif len(gds) == 1 and gds <= germline_gds:
             status.append(STATUS_GERMLINE)
+            gtype[-1] = str(svtypes.get(next(iter(gds)), ""))
         else:
             status.append(STATUS_OTHER)
-    return pd.DataFrame({"sample": cluster_samples, "status": status})
+    return pd.DataFrame({"sample": cluster_samples, "status": status,
+                         "germline_type": gtype})
 
 
 def _load_cluster_bins(cn_posteriors: str, cluster: str) -> pd.DataFrame:
@@ -300,7 +325,9 @@ def cmd_classify(args) -> None:
 
     bins = _load_cluster_bins(args.cn_posteriors, locus.cluster)
     samples = sorted(bins["sample"].astype(str).unique())
-    classes = classify_samples(calls_df, samples, locus.cluster, args.gd_id)
+    svtypes = {str(e["GD_ID"]): str(e["svtype"]) for e in locus.gd_entries}
+    classes = classify_samples(calls_df, samples, locus.cluster, args.gd_id,
+                               partner_gd_id(locus, args.gd_id), svtypes)
     ploidy = _ploidy_for(args.ploidy_table, locus.chrom, samples)
     classes["batch"] = args.batch
     classes["ploidy"] = classes["sample"].map(ploidy)
@@ -327,7 +354,8 @@ def cmd_classify(args) -> None:
                                   args.flank_max_population_fraction, segdups)
     classes = classes.merge(flags[["sample", "abnormal", "abnormal_region"]],
                             on="sample", how="left")
-    classes[["sample", "batch", "status", "ploidy", "abnormal", "abnormal_region"]].to_csv(
+    classes[["sample", "batch", "status", "germline_type", "ploidy", "abnormal",
+             "abnormal_region"]].to_csv(
         f"{args.out_prefix}.classes.tsv", sep="\t", index=False)
 
     with open(f"{args.out_prefix}.region.json", "w") as handle:
@@ -382,6 +410,40 @@ def choose_extra_batches(counts: Dict[str, int], need: int,
     return sorted(valid[rng.randint(len(valid))])
 
 
+def allocate_germline(counts: Dict[str, int], total: int,
+                      small: int = 3) -> Dict[str, int]:
+    """Split a germline target across carrier types (e.g. DEL and DUP).
+
+    *counts* is the number available per type.  Types with none are dropped.
+    One type: it gets min(total, available).  Two or more: a type with at most
+    *small* carriers is included whole; the remaining target goes to the other
+    type(s) in proportion to their frequency, each getting at least *small*
+    (so the total can exceed *total* when it is below twice *small*).
+    """
+    avail = {t: n for t, n in counts.items() if n > 0}
+    total = min(total, sum(avail.values()))
+    if len(avail) <= 1:
+        return {t: total for t in avail}
+    out = {t: n for t, n in avail.items() if n <= small}
+    big = [t for t in sorted(avail) if t not in out]
+    rest = max(total - sum(out.values()), 0)
+    if len(big) == 1:
+        out[big[0]] = min(avail[big[0]], max(rest, 1))
+    elif big:
+        # *small* each, then hand out the rest to whichever type is furthest
+        # below its proportional share (capped at availability).
+        pop = sum(avail[t] for t in big)
+        want = {t: rest * avail[t] / pop for t in big}
+        share = {t: small for t in big}
+        for _ in range(max(rest - small * len(big), 0)):
+            open_ = [t for t in big if share[t] < avail[t]]
+            if not open_:
+                break
+            share[max(open_, key=lambda t: (want[t] - share[t], avail[t]))] += 1
+        out.update(share)
+    return out
+
+
 def select_samples(
     classes: pd.DataFrame,
     mosaic_samples: List[str],
@@ -399,10 +461,13 @@ def select_samples(
 
     Comparators share the mosaic carriers' (most common) ploidy on the locus
     contig.  Non-carriers come only from batches containing a mosaic carrier.
-    Germline carriers number ``min(n_germline, total available)``: they come
-    from the mosaic carriers' batches first; if those hold too few, the
-    smallest possible number of additional batches (random among ties)
-    supplies the rest.
+    Germline carriers (the target GD and its DEL/DUP counterpart, when
+    tabulated) number ``min(n_germline, total available)`` across both types.
+    A type with at most 3 carriers is included whole; otherwise the types
+    share the total in proportion to their frequency (each at least 3).
+    Each type's carriers come from the mosaic carriers' batches first; if
+    those hold too few, the smallest possible number of additional batches
+    (random among ties) supplies the rest.
     """
     classes = classes.drop_duplicates("sample")
     known = set(classes["sample"])
@@ -454,22 +519,33 @@ def select_samples(
         idx = rng.choice(len(cand), size=n, replace=False)
         return cand.iloc[np.sort(idx)]
 
+    candidates = candidates.assign(
+        germline_type=candidates["germline_type"].fillna("")
+        if "germline_type" in candidates.columns else "")
     germ_all = candidates[candidates["status"] == STATUS_GERMLINE]
-    germ_local = germ_all[germ_all["batch"].isin(mosaic_batches)]
-    target = min(n_germline, len(germ_all))
-    if len(germ_local) >= target:
-        germline = draw(germ_local, target, STATUS_GERMLINE)
-    else:
-        remote = germ_all[~germ_all["batch"].isin(mosaic_batches)]
-        need = target - len(germ_local)
+    by_type = {t: germ_all[germ_all["germline_type"] == t]
+               for t in sorted(germ_all["germline_type"].unique())}
+    alloc = allocate_germline({t: len(g) for t, g in by_type.items()}, n_germline)
+    used_batches = set(mosaic_batches)
+    parts = []
+    # Largest allocation first, so extra batches it brings in can serve the other type.
+    for gtype in sorted(alloc, key=lambda t: -alloc[t]):
+        cand, k = by_type[gtype], alloc[gtype]
+        local = cand[cand["batch"].isin(used_batches)]
+        label = f"{STATUS_GERMLINE} {gtype}".strip()
+        if len(local) >= k:
+            parts.append(draw(local, k, label))
+            continue
+        remote = cand[~cand["batch"].isin(used_batches)]
+        need = k - len(local)
         extra = choose_extra_batches(
             remote.groupby("batch").size().to_dict(), need, rng)
-        print(f"Germline carriers: {len(germ_local)} in mosaic batches; adding "
-              f"batch(es) {', '.join(extra)} for {need} more", file=sys.stderr)
-        germline = pd.concat([
-            germ_local,
-            draw(remote[remote["batch"].isin(extra)], need, STATUS_GERMLINE),
-        ])
+        print(f"Germline {gtype or 'carriers'}: {len(local)} in already-used batches; "
+              f"adding batch(es) {', '.join(extra)} for {need} more", file=sys.stderr)
+        used_batches |= set(extra)
+        parts.append(pd.concat([local, draw(remote[remote["batch"].isin(extra)],
+                                            need, label)]))
+    germline = pd.concat(parts) if parts else candidates.iloc[0:0]
 
     out = pd.concat([
         mosaic.assign(group=GROUP_MOSAIC),
@@ -477,7 +553,16 @@ def select_samples(
         draw(pool[pool["status"] == STATUS_NON_CARRIER], n_non_carrier,
              STATUS_NON_CARRIER).assign(group=GROUP_NON_CARRIER),
     ], ignore_index=True)
-    return out[["sample", "batch", "group"]]
+    out["carrier_type"] = np.where(out["group"] == GROUP_GERMLINE,
+                                   out["germline_type"].fillna(""), "")
+    # Cohort-wide numbers the legend quotes ("n=20 of 45"): eligible germline
+    # carriers of the row's type, and eligible non-carriers, over all batches.
+    germ_total = {t: len(g) for t, g in by_type.items()}
+    noncarrier_total = int((candidates["status"] == STATUS_NON_CARRIER).sum())
+    out["cohort_total"] = np.where(
+        out["group"] == GROUP_GERMLINE, out["carrier_type"].map(germ_total),
+        np.where(out["group"] == GROUP_NON_CARRIER, noncarrier_total, np.nan))
+    return out[["sample", "batch", "group", "carrier_type", "ploidy", "cohort_total"]]
 
 
 def cmd_select(args) -> None:
@@ -617,6 +702,28 @@ def _draw_group(ax, df: pd.DataFrame, samples: List[str], xform: FlankCompressor
                 pe.Stroke(linewidth=lw + 0.5, foreground=outline), pe.Normal()])
 
 
+def key_label(name: str, total: int, by_type: Dict[str, int],
+              cohort: Optional[Dict[str, int]] = None) -> str:
+    """One legend line; DEL and DUP counts side by side when both occur.
+
+    *cohort* maps a type ("" for untyped groups) to the number available in the
+    cohort; a count smaller than that is written "n=20, selected".
+    """
+    cohort = cohort or {}
+
+    def n_text(n: int, key: str) -> str:
+        avail = cohort.get(key)
+        return f"{n}, selected" if avail and avail > n else f"{n}"
+
+    types = sorted(t for t, n in by_type.items() if t and n > 0)
+    if len(types) > 1:
+        return f"{name} (" + "; ".join(
+            f"{t} n={n_text(by_type[t], t)}" for t in types) + ")"
+    if len(types) == 1 and name != "Mosaic":
+        return f"{name} {types[0]} (n={n_text(total, types[0])})"
+    return f"{name} (n={n_text(total, '')})"
+
+
 def draw_mosaic_plot(
     locus: GDLocus,
     region: dict,
@@ -657,6 +764,22 @@ def draw_mosaic_plot(
     ax.axhline(2.0, color="0.6", lw=0.5, ls=(0, (3, 3)), zorder=1)
 
     counts = {}
+    type_counts: Dict[str, int] = {}
+    mosaic_type_counts: Dict[str, int] = {}
+    ploidy_of = (dict(zip(selected["sample"].astype(str), selected["ploidy"]))
+                 if "ploidy" in selected.columns else {})
+    cohort_germline: Dict[str, int] = {}
+    cohort_noncarrier: Dict[str, int] = {}
+    if "cohort_total" in selected.columns:
+        for _, r in selected.dropna(subset=["cohort_total"]).iterrows():
+            if r["group"] == GROUP_GERMLINE:
+                cohort_germline[str(r.get("carrier_type", "") if pd.notna(r.get("carrier_type", ""))
+                                    else "")] = int(r["cohort_total"])
+            elif r["group"] == GROUP_NON_CARRIER:
+                cohort_noncarrier[""] = int(r["cohort_total"])
+    carrier_of = (dict(zip(selected["sample"].astype(str),
+                           selected["carrier_type"].fillna("").astype(str)))
+                  if "carrier_type" in selected.columns else {})
     style = [
         (GROUP_NON_CARRIER, COLOR_NON_CARRIER, 0.3, 1.0, 2, None),
         (GROUP_GERMLINE, COLOR_GERMLINE, 0.3, 0.9, 3, None),
@@ -668,6 +791,17 @@ def draw_mosaic_plot(
         for table in depth_tables:
             names = [s for s in members["sample"].astype(str) if s in table.columns]
             counts[group] += len(names)
+            if group == GROUP_GERMLINE:
+                for name in names:
+                    t = carrier_of.get(name, "")
+                    type_counts[t] = type_counts.get(t, 0) + 1
+            elif group == GROUP_MOSAIC:
+                mids = (table["Start"] + table["End"]) / 2
+                body = table[(mids >= locus.start) & (mids < locus.end)]
+                for name in names:
+                    expected = float(ploidy_of.get(name, 2) or 2)
+                    t = "DUP" if float(body[name].median()) > expected else "DEL"
+                    mosaic_type_counts[t] = mosaic_type_counts.get(t, 0) + 1
             _draw_group(ax, table.sort_values("Start"), names, xform,
                         color, lw, alpha, zorder, outline)
 
@@ -698,16 +832,19 @@ def draw_mosaic_plot(
         Line2D([0], [0], color=COLOR_MOSAIC, lw=0.6,
                path_effects=[pe.Stroke(linewidth=0.8, foreground=COLOR_MOSAIC_OUTLINE),
                              pe.Normal()],
-               label=f"Mosaic (n={counts[GROUP_MOSAIC]})"),
+               label=key_label("Mosaic", counts[GROUP_MOSAIC], mosaic_type_counts)),
         Line2D([0], [0], color=COLOR_GERMLINE, lw=0.6,
-               label=f"Germline (n={counts[GROUP_GERMLINE]})"),
+               label=key_label("Germline", counts[GROUP_GERMLINE], type_counts,
+                               cohort_germline)),
         Line2D([0], [0], color=COLOR_NON_CARRIER, lw=0.6,
-               label=f"Non-carrier (n={counts[GROUP_NON_CARRIER]})"),
+               label=key_label("Non-carrier", counts[GROUP_NON_CARRIER], {},
+                               cohort_noncarrier)),
     ]
     fig.legend(handles=handles, loc="lower center", ncol=1, frameon=False,
                fontsize=5, handlelength=1.4, labelspacing=0.3,
                bbox_to_anchor=(0.5, 0.0))
-    fig.subplots_adjust(left=0.27, right=0.97, top=0.89, bottom=0.30)
+    fig.subplots_adjust(left=0.27, right=0.97, top=0.89,
+                        bottom=0.14 + 0.053 * len(handles))
     fig.savefig(out_pdf, format="pdf")
     plt.close(fig)
 

@@ -388,3 +388,168 @@ def test_include_samples_cli(dataset):
                "--out-prefix", str(tmp_path / "sel")])
     sel = pd.read_csv(tmp_path / "sel.selected.tsv", sep="\t")
     assert set(sel["sample"]) <= set(keep) and "mos1" in set(sel["sample"])
+
+
+def test_allocate_germline_rules():
+    a = pm.allocate_germline
+    assert a({"DEL": 40}, 10) == {"DEL": 10}
+    assert a({"DEL": 4}, 10) == {"DEL": 4}
+    assert a({"DEL": 50, "DUP": 2}, 10) == {"DEL": 8, "DUP": 2}          # <=3: all of it
+    assert a({"DEL": 2, "DUP": 3}, 10) == {"DEL": 2, "DUP": 3}
+    both = a({"DEL": 300, "DUP": 100}, 20)                                # 3:1
+    assert both == {"DEL": 15, "DUP": 5}
+    assert a({"DEL": 1000, "DUP": 4}, 10) == {"DEL": 7, "DUP": 3}         # >=3 of each
+    assert a({"DEL": 1000, "DUP": 4}, 4) == {"DEL": 3, "DUP": 3}          # min 3 beats the total
+    mixed = a({"DEL": 7, "DUP": 5}, 10)
+    assert min(mixed.values()) >= 3 and sum(mixed.values()) == 10
+    assert sum(a({"DEL": 7, "DUP": 5}, 10).values()) == 10
+    assert a({"DEL": 5, "DUP": 5}, 100) == {"DEL": 5, "DUP": 5}           # capped at available
+
+
+def test_classify_includes_partner_gd_as_germline():
+    calls = pd.DataFrame([("a", "c1", "G_DEL_x", True), ("b", "c1", "G_DUP_x", True),
+                          ("c", "c1", "G_DEL_x", True), ("c", "c1", "G_DUP_x", True),
+                          ("d", "c1", "OTHER", True)],
+                         columns=["sample", "cluster", "GD_ID", "is_carrier"])
+    out = pm.classify_samples(calls, list("abcde"), "c1", "G_DEL_x", "G_DUP_x",
+                              {"G_DEL_x": "DEL", "G_DUP_x": "DUP"}).set_index("sample")
+    assert out.loc["a", "status"] == pm.STATUS_GERMLINE and out.loc["a", "germline_type"] == "DEL"
+    assert out.loc["b", "status"] == pm.STATUS_GERMLINE and out.loc["b", "germline_type"] == "DUP"
+    assert out.loc["c", "status"] == pm.STATUS_OTHER           # both DEL and DUP
+    assert out.loc["d", "status"] == pm.STATUS_OTHER
+    assert out.loc["e", "status"] == pm.STATUS_NON_CARRIER
+
+
+def test_select_mixes_del_and_dup_germline():
+    rows = [("m", "b1", pm.STATUS_NON_CARRIER, "", 2)]
+    rows += [(f"del{i}", "b1", pm.STATUS_GERMLINE, "DEL", 2) for i in range(30)]
+    rows += [(f"dup{i}", "b1", pm.STATUS_GERMLINE, "DUP", 2) for i in range(10)]
+    rows += [(f"n{i}", "b1", pm.STATUS_NON_CARRIER, "", 2) for i in range(5)]
+    classes = pd.DataFrame(rows, columns=["sample", "batch", "status", "germline_type", "ploidy"])
+    out = pm.select_samples(classes, ["m"], 20, 5, 1)
+    g = out[out["group"] == pm.GROUP_GERMLINE]
+    assert g["carrier_type"].value_counts().to_dict() == {"DEL": 15, "DUP": 5}   # 3:1
+    assert (out[out["group"] != pm.GROUP_GERMLINE]["carrier_type"] == "").all()
+
+
+def test_partner_gd_id(tmp_path):
+    _write_gd_table_pair = tmp_path / "gd.tsv"
+    pd.DataFrame([("chr1", 100, 200, "G_DEL_chr1_100_200", "DEL", "yes", "no", "c", 1, 2),
+                  ("chr1", 100, 200, "G_DUP_chr1_100_200", "DUP", "yes", "no", "c", 1, 2),
+                  ("chr1", 500, 600, "H_DEL_chr1_500_600", "DEL", "yes", "no", "d", 1, 2)],
+                 columns=["chr", "start_GRCh38", "end_GRCh38", "GD_ID", "svtype", "NAHR",
+                          "terminal", "cluster", "BP1", "BP2"]).to_csv(
+        _write_gd_table_pair, sep="\t", index=False)
+    pm_locus = pm._resolve_locus(str(_write_gd_table_pair), "G_DEL_chr1_100_200")
+    assert pm.partner_gd_id(pm_locus, "G_DEL_chr1_100_200") == "G_DUP_chr1_100_200"
+    assert pm.partner_gd_id(pm_locus, "G_DUP_chr1_100_200") == "G_DEL_chr1_100_200"
+    solo = pm._resolve_locus(str(_write_gd_table_pair), "H_DEL_chr1_500_600")
+    assert pm.partner_gd_id(solo, "H_DEL_chr1_500_600") is None
+
+
+def test_end_to_end_del_and_dup_germline_legend(dataset):
+    tmp_path, files = dataset
+    gd = tmp_path / "gd2.tsv"
+    pd.DataFrame([
+        (CHROM, BPS["1"][0], BPS["2"][1], "GD_DEL_A", "DEL", "yes", "no", "c1", "1", "2"),
+        (CHROM, BPS["1"][0], BPS["2"][1], "GD_DUP_A", "DUP", "yes", "no", "c1", "1", "2"),
+    ], columns=["chr", "start_GRCh38", "end_GRCh38", "GD_ID", "svtype", "NAHR",
+                "terminal", "cluster", "BP1", "BP2"]).to_csv(gd, sep="\t", index=False)
+    carriers = {
+        "b1": {**{f"b1_s{i}": ["GD_DEL_A"] for i in range(0, 12)},
+               **{f"b1_s{i}": ["GD_DUP_A"] for i in range(12, 16)}},
+        "b2": {f"b2_s{i}": ["GD_DEL_A"] for i in range(0, 6)},
+        "b3": {"b3_s0": ["GD_DUP_A"]},
+    }
+    for b, c in carriers.items():
+        rows = [(s, "c1", g, True) for s, gds in c.items() for g in gds]
+        pd.DataFrame(rows, columns=["sample", "cluster", "GD_ID", "is_carrier"]).to_csv(
+            files[b]["calls"], sep="\t", index=False, compression="gzip")
+        pm.main(["classify", "--batch", b, "--gd-table", str(gd), "--gd-id", "GD_DEL_A",
+                 "--calls", files[b]["calls"], "--cn-posteriors", files[b]["post"],
+                 "--out-prefix", str(tmp_path / b)])
+    (tmp_path / "mosaic.txt").write_text("mos1\n")
+    pm.main(["select", "--classes"] + [str(tmp_path / f"{b}.classes.tsv") for b in files]
+            + ["--regions"] + [str(tmp_path / f"{b}.region.json") for b in files]
+            + ["--mosaic-samples", str(tmp_path / "mosaic.txt"), "--n-germline", "10",
+               "--out-prefix", str(tmp_path / "sel")])
+    sel = pd.read_csv(tmp_path / "sel.selected.tsv", sep="\t").fillna("")
+    counts = sel[sel["group"] == "germline"]["carrier_type"].value_counts().to_dict()
+    # 17 DEL vs 5 DUP in the cohort: DUP > 3, so a proportional split (~8 / 2) of 10
+    assert sum(counts.values()) == 10 and counts["DUP"] >= 1 and counts["DEL"] > counts["DUP"]
+    used = sorted(sel["batch"].unique())
+    for b in used:
+        pm.main(["extract", "--batch", b, "--gd-table", str(gd), "--gd-id", "GD_DEL_A",
+                 "--selected", str(tmp_path / "sel.selected.tsv"),
+                 "--region", str(tmp_path / "sel.region.json"),
+                 "--low-res-counts", files[b]["lowres"], "--out-prefix", str(tmp_path / b)])
+    out = tmp_path / "plot2.pdf"
+    pm.main(["plot", "--gd-table", str(gd), "--gd-id", "GD_DEL_A",
+             "--selected", str(tmp_path / "sel.selected.tsv"),
+             "--region", str(tmp_path / "sel.region.json"),
+             "--depth"] + [str(tmp_path / f"{b}.depth.tsv.gz") for b in used]
+            + ["--out-pdf", str(out)])
+    assert out.read_bytes().startswith(b"%PDF")
+
+
+def test_legend_key_labels():
+    assert pm.key_label("Germline", 10, {"DEL": 8, "DUP": 2}) == "Germline (DEL n=8, DUP n=2)"
+    assert pm.key_label("Germline", 8, {"DEL": 8}) == "Germline DEL (n=8)"
+    assert pm.key_label("Germline", 8, {"": 8}) == "Germline (n=8)"
+    assert pm.key_label("Mosaic", 3, {"DEL": 3}) == "Mosaic (n=3)"
+    assert pm.key_label("Mosaic", 5, {"DEL": 3, "DUP": 2}) == "Mosaic (DEL n=3, DUP n=2)"
+
+
+def test_mosaic_del_and_dup_split_in_plot(dataset):
+    tmp_path, files = dataset
+    gd = str(tmp_path / "gd.tsv")
+    df = pd.read_csv(files["b2"]["lowres"], sep="\t")
+    body = (df["Chr"] == CHROM) & (df["Start"] >= BPS["1"][1]) & (df["End"] <= BPS["2"][0])
+    df.loc[body, "mos2"] = (df.loc[body, "mos2"] * 5 / 3).round().astype(int)   # 0.75x -> 1.25x
+    df.to_csv(files["b2"]["lowres"], sep="\t", index=False, compression="gzip")
+    for b in files:
+        pm.main(["classify", "--batch", b, "--gd-table", gd, "--gd-id", "GD_A",
+                 "--calls", files[b]["calls"], "--cn-posteriors", files[b]["post"],
+                 "--out-prefix", str(tmp_path / b)])
+    (tmp_path / "mosaic.txt").write_text("mos1\nmos2\n")
+    pm.main(["select", "--classes"] + [str(tmp_path / f"{b}.classes.tsv") for b in files]
+            + ["--regions"] + [str(tmp_path / f"{b}.region.json") for b in files]
+            + ["--mosaic-samples", str(tmp_path / "mosaic.txt"),
+               "--out-prefix", str(tmp_path / "sel")])
+    for b in ("b1", "b2"):
+        pm.main(["extract", "--batch", b, "--gd-table", gd, "--gd-id", "GD_A",
+                 "--selected", str(tmp_path / "sel.selected.tsv"),
+                 "--region", str(tmp_path / "sel.region.json"),
+                 "--low-res-counts", files[b]["lowres"], "--out-prefix", str(tmp_path / b)])
+    captured = {}
+    orig = pm.key_label
+    pm.key_label = lambda name, total, by_type, cohort=None: captured.setdefault(
+        name, (total, dict(by_type))) and orig(name, total, by_type, cohort)
+    try:
+        pm.main(["plot", "--gd-table", gd, "--gd-id", "GD_A",
+                 "--selected", str(tmp_path / "sel.selected.tsv"),
+                 "--region", str(tmp_path / "sel.region.json"),
+                 "--depth", str(tmp_path / "b1.depth.tsv.gz"), str(tmp_path / "b2.depth.tsv.gz"),
+                 "--out-pdf", str(tmp_path / "p.pdf")])
+    finally:
+        pm.key_label = orig
+    assert captured["Mosaic"] == (2, {"DEL": 1, "DUP": 1})
+
+
+def test_legend_marks_selected_when_cohort_is_larger():
+    assert pm.key_label("Non-carrier", 50, {}, {"": 300}) == "Non-carrier (n=50, selected)"
+    assert pm.key_label("Non-carrier", 12, {}, {"": 12}) == "Non-carrier (n=12)"
+    assert pm.key_label("Germline", 20, {"DEL": 20}, {"DEL": 45}) == "Germline DEL (n=20, selected)"
+    assert pm.key_label("Germline", 10, {"DEL": 8, "DUP": 2}, {"DEL": 30, "DUP": 2}) \
+        == "Germline (DEL n=8, selected, DUP n=2)"
+
+
+def test_select_reports_cohort_totals():
+    rows = [("m", "b1", pm.STATUS_NON_CARRIER, "", 2)]
+    rows += [(f"del{i}", "b1", pm.STATUS_GERMLINE, "DEL", 2) for i in range(30)]
+    rows += [(f"n{i}", "b1", pm.STATUS_NON_CARRIER, "", 2) for i in range(40)]
+    classes = pd.DataFrame(rows, columns=["sample", "batch", "status", "germline_type", "ploidy"])
+    out = pm.select_samples(classes, ["m"], 10, 25, 1)
+    assert set(out.loc[out["group"] == pm.GROUP_GERMLINE, "cohort_total"]) == {30}
+    assert set(out.loc[out["group"] == pm.GROUP_NON_CARRIER, "cohort_total"]) == {40}
+    assert out.loc[out["group"] == pm.GROUP_MOSAIC, "cohort_total"].isna().all()
