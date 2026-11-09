@@ -20,6 +20,7 @@ SUBCOMMANDS = {
     "integrate": "gatk_sv_gd.integrate",
     "plot-mosaic": "gatk_sv_gd.plot_mosaic",
     "plot-mode-depth": "gatk_sv_gd.plot_mode_depth",
+    "nominate-mosaic": "gatk_sv_gd.nominate_mosaic",
 }
 
 DESCRIPTIONS = {
@@ -34,6 +35,7 @@ DESCRIPTIONS = {
     "integrate": "Integrate GD calls into a GATK-SV final VCF",
     "plot-mosaic": "Plot mosaic carrier depth against germline carriers and non-carriers",
     "plot-mode-depth": "Plot most-common normalized depth per sample across NAHR GD loci",
+    "nominate-mosaic": "Nominate candidate mosaic GD carriers from read depth",
 }
 
 

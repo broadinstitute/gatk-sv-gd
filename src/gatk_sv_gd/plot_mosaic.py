@@ -737,8 +737,15 @@ def draw_mosaic_plot(
     ymin: float = 0.0,
     ymax: float = 4.0,
     title: Optional[str] = None,
+    gd_id: Optional[str] = None,
 ) -> None:
     region_start, region_end = int(region["start"]), int(region["end"])
+    # Mosaic DEL/DUP is typed on the target GD's own span, not the whole cluster.
+    type_start, type_end = locus.start, locus.end
+    for e in locus.gd_entries:
+        if gd_id is not None and str(e["GD_ID"]) == str(gd_id):
+            type_start, type_end = int(e["start_GRCh38"]), int(e["end_GRCh38"])
+            break
     xform = FlankCompressor(region_start, region_end, locus.start, locus.end,
                             flank_scale=flank_scale)
 
@@ -766,8 +773,6 @@ def draw_mosaic_plot(
     counts = {}
     type_counts: Dict[str, int] = {}
     mosaic_type_counts: Dict[str, int] = {}
-    ploidy_of = (dict(zip(selected["sample"].astype(str), selected["ploidy"]))
-                 if "ploidy" in selected.columns else {})
     cohort_germline: Dict[str, int] = {}
     cohort_noncarrier: Dict[str, int] = {}
     if "cohort_total" in selected.columns:
@@ -797,10 +802,9 @@ def draw_mosaic_plot(
                     type_counts[t] = type_counts.get(t, 0) + 1
             elif group == GROUP_MOSAIC:
                 mids = (table["Start"] + table["End"]) / 2
-                body = table[(mids >= locus.start) & (mids < locus.end)]
+                body = table[(mids >= type_start) & (mids < type_end)]
                 for name in names:
-                    expected = float(ploidy_of.get(name, 2) or 2)
-                    t = "DUP" if float(body[name].median()) > expected else "DEL"
+                    t = "DUP" if float(body[name].median()) > 2.0 else "DEL"
                     mosaic_type_counts[t] = mosaic_type_counts.get(t, 0) + 1
             _draw_group(ax, table.sort_values("Start"), names, xform,
                         color, lw, alpha, zorder, outline)
@@ -826,7 +830,7 @@ def draw_mosaic_plot(
 
     if title is None:
         title = f"{locus.display_label}"
-    ax_ann.set_title(title, loc="left", fontsize=5.5, pad=7 if locus.breakpoints else 2)
+    ax_ann.set_title(title, loc="center", fontsize=5.5, pad=7 if locus.breakpoints else 2)
 
     handles = [
         Line2D([0], [0], color=COLOR_MOSAIC, lw=0.6,
@@ -860,7 +864,7 @@ def cmd_plot(args) -> None:
     draw_mosaic_plot(
         locus, region, selected, tables, segdup, args.out_pdf,
         width=args.width, height=args.height, flank_scale=args.flank_scale,
-        ymin=args.ymin, ymax=args.ymax, title=args.title,
+        ymin=args.ymin, ymax=args.ymax, title=args.title, gd_id=args.gd_id,
     )
     print(f"Wrote {args.out_pdf}")
 

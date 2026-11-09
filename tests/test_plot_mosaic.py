@@ -493,11 +493,11 @@ def test_end_to_end_del_and_dup_germline_legend(dataset):
 
 
 def test_legend_key_labels():
-    assert pm.key_label("Germline", 10, {"DEL": 8, "DUP": 2}) == "Germline (DEL n=8, DUP n=2)"
+    assert pm.key_label("Germline", 10, {"DEL": 8, "DUP": 2}) == "Germline (DEL n=8; DUP n=2)"
     assert pm.key_label("Germline", 8, {"DEL": 8}) == "Germline DEL (n=8)"
     assert pm.key_label("Germline", 8, {"": 8}) == "Germline (n=8)"
     assert pm.key_label("Mosaic", 3, {"DEL": 3}) == "Mosaic (n=3)"
-    assert pm.key_label("Mosaic", 5, {"DEL": 3, "DUP": 2}) == "Mosaic (DEL n=3, DUP n=2)"
+    assert pm.key_label("Mosaic", 5, {"DEL": 3, "DUP": 2}) == "Mosaic (DEL n=3; DUP n=2)"
 
 
 def test_mosaic_del_and_dup_split_in_plot(dataset):
@@ -541,7 +541,7 @@ def test_legend_marks_selected_when_cohort_is_larger():
     assert pm.key_label("Non-carrier", 12, {}, {"": 12}) == "Non-carrier (n=12)"
     assert pm.key_label("Germline", 20, {"DEL": 20}, {"DEL": 45}) == "Germline DEL (n=20, selected)"
     assert pm.key_label("Germline", 10, {"DEL": 8, "DUP": 2}, {"DEL": 30, "DUP": 2}) \
-        == "Germline (DEL n=8, selected, DUP n=2)"
+        == "Germline (DEL n=8, selected; DUP n=2)"
 
 
 def test_select_reports_cohort_totals():
@@ -553,3 +553,26 @@ def test_select_reports_cohort_totals():
     assert set(out.loc[out["group"] == pm.GROUP_GERMLINE, "cohort_total"]) == {30}
     assert set(out.loc[out["group"] == pm.GROUP_NON_CARRIER, "cohort_total"]) == {40}
     assert out.loc[out["group"] == pm.GROUP_MOSAIC, "cohort_total"].isna().all()
+
+
+def test_mosaic_type_uses_target_gd_span_and_cutoff_2(dataset):
+    tmp_path, _ = dataset
+    locus = pm._resolve_locus(str(tmp_path / "gd.tsv"), "GD_A")
+    starts = np.arange(*REGION, BIN)
+    mids = starts + BIN / 2
+    in_a = (mids >= BPS["1"][0]) & (mids < BPS["2"][1])
+    # DEL inside GD_A; elevated elsewhere in the cluster (would flip a cluster-wide median)
+    depth = pd.DataFrame({"Chr": CHROM, "Start": starts, "End": starts + BIN,
+                          "m": np.where(in_a, 1.5, 3.0), "n": 2.0})
+    sel = pd.DataFrame({"sample": ["m", "n"], "batch": "x",
+                        "group": [pm.GROUP_MOSAIC, pm.GROUP_NON_CARRIER], "ploidy": [2, 2]})
+    captured = {}
+    orig = pm.key_label
+    pm.key_label = lambda name, total, by_type, cohort=None: captured.setdefault(
+        name, dict(by_type)) and orig(name, total, by_type, cohort)
+    try:
+        pm.draw_mosaic_plot(locus, {"start": REGION[0], "end": REGION[1]}, sel, [depth],
+                            None, str(tmp_path / "t.pdf"), gd_id="GD_A")
+    finally:
+        pm.key_label = orig
+    assert captured["Mosaic"] == {"DEL": 1}
