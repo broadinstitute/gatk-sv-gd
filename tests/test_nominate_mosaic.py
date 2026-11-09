@@ -113,13 +113,41 @@ def test_merge_streams_and_handles_empty(tmp_path):
     assert list(pd.read_csv(tmp_path / "e.tsv.gz", sep="\t").columns) == nm.CANDIDATE_COLUMNS
 
 
-def test_recenter_removes_batch_wide_shift():
-    med = pd.Series([1.5] * 20 + [1.1])           # whole batch sits at 1.5; one sample lower
-    f = nm.recenter_factor(med)
-    assert f == pytest.approx(2.0 / 1.5)
-    assert (med * f).iloc[-1] == pytest.approx(1.1 * 4 / 3)
-    assert nm.recenter_factor(med, enabled=False) == 1.0
-    assert nm.recenter_factor(pd.Series([1.5, 1.4])) == 1.0   # too few samples
+def test_chrom_factors_put_chromosome_median_at_cn2():
+    counts = pd.DataFrame({
+        "Chr": ["chr1"] * 4 + ["chr2"] * 4,
+        "Start": list(range(4)) * 2, "End": list(range(1, 5)) * 2,
+        "s": [100, 100, 100, 100, 150, 150, 150, 150],   # chr2 shifted 1.5x
+        "z": [100] * 4 + [0] * 4,                          # no chr2 signal
+    })
+    med = {"s": 125.0, "z": 50.0}
+    f = nm.chrom_scale_factors(counts, med, ["s", "z"])
+    assert f["chr1"]["s"] == pytest.approx(1.25) and f["chr2"]["s"] == pytest.approx(125 / 150)
+    assert f["chr2"]["z"] == 1.0                           # zero median -> unchanged
+
+
+def test_chromosome_wide_shift_is_normalized_out(tmp_path):
+    # chr1 of one sample sits at 1.3x of the batch everywhere (whole-chromosome
+    # gain relative to its other chromosomes); its interval looks CN 2 once
+    # normalized to the chromosome, but "mosaic" without chrom normalization.
+    gd, counts, sd = tmp_path / "gd.tsv", tmp_path / "c.tsv.gz", tmp_path / "sd.bed"
+    _table(gd), _segdup_bed(sd)
+    rng = np.random.RandomState(5)
+    starts = np.arange(0, GENOME, BIN)
+    frames = []
+    for chrom in ("chr1", "chr2", "chr3"):
+        cols = {f"n{i}": rng.poisson(LAM, len(starts)) for i in range(25)}
+        cols["shifted"] = rng.poisson(LAM * (1.3 if chrom == "chr1" else 1.0), len(starts))
+        frames.append(pd.DataFrame({"#Chr": chrom, "Start": starts, "End": starts + BIN, **cols}))
+    pd.concat(frames).to_csv(counts, sep="\t", index=False, compression="gzip")
+    args = ["nominate", "--batch", "b", "--gd-table", str(gd), "--low-res-counts", str(counts),
+            "--segdup-bed", str(sd), "--out-prefix", str(tmp_path / "o"),
+            "--max-deviation", "100"]   # isolate normalization from the abnormal-flank filter
+    nm.main(args)
+    assert "shifted" not in set(pd.read_csv(tmp_path / "o.candidates.tsv.gz", sep="\t")["sample"])
+    nm.main(args + ["--no-chrom-normalize"])
+    raw = pd.read_csv(tmp_path / "o.candidates.tsv.gz", sep="\t")
+    assert "shifted" in set(raw["sample"])
 
 
 def test_consistent_fraction_rejects_partial_and_spikes():

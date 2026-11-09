@@ -48,7 +48,6 @@ CANDIDATE_COLUMNS = ["gd_id", "sample", "batch", "median_depth", "mosaic_type",
                      "raw_median_depth", "consistent_fraction", "n_cluster_intervals"]
 SUMMARY_COLUMNS = ["batch", "gd_id", "chr", "start", "end", "n_samples",
                    "n_bins", "batch_median_depth", "n_abnormal", "n_candidates"]
-MIN_RECENTER_SAMPLES = 5
 
 
 def gd_intervals(table: GDTable) -> List[dict]:
@@ -106,19 +105,24 @@ def interval_medians(depth: pd.DataFrame, chrom: str, start: int, end: int,
     return pd.Series(np.nanmedian(values, axis=0), index=sample_cols), len(values)
 
 
-def recenter_factor(med: pd.Series, enabled: bool = True) -> float:
-    """Factor putting the batch's median interval depth at CN 2.
+def chrom_scale_factors(counts: pd.DataFrame, medians: Dict[str, float],
+                        samples: Sequence[str]) -> Dict[str, pd.Series]:
+    """Per-chromosome, per-sample factors putting each sample's chromosome-wide
+    median depth at CN 2.
 
-    Segdup-rich loci have batch-wide depth shifts (GC, mappability); dividing
-    by the batch median removes them so only deviations from the batch count.
-    Returns 1.0 when disabled, with fewer than MIN_RECENTER_SAMPLES finite
-    samples, or when the batch median is not positive.
+    Depth is already scaled by the sample's autosomal median (CN 2), so the
+    factor is autosomal median / chromosome median of the raw counts. It
+    removes sample- and chromosome-specific shifts (e.g. whole-chromosome
+    copy changes or chromosome-level coverage bias). Samples whose chromosome
+    median is not positive keep a factor of 1.
     """
-    finite = med[np.isfinite(med)]
-    if not enabled or len(finite) < MIN_RECENTER_SAMPLES:
-        return 1.0
-    center = float(np.median(finite))
-    return 2.0 / center if center > 0 else 1.0
+    out: Dict[str, pd.Series] = {}
+    for chrom, grp in counts.groupby("Chr", sort=False):
+        chrom_med = grp[list(samples)].median()
+        auto = pd.Series({s: medians[s] for s in samples})
+        factor = (auto / chrom_med).where(chrom_med > 0, 1.0)
+        out[str(chrom)] = factor.fillna(1.0)
+    return out
 
 
 def consistent_fraction(values: np.ndarray, mosaic_type: np.ndarray,
@@ -163,7 +167,7 @@ def nominate_batch(
     min_deviant_bins: int = 3,
     max_population_fraction: float = 0.05,
     nahr_only: bool = True,
-    recenter: bool = True,
+    chrom_normalize: bool = True,
     min_consistent_fraction: float = 0.7,
     consistency_margin: float = 0.1,
     collapse_cluster: bool = True,
@@ -183,6 +187,7 @@ def nominate_batch(
         return (pd.DataFrame(columns=CANDIDATE_COLUMNS),
                 pd.DataFrame(columns=SUMMARY_COLUMNS))
     bin_size = estimate_lowres_bin_size(counts)
+    chrom_factors = chrom_scale_factors(counts, medians, usable) if chrom_normalize else {}
 
     for item in gd_intervals(table):
         locus, chrom = item["locus"], item["chrom"]
@@ -202,7 +207,8 @@ def nominate_batch(
         n_bins = len(values)
         raw = (pd.Series(np.nanmedian(values, axis=0), index=cols) if n_bins
                else pd.Series(np.nan, index=cols))
-        factor = recenter_factor(raw, recenter)
+        factor = (chrom_factors[chrom].reindex(cols).fillna(1.0).to_numpy()
+                  if chrom in chrom_factors else np.ones(len(cols)))
         med = raw * factor
         flags = flag_abnormal_samples(
             depth, locus, first_id, {}, usable, max_deviation, window_bins,
@@ -216,7 +222,7 @@ def nominate_batch(
             hit = med[in_window]
             idx = [cols.index(sample) for sample in hit.index]
             types = np.where(hit.to_numpy() < 2.0, "DEL", "DUP")
-            frac = consistent_fraction(values[:, idx] * factor, types, consistency_margin)
+            frac = consistent_fraction(values[:, idx] * factor[idx], types, consistency_margin)
             rows = []
             for sample, value, mtype, f in zip(hit.index, hit.to_numpy(), types, frac):
                 if f < min_consistent_fraction:
@@ -246,7 +252,7 @@ def cmd_nominate(args) -> None:
         counts, args.gd_table, args.batch, segdups, args.high_res_counts,
         (args.del_min, args.del_max), (args.dup_min, args.dup_max), args.min_bins,
         args.max_deviation, args.window_bins, args.min_deviant_bins,
-        args.max_population_fraction, args.nahr_only, args.recenter,
+        args.max_population_fraction, args.nahr_only, args.chrom_normalize,
         args.min_consistent_fraction, args.consistency_margin, args.collapse_cluster)
     candidates.to_csv(f"{args.out_prefix}.candidates.tsv.gz", sep="\t", index=False)
     summary.to_csv(f"{args.out_prefix}.interval_summary.tsv.gz", sep="\t", index=False)
@@ -294,8 +300,8 @@ def build_parser() -> argparse.ArgumentParser:
     n.add_argument("--window-bins", type=int, default=5)
     n.add_argument("--min-deviant-bins", type=int, default=3)
     n.add_argument("--max-population-fraction", type=float, default=0.05)
-    n.add_argument("--recenter", action=argparse.BooleanOptionalAction, default=True,
-                   help="scale each interval so the batch median depth is CN 2")
+    n.add_argument("--chrom-normalize", action=argparse.BooleanOptionalAction, default=True,
+                   help="scale each sample so its chromosome-wide median depth is CN 2")
     n.add_argument("--min-consistent-fraction", type=float, default=0.7,
                    help="min fraction of interval bins beyond the margin on the event side")
     n.add_argument("--consistency-margin", type=float, default=0.1)
