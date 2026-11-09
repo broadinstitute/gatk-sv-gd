@@ -44,9 +44,11 @@ SEX_CHROMS = {"chrX", "chrY", "X", "Y"}
 MIN_FLANK, MAX_FLANK = 50_000, 1_000_000  # as in bins.py
 
 CANDIDATE_COLUMNS = ["gd_id", "sample", "batch", "median_depth", "mosaic_type",
-                     "chr", "start", "end", "svtype", "n_bins"]
+                     "chr", "start", "end", "svtype", "n_bins", "cluster",
+                     "raw_median_depth", "consistent_fraction", "n_cluster_intervals"]
 SUMMARY_COLUMNS = ["batch", "gd_id", "chr", "start", "end", "n_samples",
-                   "n_bins", "n_abnormal", "n_candidates"]
+                   "n_bins", "batch_median_depth", "n_abnormal", "n_candidates"]
+MIN_RECENTER_SAMPLES = 5
 
 
 def gd_intervals(table: GDTable) -> List[dict]:
@@ -81,18 +83,70 @@ def flank_size(locus: GDLocus) -> int:
     return int(min(max(locus.end - locus.start, MIN_FLANK), MAX_FLANK))
 
 
-def interval_medians(depth: pd.DataFrame, chrom: str, start: int, end: int,
-                     segdups) -> Tuple[pd.Series, int]:
-    """Per-sample median depth over [start, end) without segdup-touching bins."""
+def interval_bins(depth: pd.DataFrame, chrom: str, start: int, end: int,
+                  segdups) -> Tuple[np.ndarray, List[str]]:
+    """Depth of the bins in [start, end) that do not touch a segdup.
+
+    Returns (bins x samples array, sample names).
+    """
     starts = depth["Start"].to_numpy()
     ends = depth["End"].to_numpy()
     mid = (starts + ends) / 2
     keep = (mid >= start) & (mid < end) & ~overlaps_segdup(segdups, chrom, starts, ends)
     sample_cols = [c for c in depth.columns if c not in ("Chr", "Start", "End")]
-    if not keep.any():
+    return depth.loc[keep, sample_cols].to_numpy(dtype=float), sample_cols
+
+
+def interval_medians(depth: pd.DataFrame, chrom: str, start: int, end: int,
+                     segdups) -> Tuple[pd.Series, int]:
+    """Per-sample median depth over [start, end) without segdup-touching bins."""
+    values, sample_cols = interval_bins(depth, chrom, start, end, segdups)
+    if len(values) == 0:
         return pd.Series(np.nan, index=sample_cols), 0
-    med = np.nanmedian(depth.loc[keep, sample_cols].to_numpy(dtype=float), axis=0)
-    return pd.Series(med, index=sample_cols), int(keep.sum())
+    return pd.Series(np.nanmedian(values, axis=0), index=sample_cols), len(values)
+
+
+def recenter_factor(med: pd.Series, enabled: bool = True) -> float:
+    """Factor putting the batch's median interval depth at CN 2.
+
+    Segdup-rich loci have batch-wide depth shifts (GC, mappability); dividing
+    by the batch median removes them so only deviations from the batch count.
+    Returns 1.0 when disabled, with fewer than MIN_RECENTER_SAMPLES finite
+    samples, or when the batch median is not positive.
+    """
+    finite = med[np.isfinite(med)]
+    if not enabled or len(finite) < MIN_RECENTER_SAMPLES:
+        return 1.0
+    center = float(np.median(finite))
+    return 2.0 / center if center > 0 else 1.0
+
+
+def consistent_fraction(values: np.ndarray, mosaic_type: np.ndarray,
+                        margin: float) -> np.ndarray:
+    """Per-sample fraction of bins on the event side of 2 by more than *margin*.
+
+    *values* is bins x samples; *mosaic_type* gives "DEL"/"DUP" per sample.
+    A uniform mosaic event has most bins beyond the margin; partial events and
+    single-bin spikes do not.
+    """
+    below = (values < 2.0 - margin).mean(axis=0)
+    above = (values > 2.0 + margin).mean(axis=0)
+    return np.where(mosaic_type == "DEL", below, above)
+
+
+def collapse_by_cluster(cands: pd.DataFrame) -> pd.DataFrame:
+    """One row per sample per cluster: the best-supported interval.
+
+    Support is the consistent fraction, then the number of bins. The rows
+    dropped are other intervals of the same cluster nominated for the sample;
+    ``n_cluster_intervals`` records how many there were.
+    """
+    if cands.empty:
+        return cands
+    cands = cands.copy()
+    cands["n_cluster_intervals"] = cands.groupby(["sample", "cluster"])["gd_id"].transform("size")
+    order = cands.sort_values(["consistent_fraction", "n_bins"], ascending=False, kind="stable")
+    return order.drop_duplicates(["sample", "cluster"]).sort_index().reset_index(drop=True)
 
 
 def nominate_batch(
@@ -109,6 +163,10 @@ def nominate_batch(
     min_deviant_bins: int = 3,
     max_population_fraction: float = 0.05,
     nahr_only: bool = True,
+    recenter: bool = True,
+    min_consistent_fraction: float = 0.7,
+    consistency_margin: float = 0.1,
+    collapse_cluster: bool = True,
 ) -> Tuple[pd.DataFrame, pd.DataFrame]:
     """Candidate mosaic events and a per-interval summary for one batch."""
     table = GDTable(gd_table_path)
@@ -140,28 +198,44 @@ def nominate_batch(
             print(f"WARNING: {batch}: no depth bins for {first_id}", file=sys.stderr)
             continue
 
-        med, n_bins = interval_medians(depth, chrom, start, end, segdups)
+        values, cols = interval_bins(depth, chrom, start, end, segdups)
+        n_bins = len(values)
+        raw = (pd.Series(np.nanmedian(values, axis=0), index=cols) if n_bins
+               else pd.Series(np.nan, index=cols))
+        factor = recenter_factor(raw, recenter)
+        med = raw * factor
         flags = flag_abnormal_samples(
             depth, locus, first_id, {}, usable, max_deviation, window_bins,
             min_deviant_bins, max_population_fraction, segdups)
         abnormal = set(flags.loc[flags["abnormal"], "sample"])
 
-        in_window = med.between(*del_range) | med.between(*dup_range)
-        hit = med[in_window & ~med.index.isin(abnormal)] if n_bins >= min_bins else med.iloc[:0]
-        n_cand = len(hit)
-        if n_cand:
+        in_window = (med.between(*del_range) | med.between(*dup_range)) \
+            & ~med.index.isin(abnormal)
+        n_cand = 0
+        if n_bins >= min_bins and in_window.any():
+            hit = med[in_window]
+            idx = [cols.index(sample) for sample in hit.index]
             types = np.where(hit.to_numpy() < 2.0, "DEL", "DUP")
+            frac = consistent_fraction(values[:, idx] * factor, types, consistency_margin)
             rows = []
-            for sample, value, mtype in zip(hit.index, hit.to_numpy(), types):
+            for sample, value, mtype, f in zip(hit.index, hit.to_numpy(), types, frac):
+                if f < min_consistent_fraction:
+                    continue
                 gd_id, svtype = pick_gd_id(item["entries"], str(mtype))
                 rows.append((gd_id, sample, batch, round(float(value), 4), str(mtype),
-                             chrom, start, end, svtype, n_bins))
-            cand_parts.append(pd.DataFrame(rows, columns=CANDIDATE_COLUMNS))
+                             chrom, start, end, svtype, n_bins, locus.cluster,
+                             round(float(raw[sample]), 4), round(float(f), 4), 1))
+            n_cand = len(rows)
+            if rows:
+                cand_parts.append(pd.DataFrame(rows, columns=CANDIDATE_COLUMNS))
         summary_rows.append((batch, first_id, chrom, start, end, len(usable), n_bins,
+                             round(float(np.nanmedian(raw)), 4) if n_bins else np.nan,
                              len(abnormal), n_cand))
 
     candidates = (pd.concat(cand_parts, ignore_index=True)
                   if cand_parts else pd.DataFrame(columns=CANDIDATE_COLUMNS))
+    if collapse_cluster:
+        candidates = collapse_by_cluster(candidates)
     return candidates, pd.DataFrame(summary_rows, columns=SUMMARY_COLUMNS)
 
 
@@ -172,7 +246,8 @@ def cmd_nominate(args) -> None:
         counts, args.gd_table, args.batch, segdups, args.high_res_counts,
         (args.del_min, args.del_max), (args.dup_min, args.dup_max), args.min_bins,
         args.max_deviation, args.window_bins, args.min_deviant_bins,
-        args.max_population_fraction, args.nahr_only)
+        args.max_population_fraction, args.nahr_only, args.recenter,
+        args.min_consistent_fraction, args.consistency_margin, args.collapse_cluster)
     candidates.to_csv(f"{args.out_prefix}.candidates.tsv.gz", sep="\t", index=False)
     summary.to_csv(f"{args.out_prefix}.interval_summary.tsv.gz", sep="\t", index=False)
     print(f"{args.batch}: {len(candidates)} candidate events in "
@@ -219,6 +294,13 @@ def build_parser() -> argparse.ArgumentParser:
     n.add_argument("--window-bins", type=int, default=5)
     n.add_argument("--min-deviant-bins", type=int, default=3)
     n.add_argument("--max-population-fraction", type=float, default=0.05)
+    n.add_argument("--recenter", action=argparse.BooleanOptionalAction, default=True,
+                   help="scale each interval so the batch median depth is CN 2")
+    n.add_argument("--min-consistent-fraction", type=float, default=0.7,
+                   help="min fraction of interval bins beyond the margin on the event side")
+    n.add_argument("--consistency-margin", type=float, default=0.1)
+    n.add_argument("--collapse-cluster", action=argparse.BooleanOptionalAction, default=True,
+                   help="keep one interval per sample per cluster")
     n.add_argument("--nahr-only", action=argparse.BooleanOptionalAction, default=True)
 
     m = sub.add_parser("merge", help="Concatenate per-batch tables")

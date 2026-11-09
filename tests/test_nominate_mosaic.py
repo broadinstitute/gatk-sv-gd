@@ -1,5 +1,6 @@
 import numpy as np
 import pandas as pd
+import pytest
 
 from gatk_sv_gd import nominate_mosaic as nm
 from gatk_sv_gd import plot_mosaic as pm
@@ -34,6 +35,8 @@ def _counts(path):
     profiles = {f"n{i}": np.ones(len(starts)) for i in range(25)}
     profiles["mos_del"] = np.where(in_a, 0.75, 1.0)
     profiles["mos_dup"] = np.where(in_a, 1.25, 1.0)
+    first_60 = in_a & (mid < A[0] + 0.6 * (A[1] - A[0]))
+    profiles["part_del"] = np.where(first_60, 0.75, 1.0)
     profiles["het_del"] = np.where(in_a, 0.5, 1.0)
     # mosaic-range interval depth, but a large event in the left flank
     profiles["mos_del_bigflank"] = np.where(in_a, 0.75, 1.0) * np.where(left_flank, 0.5, 1.0)
@@ -108,3 +111,47 @@ def test_merge_streams_and_handles_empty(tmp_path):
     nm.main(["merge", "--input-list", str(tmp_path / "empty.txt"),
              "--out", str(tmp_path / "e.tsv.gz")])
     assert list(pd.read_csv(tmp_path / "e.tsv.gz", sep="\t").columns) == nm.CANDIDATE_COLUMNS
+
+
+def test_recenter_removes_batch_wide_shift():
+    med = pd.Series([1.5] * 20 + [1.1])           # whole batch sits at 1.5; one sample lower
+    f = nm.recenter_factor(med)
+    assert f == pytest.approx(2.0 / 1.5)
+    assert (med * f).iloc[-1] == pytest.approx(1.1 * 4 / 3)
+    assert nm.recenter_factor(med, enabled=False) == 1.0
+    assert nm.recenter_factor(pd.Series([1.5, 1.4])) == 1.0   # too few samples
+
+
+def test_consistent_fraction_rejects_partial_and_spikes():
+    full = np.full(10, 1.5)
+    part = np.r_[np.full(3, 1.5), np.full(7, 2.0)]
+    up = np.full(10, 2.5)
+    vals = np.column_stack([full, part, up])
+    f = nm.consistent_fraction(vals, np.array(["DEL", "DEL", "DUP"]), 0.1)
+    assert list(f) == [1.0, 0.3, 1.0]
+
+
+def test_partial_interval_event_needs_consistency(tmp_path):
+    # 0.75x over 60% of GD_A: median is in the DEL window, but only ~60% of bins
+    # are on the event side, below the 0.7 default
+    cand, _ = _run(tmp_path)
+    assert "part_del" not in set(cand["sample"])
+    cand, _ = _run(tmp_path, ["--min-consistent-fraction", "0.4"])
+    assert "part_del" in set(cand["sample"])
+
+
+def test_collapse_keeps_best_interval_per_cluster():
+    rows = [("A_DEL", "s", "b", 1.5, "DEL", "chr1", 1, 2, "DEL", 30, "c1", 1.5, 0.9, 1),
+            ("B_DEL", "s", "b", 1.5, "DEL", "chr1", 2, 3, "DEL", 40, "c1", 1.5, 0.8, 1),
+            ("C_DEL", "s", "b", 1.5, "DEL", "chr1", 5, 6, "DEL", 40, "c2", 1.5, 0.8, 1)]
+    out = nm.collapse_by_cluster(pd.DataFrame(rows, columns=nm.CANDIDATE_COLUMNS))
+    assert list(out["gd_id"]) == ["A_DEL", "C_DEL"]
+    assert list(out["n_cluster_intervals"]) == [2, 1]
+
+
+def test_end_to_end_adds_columns_and_collapses(tmp_path):
+    cand, summ = _run(tmp_path)
+    assert list(cand.columns) == nm.CANDIDATE_COLUMNS
+    assert not cand.duplicated(["sample", "cluster"]).any()
+    assert (cand["consistent_fraction"] >= 0.7).all()
+    assert "batch_median_depth" in summ.columns
