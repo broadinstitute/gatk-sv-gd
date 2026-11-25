@@ -454,10 +454,16 @@ def select_samples(
 ) -> pd.DataFrame:
     """Pick mosaic carriers plus random comparators.
 
+    *mosaic_samples* may be empty: only germline carriers and non-carriers are
+    then drawn.  Ploidy is the most common among all candidate samples,
+    germline carriers come from the fewest batches that hold enough of them,
+    and non-carriers from the batches of the selected germline carriers (all
+    batches if there are none).
+
     With *allowed_samples*, only those samples can be plotted: others are
     dropped before anything is drawn (mosaic samples outside the list with a
-    warning; at least one mosaic sample must remain), so comparator counts and
-    the batches used reflect the list.
+    warning; at least one mosaic sample must remain when any were given), so
+    comparator counts and the batches used reflect the list.
 
     Comparators share the mosaic carriers' (most common) ploidy on the locus
     contig.  Non-carriers come only from batches containing a mosaic carrier.
@@ -484,13 +490,18 @@ def select_samples(
             print("WARNING: mosaic sample(s) not in the sample list, not plotted: "
                   + ", ".join(dropped), file=sys.stderr)
         mosaic_samples = [s for s in mosaic_samples if s in allowed]
-        if not mosaic_samples:
+        if dropped and not mosaic_samples:
             raise SystemExit("ERROR: none of the mosaic samples is in the sample list")
         classes = classes[classes["sample"].isin(allowed)]
 
     mosaic = classes[classes["sample"].isin(mosaic_samples)]
     mosaic_batches = set(mosaic["batch"])
-    ploidy = int(mosaic["ploidy"].mode().iloc[0])
+    if len(mosaic):
+        ploidy = int(mosaic["ploidy"].mode().iloc[0])
+    elif len(classes):
+        ploidy = int(classes["ploidy"].mode().iloc[0])
+    else:
+        raise SystemExit("ERROR: no samples left to plot")
 
     if "abnormal" in classes.columns:
         bad = classes["abnormal"].fillna(False).astype(bool)
@@ -508,7 +519,6 @@ def select_samples(
     candidates = classes[
         ~classes["sample"].isin(mosaic_samples) & (classes["ploidy"] == ploidy)
     ].sort_values("sample")
-    pool = candidates[candidates["batch"].isin(mosaic_batches)]
     rng = np.random.RandomState(seed)
 
     def draw(cand: pd.DataFrame, n: int, status: str) -> pd.DataFrame:
@@ -547,6 +557,11 @@ def select_samples(
                                             need, label)]))
     germline = pd.concat(parts) if parts else candidates.iloc[0:0]
 
+    # Non-carriers come from the mosaic carriers' batches; with no mosaic
+    # carriers, from the batches that supply the germline carriers, else any.
+    pool_batches = mosaic_batches or (used_batches if len(germline) else set(candidates["batch"]))
+    pool = candidates[candidates["batch"].isin(pool_batches)]
+
     out = pd.concat([
         mosaic.assign(group=GROUP_MOSAIC),
         germline.assign(group=GROUP_GERMLINE),
@@ -568,9 +583,10 @@ def select_samples(
 def cmd_select(args) -> None:
     classes = pd.concat(
         [pd.read_csv(p, sep="\t") for p in args.classes], ignore_index=True)
-    mosaic_samples = _read_lines(args.mosaic_samples)
+    mosaic_samples = _read_lines(args.mosaic_samples) if args.mosaic_samples else []
     if not mosaic_samples:
-        raise SystemExit("ERROR: no mosaic samples given")
+        print("No mosaic samples given: plotting germline carriers and non-carriers only",
+              file=sys.stderr)
     allowed = _read_lines(args.include_samples) if args.include_samples else None
     selected = select_samples(
         classes, mosaic_samples, args.n_germline, args.n_non_carrier, args.seed, allowed)
@@ -844,6 +860,8 @@ def draw_mosaic_plot(
                label=key_label("Non-carrier", counts[GROUP_NON_CARRIER], {},
                                cohort_noncarrier)),
     ]
+    if counts[GROUP_MOSAIC] == 0:        # no mosaic carriers plotted: no Mosaic legend line
+        handles = handles[1:]
     fig.legend(handles=handles, loc="lower center", ncol=1, frameon=False,
                fontsize=5, handlelength=1.4, labelspacing=0.3,
                bbox_to_anchor=(0.5, 0.0))
@@ -913,7 +931,8 @@ def build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser("select", help="Choose mosaic carriers and comparators")
     p.add_argument("--classes", nargs="+", required=True)
     p.add_argument("--regions", nargs="+", required=True)
-    p.add_argument("--mosaic-samples", required=True, help="One sample ID per line")
+    p.add_argument("--mosaic-samples", help="One sample ID per line; optional (omit or "
+                   "leave empty to plot only germline carriers and non-carriers)")
     p.add_argument("--include-samples",
                    help="One sample ID per line; only these samples are plotted")
     p.add_argument("--n-germline", type=int, default=10)

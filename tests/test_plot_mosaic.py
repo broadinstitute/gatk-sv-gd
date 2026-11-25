@@ -576,3 +576,39 @@ def test_mosaic_type_uses_target_gd_span_and_cutoff_2(dataset):
     finally:
         pm.key_label = orig
     assert captured["Mosaic"] == {"DEL": 1}
+
+
+def test_plot_without_mosaic_samples(dataset):
+    tmp_path, files = dataset
+    gd = str(tmp_path / "gd.tsv")
+    for b in files:
+        pm.main(["classify", "--batch", b, "--gd-table", gd, "--gd-id", "GD_A",
+                 "--calls", files[b]["calls"], "--cn-posteriors", files[b]["post"],
+                 "--out-prefix", str(tmp_path / b)])
+    for mosaic_args in ([], ["--mosaic-samples", str(tmp_path / "empty.txt")]):
+        (tmp_path / "empty.txt").write_text("")
+        pm.main(["select", "--classes"] + [str(tmp_path / f"{b}.classes.tsv") for b in files]
+                + ["--regions"] + [str(tmp_path / f"{b}.region.json") for b in files]
+                + mosaic_args
+                + ["--n-germline", "4", "--n-non-carrier", "10", "--seed", "1",
+                   "--out-prefix", str(tmp_path / "sel")])
+        sel = pd.read_csv(tmp_path / "sel.selected.tsv", sep="\t")
+        assert (sel["group"] != pm.GROUP_MOSAIC).all() and len(sel) == 14
+        germ = sel[sel["group"] == pm.GROUP_GERMLINE]
+        assert len(germ) == 4
+        # non-carriers come only from batches that supply germline carriers
+        nc = sel[sel["group"] == pm.GROUP_NON_CARRIER]
+        assert set(nc["batch"]) <= set(germ["batch"])
+    use = (tmp_path / "sel.use_batch.txt").read_text().split()
+    batches = [b for b, u in zip(files, use) if u == "true"]
+    for b in batches:
+        pm.main(["extract", "--batch", b, "--gd-table", gd, "--gd-id", "GD_A",
+                 "--selected", str(tmp_path / "sel.selected.tsv"),
+                 "--region", str(tmp_path / "sel.region.json"),
+                 "--low-res-counts", files[b]["lowres"], "--out-prefix", str(tmp_path / b)])
+    pm.main(["plot", "--gd-table", gd, "--gd-id", "GD_A",
+             "--selected", str(tmp_path / "sel.selected.tsv"),
+             "--region", str(tmp_path / "sel.region.json"),
+             "--depth"] + [str(tmp_path / f"{b}.depth.tsv.gz") for b in batches]
+            + ["--out-pdf", str(tmp_path / "p.pdf")])
+    assert (tmp_path / "p.pdf").read_bytes().startswith(b"%PDF")
